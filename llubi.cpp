@@ -3,11 +3,15 @@
 // This file is licensed under the Apache-2.0 License.
 // See the LICENSE file for more information.
 
+#include <llvm-20/llvm/ADT/StringRef.h>
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/APInt.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/BitVector.h>
+#include <llvm/ADT/MapVector.h>
+#include <llvm/ADT/STLFunctionalExtras.h>
 #include <llvm/ADT/ScopeExit.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/BasicBlock.h>
@@ -47,10 +51,12 @@
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Support/TypeSize.h>
 #include <llvm/Support/raw_ostream.h>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <optional>
 #include <variant>
 
 using namespace llvm;
@@ -71,7 +77,8 @@ class ImmUBReporter final {
 public:
   ImmUBReporter() : Out(errs()) { Out << "UB triggered: "; }
   [[noreturn]] ~ImmUBReporter() {
-    Out << "Exited with immediate UB.\n";
+    Out << "\nExited with immediate UB.\n";
+    Out.flush();
     std::exit(EXIT_FAILURE);
   }
   template <typename Arg> ImmUBReporter &operator<<(Arg &&arg) {
@@ -81,12 +88,16 @@ public:
 };
 
 class MemObject final {
+  StringRef Name;
+  bool IsLocal;
   size_t Address;
   SmallVector<std::byte, 16> Data;
   static std::map<size_t, MemObject *> AddressMap;
 
 public:
-  explicit MemObject(size_t Size, size_t Alignment) : Data(Size) {
+  explicit MemObject(StringRef Name, bool IsLocal, size_t Size,
+                     size_t Alignment)
+      : Name(Name), IsLocal(IsLocal), Data(Size) {
     AllocatedMem = alignTo(AllocatedMem, Alignment);
     Address = AllocatedMem;
     AllocatedMem += Size + Padding;
@@ -100,12 +111,15 @@ public:
     if (Offset + AccessSize >= Data.size())
       ImmUBReporter() << "Out of bound mem op";
   }
-  static std::shared_ptr<MemObject> create(size_t Size, size_t Alignment) {
-    return std::make_shared<MemObject>(Size, Alignment);
+  static std::shared_ptr<MemObject> create(StringRef Name, bool IsLocal,
+                                           size_t Size, size_t Alignment) {
+    return std::make_shared<MemObject>(Name, IsLocal, Size, Alignment);
   }
   void store(size_t Offset, const APInt &C) {
-    constexpr uint32_t Scale = APInt::APINT_BITS_PER_WORD / 8;
-    const size_t Size = alignTo(C.getBitWidth(), 8);
+    //     errs() << Offset << ' ' << Data.size() << ' ' << C.getBitWidth() << '
+    //     '<< C.getNumWords() << '\n';
+    constexpr uint32_t Scale = sizeof(APInt::WordType);
+    const size_t Size = alignTo(C.getBitWidth(), 8) / 8;
     uint32_t WriteCnt = 0;
     std::byte *WritePos = Data.data() + Offset;
     for (uint32_t I = 0; I != C.getNumWords(); ++I) {
@@ -127,8 +141,8 @@ public:
   }
   APInt load(size_t Offset, size_t Bits) const {
     APInt Res = APInt::getZero(alignTo(Bits, 8));
-    constexpr uint32_t Scale = APInt::APINT_BITS_PER_WORD / 8;
-    const size_t Size = Res.getBitWidth();
+    constexpr uint32_t Scale = sizeof(APInt::WordType);
+    const size_t Size = Res.getBitWidth() / 8;
     uint32_t ReadCnt = 0;
     const std::byte *ReadPos = Data.data() + Offset;
     for (uint32_t I = 0; I != Res.getNumWords(); ++I) {
@@ -151,21 +165,69 @@ public:
     return Res.trunc(Bits);
   }
   size_t address() const { return Address; }
+  size_t size() const { return Data.size(); }
+  void dumpRef(raw_ostream &Out) {
+    Out << '[' << (IsLocal ? '%' : '@') << Name << "(Addr = " << Address << ", "
+        << "Size = " << Data.size() << ']';
+  }
 };
 std::map<size_t, MemObject *> MemObject::AddressMap;
 
 struct Pointer final {
   std::weak_ptr<MemObject> Obj;
-  size_t Offset;
+  intptr_t Offset;
   size_t Address;
+  intptr_t Bound;
 
-  Pointer(const std::shared_ptr<MemObject> &Obj, size_t Offset)
-      : Obj(Obj), Offset(Offset), Address(Obj->address() + Offset) {}
+  Pointer(const std::shared_ptr<MemObject> &Obj, intptr_t Offset)
+      : Obj(Obj), Offset(Offset), Address(Obj->address() + Offset),
+        Bound(Obj->size()) {}
+  explicit Pointer(const std::weak_ptr<MemObject> &Obj, intptr_t NewOffset,
+                   size_t NewAddress, intptr_t NewBound)
+      : Obj(Obj), Offset(NewOffset), Address(NewAddress), Bound(NewBound) {}
 };
 
 using SingleValue = std::variant<APInt, APFloat, Pointer, std::monostate>;
 bool isPoison(const SingleValue &SV) {
   return std::holds_alternative<std::monostate>(SV);
+}
+SingleValue boolean(bool Val) { return SingleValue{APInt(1, Val)}; }
+SingleValue poison() { return std::monostate{}; }
+SingleValue lookupPointer(size_t Addr) {
+  // TODO
+  return poison();
+}
+SingleValue offsetPointer(const Pointer &Ptr, intptr_t Offset, bool InBound) {
+  if (Offset == 0)
+    return Ptr;
+  intptr_t NewOffset = Ptr.Offset + Offset;
+  if (NewOffset < 0 || NewOffset > Ptr.Bound) {
+    if (InBound)
+      return poison();
+    return lookupPointer(Ptr.Address + NewOffset);
+  }
+
+  return Pointer{Ptr.Obj, NewOffset, Ptr.Address + Offset, Ptr.Bound};
+}
+raw_ostream &operator<<(raw_ostream &Out, const SingleValue &Val) {
+  if (auto *CI = std::get_if<APInt>(&Val)) {
+    if (CI->getBitWidth() == 1)
+      return Out << (CI->getBoolValue() ? "T" : "F");
+    return Out << "i" << CI->getBitWidth() << ' ' << *CI;
+  }
+  if (auto *CFP = std::get_if<APFloat>(&Val))
+    return Out << *CFP;
+  if (auto *Ptr = std::get_if<Pointer>(&Val)) {
+    Out << "Ptr { Obj = ";
+    if (auto P = Ptr->Obj.lock())
+      P->dumpRef(Out);
+    else
+      Out << "[dangling]";
+    Out << ", Offset = " << Ptr->Offset << ", Addr = " << Ptr->Address
+        << ", Bound = " << Ptr->Bound << '}';
+    return Out;
+  }
+  return Out << "poison";
 }
 
 struct AnyValue final {
@@ -179,7 +241,43 @@ struct AnyValue final {
     assert(std::holds_alternative<SingleValue>(Val));
     return std::get<SingleValue>(Val);
   }
+  SingleValue &getSingleValue() {
+    assert(std::holds_alternative<SingleValue>(Val));
+    return std::get<SingleValue>(Val);
+  }
+  const std::vector<AnyValue> &getValueArray() const {
+    assert(std::holds_alternative<std::vector<AnyValue>>(Val));
+    return std::get<std::vector<AnyValue>>(Val);
+  }
+  std::vector<AnyValue> &getValueArray() {
+    assert(std::holds_alternative<std::vector<AnyValue>>(Val));
+    return std::get<std::vector<AnyValue>>(Val);
+  }
+  const SingleValue &getSingleValueAt(uint32_t Idx) const {
+    return getValueArray().at(Idx).getSingleValue();
+  }
+  SingleValue &getSingleValueAt(uint32_t Idx) {
+    return getValueArray().at(Idx).getSingleValue();
+  }
 };
+
+raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val) {
+  if (const auto *SV = std::get_if<SingleValue>(&Val.Val))
+    return Out << *SV;
+  if (const auto *MV = std::get_if<std::vector<AnyValue>>(&Val.Val)) {
+    Out << "{ ";
+    bool First = true;
+    for (auto &Sub : *MV) {
+      if (First)
+        First = false;
+      else
+        Out << ", ";
+      Out << Sub;
+    }
+    return Out << " }";
+  }
+  return Out << "None";
+}
 
 struct Frame final {
   BasicBlock *BB;
@@ -206,7 +304,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   }
   AnyValue getPoison(Type *Ty) const {
     if (Ty->isIntegerTy() || Ty->isFloatingPointTy() || Ty->isPointerTy())
-      return SingleValue{};
+      return poison();
     if (auto *VTy = dyn_cast<VectorType>(Ty))
       return std::vector<AnyValue>(getVectorLength(VTy));
     llvm_unreachable("Unsupported type");
@@ -221,26 +319,60 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
     if (auto *VTy = dyn_cast<VectorType>(Ty))
       return std::vector<AnyValue>(getVectorLength(VTy),
                                    getZero(Ty->getScalarType()));
+    if (auto *ATy = dyn_cast<ArrayType>(Ty))
+      return std::vector<AnyValue>(ATy->getArrayNumElements(),
+                                   getZero(ATy->getArrayElementType()));
+    errs() << *Ty << '\n';
     llvm_unreachable("Unsupported type");
   }
   AnyValue convertFromConstant(Constant *V) const {
     if (isa<PoisonValue>(V))
       return getPoison(V->getType());
-    if (isa<UndefValue>(V))
+    if (isa<UndefValue, ConstantAggregateZero>(V))
       return getZero(V->getType());
     if (auto *CI = dyn_cast<ConstantInt>(V))
       return SingleValue{CI->getValue()};
     if (auto *CFP = dyn_cast<ConstantFP>(V))
       return SingleValue{CFP->getValue()};
-    if (isa<ConstantAggregateZero>(V))
-      return getZero(V->getType());
     if (isa<ConstantPointerNull>(V))
       return SingleValue{Pointer{NullPtr, 0U}};
     if (auto *CDS = dyn_cast<ConstantDataSequential>(V)) {
       std::vector<AnyValue> Elts;
+      Elts.reserve(CDS->getNumElements());
       for (uint32_t I = 0, E = CDS->getNumElements(); I != E; ++I)
         Elts.push_back(convertFromConstant(CDS->getElementAsConstant(I)));
       return std::move(Elts);
+    }
+    if (auto *CA = dyn_cast<ConstantAggregate>(V)) {
+      std::vector<AnyValue> Elts;
+      Elts.reserve(CA->getNumOperands());
+      for (uint32_t I = 0, E = CA->getNumOperands(); I != E; ++I)
+        Elts.push_back(convertFromConstant(CA->getOperand(I)));
+      return std::move(Elts);
+    }
+    if (auto *GV = dyn_cast<GlobalVariable>(V)) {
+      return AnyValue{Pointer{GlobalVariables.at(GV), 0}};
+    }
+    if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+      switch (CE->getOpcode()) {
+      case Instruction::GetElementPtr: {
+        auto *Inst = cast<GetElementPtrInst>(CE->getAsInstruction());
+        auto Guard = make_scope_exit([Inst] { Inst->deleteValue(); });
+        APInt Offset = APInt::getZero(DL.getIndexSizeInBits(0));
+        SmallMapVector<Value *, APInt, 4> VarOffset;
+        if (Inst->collectOffset(DL, Offset.getBitWidth(), VarOffset, Offset)) {
+          assert(VarOffset.empty());
+          return offsetPointer(
+              std::get<Pointer>(
+                  convertFromConstant(cast<Constant>(Inst->getPointerOperand()))
+                      .getSingleValue()),
+              Offset.getSExtValue(), Inst->isInBounds());
+        }
+        break;
+      }
+      default:
+        break;
+      }
     }
     errs() << *V << '\n';
     llvm_unreachable("Unexpected constant");
@@ -265,6 +397,14 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
       MO.store(Offset, APInt(DL.getPointerSizeInBits(), Ptr.Address));
     } else if (Ty->isVectorTy()) {
       llvm_unreachable("Not Implemented");
+    } else if (auto *ArrTy = dyn_cast<ArrayType>(Ty)) {
+      Type *EltTy = ArrTy->getElementType();
+      auto Step = DL.getTypeStoreSize(EltTy);
+      auto &MV = V.getValueArray();
+      for (uint32_t I = 0, E = ArrTy->getNumElements(); I != E; ++I) {
+        store(MO, Offset, MV[I], EltTy);
+        Offset += Step;
+      }
     } else {
       errs() << "Unsupproted type: " << *Ty << '\n';
       llvm_unreachable("Unsupported mem store");
@@ -315,17 +455,22 @@ public:
         TLI(Triple{M.getTargetTriple()}) {
     assert(DL.isLittleEndian());
     static_assert(sys::IsLittleEndianHost);
-    NullPtr = MemObject::create(0U, 1U);
+    NullPtr = MemObject::create("null", false, 0U, 1U);
     assert(NullPtr->address() == 0);
     for (auto &GV : M.globals()) {
       if (!GV.hasExactDefinition())
         continue;
-      auto MemObj = MemObject::create(DL.getTypeAllocSize(GV.getType()),
-                                      DL.getPreferredAlign(&GV).value());
+      GlobalVariables.insert(
+          {&GV, std::move(MemObject::create(
+                    GV.getName(), false, DL.getTypeAllocSize(GV.getValueType()),
+                    DL.getPreferredAlign(&GV).value()))});
+    }
+    for (auto &GV : M.globals()) {
+      if (!GV.hasExactDefinition())
+        continue;
       if (GV.hasInitializer())
-        store(*MemObj, 0U, convertFromConstant(GV.getInitializer()),
-              GV.getValueType());
-      GlobalVariables.insert({&GV, std::move(MemObj)});
+        store(*GlobalVariables.at(&GV), 0U,
+              convertFromConstant(GV.getInitializer()), GV.getValueType());
     }
     // Expand constexprs
     while (true) {
@@ -351,19 +496,340 @@ public:
         break;
     }
   }
+
+  bool addValue(Instruction &I, AnyValue Val) {
+    errs() << I << " -> " << Val << '\n';
+    CurrentFrame->ValueMap[&I] = std::move(Val);
+    return true;
+  }
+  bool jumpTo(BasicBlock *To) {
+    BasicBlock *From = CurrentFrame->BB;
+    CurrentFrame->BB = To;
+    CurrentFrame->PC = To->begin();
+    SmallVector<std::pair<PHINode *, AnyValue>> IncomingValues;
+    while (true) {
+      if (auto *PHI = dyn_cast<PHINode>(CurrentFrame->PC)) {
+        IncomingValues.emplace_back(
+            PHI, getValue(PHI->getIncomingValueForBlock(From)));
+        ++CurrentFrame->PC;
+      } else
+        break;
+    }
+    for (auto &[K, V] : IncomingValues)
+      addValue(*K, std::move(V));
+    return false;
+  }
+  AnyValue getValue(Value *V) {
+    if (auto *C = dyn_cast<Constant>(V)) {
+      errs() << "    Constant " << *C << " -> " << convertFromConstant(C)
+             << '\n';
+      return convertFromConstant(C);
+    }
+    return CurrentFrame->ValueMap.at(V);
+  }
+  std::optional<APInt> getInt(const SingleValue &SV) {
+    if (auto *C = std::get_if<APInt>(&SV))
+      return *C;
+    return std::nullopt;
+  }
+  std::optional<APInt> getInt(Value *V) {
+    return getInt(getValue(V).getSingleValue());
+  }
+  enum class BooleanVal { Poison, False, True };
+  BooleanVal getBoolean(const SingleValue &SV) {
+    if (isPoison(SV))
+      return BooleanVal::Poison;
+    return std::get<APInt>(SV).getBoolValue() ? BooleanVal::True
+                                              : BooleanVal::False;
+  }
+  BooleanVal getBoolean(Value *V) {
+    return getBoolean(getValue(V).getSingleValue());
+  }
+
+  bool visitAllocaInst(AllocaInst &AI) {
+    assert(!AI.isArrayAllocation() && "VLA is not implemented yet.");
+    auto Obj = MemObject::create(AI.getName(), true,
+                                 DL.getTypeAllocSize(AI.getAllocatedType()),
+                                 AI.getPointerAlignment(DL).value());
+    Pointer Ptr{Obj, 0U};
+    CurrentFrame->Allocas.push_back(std::move(Obj));
+    return addValue(AI, SingleValue{std::move(Ptr)});
+  }
+  bool visitBinOp(Instruction &I,
+                  const function_ref<SingleValue(const SingleValue &,
+                                                 const SingleValue &)> &Fn) {
+    auto FnPoison = [&Fn](const SingleValue &LHS,
+                          const SingleValue &RHS) -> SingleValue {
+      if (isPoison(LHS) || isPoison(RHS))
+        return poison();
+      return Fn(LHS, RHS);
+    };
+    if (auto *VTy = dyn_cast<VectorType>(I.getType())) {
+      uint32_t Len = getVectorLength(VTy);
+      auto LHS = getValue(I.getOperand(0));
+      auto RHS = getValue(I.getOperand(1));
+      std::vector<AnyValue> Res;
+      Res.reserve(Len);
+      for (uint32_t I = 0; I != Len; ++I)
+        Res.push_back(AnyValue{
+            FnPoison(LHS.getSingleValueAt(I), RHS.getSingleValueAt(I))});
+      return addValue(I, std::move(Res));
+    }
+    return addValue(
+        I, AnyValue{FnPoison(getValue(I.getOperand(0)).getSingleValue(),
+                             getValue(I.getOperand(1)).getSingleValue())});
+  }
+  bool visitUnOp(Instruction &I,
+                 const function_ref<SingleValue(const SingleValue &)> &Fn) {
+    auto FnPoison = [&Fn](const SingleValue &V) -> SingleValue {
+      if (isPoison(V))
+        return poison();
+      return Fn(V);
+    };
+    if (auto *VTy = dyn_cast<VectorType>(I.getType())) {
+      uint32_t Len = getVectorLength(VTy);
+      auto V = getValue(I.getOperand(0));
+      std::vector<AnyValue> Res;
+      Res.reserve(Len);
+      for (uint32_t I = 0; I != Len; ++I)
+        Res.push_back(AnyValue{FnPoison(V.getSingleValueAt(I))});
+      return addValue(I, std::move(Res));
+    }
+    return addValue(
+        I, AnyValue{FnPoison(getValue(I.getOperand(0)).getSingleValue())});
+  }
+  bool visitICmpInst(ICmpInst &I) {
+    auto ICmp = [&I](const SingleValue &LHS,
+                     const SingleValue &RHS) -> SingleValue {
+      const auto &LHSC = std::get<APInt>(LHS);
+      const auto &RHSC = std::get<APInt>(RHS);
+      if (I.hasSameSign()) {
+        if (LHSC.isNonNegative() != RHSC.isNonNegative())
+          return poison();
+      }
+      return boolean(ICmpInst::compare(LHSC, RHSC, I.getPredicate()));
+    };
+    auto ICmpPtr = [&](const SingleValue &LHS,
+                       const SingleValue &RHS) -> SingleValue {
+      if (std::holds_alternative<Pointer>(LHS)) {
+        assert(std::holds_alternative<Pointer>(RHS));
+        uint32_t BitWidth = DL.getPointerSizeInBits();
+        return ICmp(APInt(BitWidth, std::get<Pointer>(LHS).Address),
+                    APInt(BitWidth, std::get<Pointer>(RHS).Address));
+      }
+      return ICmp(LHS, RHS);
+    };
+    return visitBinOp(I, ICmpPtr);
+  }
+  bool visitIntBinOp(Instruction &I, const function_ref<std::optional<APInt>(
+                                         const APInt &, const APInt &)> &Fn) {
+    return visitBinOp(
+        I,
+        [&Fn](const SingleValue &LHS, const SingleValue &RHS) -> SingleValue {
+          auto &LHSC = std::get<APInt>(LHS);
+          auto &RHSC = std::get<APInt>(RHS);
+          if (auto Res = Fn(LHSC, RHSC))
+            return SingleValue{*Res};
+          return poison();
+        });
+  }
+  bool visitAnd(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          return LHS & RHS;
+        });
+  }
+  bool visitXor(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          return LHS ^ RHS;
+        });
+  }
+  bool visitOr(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          if (cast<PossiblyDisjointInst>(I).isDisjoint() && LHS.intersects(RHS))
+            return std::nullopt;
+          return LHS | RHS;
+        });
+  }
+  bool visitShl(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          if (RHS.uge(LHS.getBitWidth()))
+            return std::nullopt;
+          if (I.hasNoSignedWrap() && RHS.uge(LHS.getNumSignBits()))
+            return std::nullopt;
+          if (I.hasNoUnsignedWrap() && RHS.ugt(LHS.countl_zero()))
+            return std::nullopt;
+          return LHS.shl(RHS);
+        });
+  }
+  bool visitLShr(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          if (RHS.uge(cast<PossiblyExactOperator>(I).isExact()
+                          ? LHS.countr_zero() + 1
+                          : LHS.getBitWidth()))
+            return std::nullopt;
+          return LHS.lshr(RHS);
+        });
+  }
+  bool visitAShr(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          if (RHS.uge(cast<PossiblyExactOperator>(I).isExact()
+                          ? LHS.countr_zero() + 1
+                          : LHS.getBitWidth()))
+            return std::nullopt;
+          return LHS.ashr(RHS);
+        });
+  }
+  bool visitAdd(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          bool Overflow = false;
+          auto Ret = LHS.uadd_ov(RHS, Overflow);
+          if (I.hasNoUnsignedWrap() && Overflow)
+            return std::nullopt;
+          if (I.hasNoSignedWrap()) {
+            (void)LHS.sadd_ov(RHS, Overflow);
+            if (Overflow)
+              return std::nullopt;
+          }
+          return Ret;
+        });
+  }
+  bool
+  visitIntUnOp(Instruction &I,
+               const function_ref<std::optional<APInt>(const APInt &)> &Fn) {
+    return visitUnOp(I, [&Fn](const SingleValue &V) -> SingleValue {
+      auto &C = std::get<APInt>(V);
+      if (auto Res = Fn(C))
+        return SingleValue{*Res};
+      return poison();
+    });
+  }
+  bool visitTruncInst(TruncInst &Trunc) {
+    uint32_t DestBW = Trunc.getDestTy()->getScalarSizeInBits();
+    return visitIntUnOp(Trunc, [&](const APInt &C) -> std::optional<APInt> {
+      if (Trunc.hasNoSignedWrap() && C.getSignificantBits() > DestBW)
+        return std::nullopt;
+      if (Trunc.hasNoUnsignedWrap() && C.getActiveBits() > DestBW)
+        return std::nullopt;
+      return C.trunc(DestBW);
+    });
+  }
+  bool visitSelect(SelectInst &SI) {
+    if (SI.getCondition()->getType()->isIntegerTy(1)) {
+      switch (getBoolean(SI.getCondition())) {
+      case BooleanVal::True:
+        return addValue(SI, getValue(SI.getTrueValue()));
+      case BooleanVal::False:
+        return addValue(SI, getValue(SI.getFalseValue()));
+      case BooleanVal::Poison:
+        return addValue(SI, getPoison(SI.getType()));
+      }
+    }
+
+    uint32_t Len = getVectorLength(cast<VectorType>(SI.getType()));
+    auto Cond = getValue(SI.getCondition());
+    auto TV = getValue(SI.getTrueValue());
+    auto FV = getValue(SI.getFalseValue());
+    std::vector<AnyValue> Res;
+    Res.reserve(Len);
+    for (uint32_t I = 0; I < Len; ++I) {
+      switch (getBoolean(Cond.getSingleValueAt(I))) {
+      case BooleanVal::True:
+        Res.push_back(std::move(TV.getSingleValueAt(I)));
+        break;
+      case BooleanVal::False:
+        Res.push_back(std::move(FV.getSingleValueAt(I)));
+        break;
+      case BooleanVal::Poison:
+        Res.push_back(getPoison(SI.getType()->getScalarType()));
+        break;
+      }
+    }
+    return addValue(SI, std::move(Res));
+  }
+  bool visitBranchInst(BranchInst &BI) {
+    if (BI.isConditional()) {
+      switch (getBoolean(BI.getCondition())) {
+      case BooleanVal::True:
+        return jumpTo(BI.getSuccessor(0));
+      case BooleanVal::False:
+        return jumpTo(BI.getSuccessor(1));
+      case BooleanVal::Poison:
+        ImmUBReporter() << "Branch on poison";
+      }
+    }
+    return jumpTo(BI.getSuccessor(0));
+  }
+  SingleValue computeGEP(const SingleValue &Base, const APInt &Offset,
+                         bool InBounds) {
+    if (isPoison(Base))
+      return Base;
+    auto &Ptr = std::get<Pointer>(Base);
+    return offsetPointer(Ptr, Offset.getSExtValue(), InBounds);
+  }
+  bool visitGetElementPtrInst(GetElementPtrInst &GEP) {
+    // TODO: handle nuw/nusw/inrange
+    uint32_t BitWidth = DL.getIndexSizeInBits(0);
+    APInt Offset = APInt::getZero(BitWidth);
+    SmallMapVector<Value *, APInt, 4> VarOffsets;
+    if (!GEP.collectOffset(DL, BitWidth, VarOffsets, Offset))
+      llvm_unreachable("Unsupported GEP");
+    bool InBounds = GEP.isInBounds();
+    if (auto *VTy = dyn_cast<VectorType>(GEP.getType())) {
+      uint32_t Len = getVectorLength(VTy);
+      AnyValue Res = getValue(GEP.getPointerOperand());
+      for (auto &[K, V] : VarOffsets) {
+        auto KV = getValue(K);
+        for (uint32_t I = 0; I != Len; ++I) {
+          if (auto Idx = getInt(KV.getSingleValueAt(I)))
+            Res.getSingleValueAt(I) =
+                computeGEP(Res.getSingleValueAt(I), *Idx * V, InBounds);
+          else
+            Res.getSingleValueAt(I) = poison();
+        }
+      }
+      for (uint32_t I = 0; I != Len; ++I) {
+        Res.getSingleValueAt(I) =
+            computeGEP(Res.getSingleValueAt(I), Offset, InBounds);
+      }
+      return addValue(GEP, std::move(Res));
+    }
+
+    SingleValue Res = getValue(GEP.getPointerOperand()).getSingleValue();
+    if (isPoison(Res))
+      return addValue(GEP, Res);
+    for (auto &[K, V] : VarOffsets) {
+      if (auto Idx = getInt(K))
+        Res = computeGEP(Res, *Idx * V, InBounds);
+      else
+        return addValue(GEP, poison());
+    }
+    return addValue(GEP, computeGEP(Res, Offset, InBounds));
+  }
+  bool visitStoreInst(StoreInst &SI) {
+    store(getValue(SI.getPointerOperand()), SI.getAlign().value(),
+          getValue(SI.getValueOperand()), SI.getValueOperand()->getType());
+    return true;
+  }
   bool visitInstruction(Instruction &I) {
     errs() << I << '\n';
     llvm_unreachable("Unsupported inst");
   }
 
-  AnyValue callIntrinsic(Function *Func, ArrayRef<AnyValue> &Args) {
+  AnyValue callIntrinsic(Function *Func, SmallVectorImpl<AnyValue> &Args) {
     llvm_unreachable("Unsupported intrinsic");
   }
   AnyValue callLibFunc(LibFunc Func, Function *FuncDecl,
-                       ArrayRef<AnyValue> &Args) {
+                       SmallVectorImpl<AnyValue> &Args) {
     llvm_unreachable("Unsupported libcall");
   }
-  AnyValue call(Function *Func, ArrayRef<AnyValue> &Args) {
+  AnyValue call(Function *Func, SmallVectorImpl<AnyValue> &Args) {
     // TODO: handle param attrs
     for (auto &Param : Func->args()) {
     }
@@ -411,13 +877,16 @@ public:
     }
     auto *FTy = Entry->getFunctionType();
     if (!FTy->getReturnType()->isIntegerTy(32) || FTy->isFunctionVarArg() ||
-        FTy->getNumParams() != 0) {
+        FTy->getNumParams() != 2 || !FTy->getParamType(0)->isIntegerTy(32) ||
+        !FTy->getParamType(1)->isPointerTy()) {
       errs() << "Unrecognized func";
       return EXIT_FAILURE;
     }
 
-    ArrayRef<AnyValue> Empty;
-    return std::get<APInt>(call(Entry, Empty).getSingleValue()).getSExtValue();
+    SmallVector<AnyValue> Args;
+    Args.push_back(SingleValue{APInt::getZero(32)});
+    Args.push_back(SingleValue{Pointer{NullPtr, 0U}});
+    return std::get<APInt>(call(Entry, Args).getSingleValue()).getSExtValue();
   }
 };
 
