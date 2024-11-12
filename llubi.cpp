@@ -3,7 +3,6 @@
 // This file is licensed under the Apache-2.0 License.
 // See the LICENSE file for more information.
 
-#include <llvm-20/llvm/ADT/StringRef.h>
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/APInt.h>
 #include <llvm/ADT/ArrayRef.h>
@@ -12,6 +11,7 @@
 #include <llvm/ADT/STLFunctionalExtras.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/StringRef.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/BasicBlock.h>
@@ -52,6 +52,7 @@
 #include <llvm/Support/TypeSize.h>
 #include <llvm/Support/raw_ostream.h>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -66,6 +67,8 @@ static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input>"),
 static cl::opt<uint32_t> VScaleValue(cl::desc("vscale"),
                                      cl::value_desc("value for llvm.vscale"),
                                      cl::init(4U));
+static cl::opt<bool> Verbose("verbose", cl::desc("Print step-by-step log"),
+                             cl::init(false));
 
 // TODO: handle llvm.lifetime.start/end and llvm.invariant.start.end
 size_t AllocatedMem = 0;
@@ -87,14 +90,14 @@ public:
   }
 };
 
-class MemObject final {
+class MemObject final : public std::enable_shared_from_this<MemObject> {
   StringRef Name;
   bool IsLocal;
   size_t Address;
   SmallVector<std::byte, 16> Data;
-  static std::map<size_t, MemObject *> AddressMap;
 
 public:
+  static std::map<size_t, MemObject *> AddressMap;
   explicit MemObject(StringRef Name, bool IsLocal, size_t Size,
                      size_t Alignment)
       : Name(Name), IsLocal(IsLocal), Data(Size) {
@@ -104,12 +107,14 @@ public:
     AddressMap.emplace(Address, this);
   }
   ~MemObject() { AddressMap.erase(Address); }
-  void verifyMemAccess(size_t Offset, size_t AccessSize, size_t Alignment) {
+  void verifyMemAccess(intptr_t Offset, size_t AccessSize, size_t Alignment) {
     size_t NewAddr = Address + Offset;
     if (alignTo(NewAddr, Alignment) != NewAddr)
       ImmUBReporter() << "Unaligned mem op";
-    if (Offset + AccessSize >= Data.size())
-      ImmUBReporter() << "Out of bound mem op";
+    if (Offset + AccessSize > Data.size())
+      ImmUBReporter() << "Out of bound mem op, bound = " << Data.size()
+                      << ", access range = [" << Offset << ", "
+                      << Offset + AccessSize << ']';
   }
   static std::shared_ptr<MemObject> create(StringRef Name, bool IsLocal,
                                            size_t Size, size_t Alignment) {
@@ -154,7 +159,7 @@ public:
           break;
       } else {
         for (auto J = 0; J != Scale; ++J) {
-          Word = (Word << 8) | static_cast<APInt::WordType>(ReadPos[ReadCnt]);
+          Word |= static_cast<APInt::WordType>(ReadPos[ReadCnt]) << (J * 8);
           if (++ReadCnt == Size)
             break;
         }
@@ -166,6 +171,8 @@ public:
   }
   size_t address() const { return Address; }
   size_t size() const { return Data.size(); }
+  char *rawPointer() { return reinterpret_cast<char *>(Data.data()); }
+  void dumpName(raw_ostream &Out) { Out << (IsLocal ? '%' : '@') << Name; }
   void dumpRef(raw_ostream &Out) {
     Out << '[' << (IsLocal ? '%' : '@') << Name << "(Addr = " << Address << ", "
         << "Size = " << Data.size() << ']';
@@ -194,8 +201,16 @@ bool isPoison(const SingleValue &SV) {
 SingleValue boolean(bool Val) { return SingleValue{APInt(1, Val)}; }
 SingleValue poison() { return std::monostate{}; }
 SingleValue lookupPointer(size_t Addr) {
-  // TODO
-  return poison();
+  if (auto Iter = MemObject::AddressMap.upper_bound(Addr);
+      Iter != MemObject::AddressMap.begin()) {
+    auto *MO = std::prev(Iter)->second;
+    if (MO->address() <= Addr && Addr <= MO->address() + MO->size()) {
+      return SingleValue{Pointer{MO->shared_from_this(),
+                                 static_cast<intptr_t>(Addr - MO->address())}};
+    }
+  }
+
+  return SingleValue{Pointer{std::weak_ptr<MemObject>{}, 0, Addr, 0}};
 }
 SingleValue offsetPointer(const Pointer &Ptr, intptr_t Offset, bool InBound) {
   if (Offset == 0)
@@ -218,14 +233,20 @@ raw_ostream &operator<<(raw_ostream &Out, const SingleValue &Val) {
   if (auto *CFP = std::get_if<APFloat>(&Val))
     return Out << *CFP;
   if (auto *Ptr = std::get_if<Pointer>(&Val)) {
-    Out << "Ptr { Obj = ";
+    // Out << "Ptr { Obj = ";
+    // if (auto P = Ptr->Obj.lock())
+    //   P->dumpRef(Out);
+    // else
+    //   Out << "[dangling]";
+    // Out << ", Offset = " << Ptr->Offset << ", Addr = " << Ptr->Address
+    //     << ", Bound = " << Ptr->Bound << '}';
+    // return Out;
+    Out << "Ptr " << Ptr->Address << '[';
     if (auto P = Ptr->Obj.lock())
-      P->dumpRef(Out);
+      P->dumpName(Out);
     else
-      Out << "[dangling]";
-    Out << ", Offset = " << Ptr->Offset << ", Addr = " << Ptr->Address
-        << ", Bound = " << Ptr->Bound << '}';
-    return Out;
+      Out << "dangling";
+    return Out << " + " << Ptr->Offset << ']';
   }
   return Out << "poison";
 }
@@ -261,6 +282,7 @@ struct AnyValue final {
   }
 };
 
+AnyValue none() { return AnyValue{std::monostate{}}; }
 raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val) {
   if (const auto *SV = std::get_if<SingleValue>(&Val.Val))
     return Out << *SV;
@@ -405,6 +427,13 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
         store(MO, Offset, MV[I], EltTy);
         Offset += Step;
       }
+    } else if (auto *StructTy = dyn_cast<StructType>(Ty)) {
+      auto *Layout = DL.getStructLayout(StructTy);
+      auto &MV = V.getValueArray();
+      for (uint32_t I = 0, E = StructTy->getStructNumElements(); I != E; ++I) {
+        auto NewOffset = Offset + Layout->getElementOffset(I).getFixedValue();
+        store(MO, NewOffset, MV.at(I), StructTy->getStructElementType(I));
+      }
     } else {
       errs() << "Unsupproted type: " << *Ty << '\n';
       llvm_unreachable("Unsupported mem store");
@@ -418,6 +447,10 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
       return SingleValue{APFloat(
           Ty->getFltSemantics(),
           MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue()))};
+    } else if (Ty->isPointerTy()) {
+      auto Addr =
+          MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
+      return SingleValue{lookupPointer(Addr.getZExtValue())};
     } else if (Ty->isVectorTy()) {
       llvm_unreachable("Not Implemented");
     } else {
@@ -425,23 +458,28 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
       llvm_unreachable("Unsupported mem store");
     }
   }
-  void store(const AnyValue &P, uint32_t Alignment, const AnyValue &V,
-             Type *Ty) {
+  void store(const AnyValue &P, uint32_t Alignment, const AnyValue &V, Type *Ty,
+             bool IsVolatile) {
     if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
       if (auto MO = PV->Obj.lock()) {
-        MO->verifyMemAccess(PV->Offset, DL.getTypeStoreSize(Ty).getFixedValue(),
-                            Alignment);
+        auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
+        if (IsVolatile)
+          volatileStore(PV->Address, Size, Alignment);
+        MO->verifyMemAccess(PV->Offset, Size, Alignment);
         return store(*MO, PV->Offset, V, Ty);
       }
       ImmUBReporter() << "load from invalid pointer";
     }
     ImmUBReporter() << "store to poison pointer";
   }
-  AnyValue load(const AnyValue &P, uint32_t Alignment, Type *Ty) {
+  AnyValue load(const AnyValue &P, uint32_t Alignment, Type *Ty,
+                bool IsVolatile) {
     if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
       if (auto MO = PV->Obj.lock()) {
-        MO->verifyMemAccess(PV->Offset, DL.getTypeStoreSize(Ty).getFixedValue(),
-                            Alignment);
+        auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
+        if (IsVolatile)
+          volatileLoad(PV->Address, Size, Alignment);
+        MO->verifyMemAccess(PV->Offset, Size, Alignment);
         return load(*MO, PV->Offset, Ty);
       }
       ImmUBReporter() << "load from invalid pointer";
@@ -498,7 +536,8 @@ public:
   }
 
   bool addValue(Instruction &I, AnyValue Val) {
-    errs() << I << " -> " << Val << '\n';
+    if (Verbose)
+      errs() << I << " -> " << Val << '\n';
     CurrentFrame->ValueMap[&I] = std::move(Val);
     return true;
   }
@@ -520,11 +559,8 @@ public:
     return false;
   }
   AnyValue getValue(Value *V) {
-    if (auto *C = dyn_cast<Constant>(V)) {
-      errs() << "    Constant " << *C << " -> " << convertFromConstant(C)
-             << '\n';
+    if (auto *C = dyn_cast<Constant>(V))
       return convertFromConstant(C);
-    }
     return CurrentFrame->ValueMap.at(V);
   }
   std::optional<APInt> getInt(const SingleValue &SV) {
@@ -542,9 +578,40 @@ public:
     return std::get<APInt>(SV).getBoolValue() ? BooleanVal::True
                                               : BooleanVal::False;
   }
+  bool getBooleanNonPoison(const SingleValue &SV) {
+    auto BV = getBoolean(SV);
+    if (BV == BooleanVal::Poison)
+      ImmUBReporter() << "expect a poison value";
+    return BV == BooleanVal::True;
+  }
   BooleanVal getBoolean(Value *V) {
     return getBoolean(getValue(V).getSingleValue());
   }
+  char *getRawPtr(const SingleValue &SV) {
+    auto Ptr = std::get<Pointer>(SV);
+    if (auto MO = Ptr.Obj.lock())
+      return MO->rawPointer() + Ptr.Offset;
+    ImmUBReporter() << "dangling pointer";
+  }
+  char *getRawPtr(const SingleValue &SV, size_t Size, size_t Alignment,
+                  bool IsStore, bool IsVolatile) {
+    auto Ptr = std::get<Pointer>(SV);
+    if (auto MO = Ptr.Obj.lock()) {
+      if (IsVolatile) {
+        if (IsStore)
+          volatileStore(Ptr.Address, Size, Alignment);
+        else
+          volatileLoad(Ptr.Address, Size, Alignment);
+      }
+      MO->verifyMemAccess(Ptr.Offset, Size, Alignment);
+      return MO->rawPointer() + Ptr.Offset;
+    }
+    ImmUBReporter() << "dangling pointer";
+  }
+
+  // TODO
+  void volatileLoad(size_t Addr, size_t Size, size_t Alignment) {}
+  void volatileStore(size_t Addr, size_t Size, size_t Alignment) {}
 
   bool visitAllocaInst(AllocaInst &AI) {
     assert(!AI.isArrayAllocation() && "VLA is not implemented yet.");
@@ -555,49 +622,55 @@ public:
     CurrentFrame->Allocas.push_back(std::move(Obj));
     return addValue(AI, SingleValue{std::move(Ptr)});
   }
-  bool visitBinOp(Instruction &I,
-                  const function_ref<SingleValue(const SingleValue &,
-                                                 const SingleValue &)> &Fn) {
+  AnyValue visitBinOp(
+      Type *RetTy, const AnyValue &LHS, const AnyValue &RHS,
+      const function_ref<SingleValue(const SingleValue &, const SingleValue &)>
+          &Fn) {
     auto FnPoison = [&Fn](const SingleValue &LHS,
                           const SingleValue &RHS) -> SingleValue {
       if (isPoison(LHS) || isPoison(RHS))
         return poison();
       return Fn(LHS, RHS);
     };
-    if (auto *VTy = dyn_cast<VectorType>(I.getType())) {
+    if (auto *VTy = dyn_cast<VectorType>(RetTy)) {
       uint32_t Len = getVectorLength(VTy);
-      auto LHS = getValue(I.getOperand(0));
-      auto RHS = getValue(I.getOperand(1));
       std::vector<AnyValue> Res;
       Res.reserve(Len);
       for (uint32_t I = 0; I != Len; ++I)
         Res.push_back(AnyValue{
             FnPoison(LHS.getSingleValueAt(I), RHS.getSingleValueAt(I))});
-      return addValue(I, std::move(Res));
+      return std::move(Res);
     }
-    return addValue(
-        I, AnyValue{FnPoison(getValue(I.getOperand(0)).getSingleValue(),
-                             getValue(I.getOperand(1)).getSingleValue())});
+    return AnyValue{FnPoison(LHS.getSingleValue(), RHS.getSingleValue())};
   }
-  bool visitUnOp(Instruction &I,
-                 const function_ref<SingleValue(const SingleValue &)> &Fn) {
+  bool visitBinOp(Instruction &I,
+                  const function_ref<SingleValue(const SingleValue &,
+                                                 const SingleValue &)> &Fn) {
+    return addValue(I, visitBinOp(I.getType(), getValue(I.getOperand(0)),
+                                  getValue(I.getOperand(1)), Fn));
+  }
+  AnyValue visitUnOp(Type *RetTy, const AnyValue &Val,
+                     const function_ref<SingleValue(const SingleValue &)> &Fn) {
     auto FnPoison = [&Fn](const SingleValue &V) -> SingleValue {
       if (isPoison(V))
         return poison();
       return Fn(V);
     };
-    if (auto *VTy = dyn_cast<VectorType>(I.getType())) {
+    if (auto *VTy = dyn_cast<VectorType>(RetTy)) {
       uint32_t Len = getVectorLength(VTy);
-      auto V = getValue(I.getOperand(0));
       std::vector<AnyValue> Res;
       Res.reserve(Len);
       for (uint32_t I = 0; I != Len; ++I)
-        Res.push_back(AnyValue{FnPoison(V.getSingleValueAt(I))});
-      return addValue(I, std::move(Res));
+        Res.push_back(AnyValue{FnPoison(Val.getSingleValueAt(I))});
+      return std::move(Res);
     }
-    return addValue(
-        I, AnyValue{FnPoison(getValue(I.getOperand(0)).getSingleValue())});
+    return AnyValue{FnPoison(Val.getSingleValue())};
   }
+  bool visitUnOp(Instruction &I,
+                 const function_ref<SingleValue(const SingleValue &)> &Fn) {
+    return addValue(I, visitUnOp(I.getType(), getValue(I.getOperand(0)), Fn));
+  }
+
   bool visitICmpInst(ICmpInst &I) {
     auto ICmp = [&I](const SingleValue &LHS,
                      const SingleValue &RHS) -> SingleValue {
@@ -621,10 +694,12 @@ public:
     };
     return visitBinOp(I, ICmpPtr);
   }
-  bool visitIntBinOp(Instruction &I, const function_ref<std::optional<APInt>(
-                                         const APInt &, const APInt &)> &Fn) {
+  AnyValue visitIntBinOp(
+      Type *RetTy, const AnyValue &LHS, const AnyValue &RHS,
+      const function_ref<std::optional<APInt>(const APInt &, const APInt &)>
+          &Fn) {
     return visitBinOp(
-        I,
+        RetTy, LHS, RHS,
         [&Fn](const SingleValue &LHS, const SingleValue &RHS) -> SingleValue {
           auto &LHSC = std::get<APInt>(LHS);
           auto &RHSC = std::get<APInt>(RHS);
@@ -632,6 +707,11 @@ public:
             return SingleValue{*Res};
           return poison();
         });
+  }
+  bool visitIntBinOp(Instruction &I, const function_ref<std::optional<APInt>(
+                                         const APInt &, const APInt &)> &Fn) {
+    return addValue(I, visitIntBinOp(I.getType(), getValue(I.getOperand(0)),
+                                     getValue(I.getOperand(1)), Fn));
   }
   bool visitAnd(BinaryOperator &I) {
     return visitIntBinOp(
@@ -700,15 +780,91 @@ public:
           return Ret;
         });
   }
-  bool
-  visitIntUnOp(Instruction &I,
+  bool visitSub(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          bool Overflow = false;
+          auto Ret = LHS.usub_ov(RHS, Overflow);
+          if (I.hasNoUnsignedWrap() && Overflow)
+            return std::nullopt;
+          if (I.hasNoSignedWrap()) {
+            (void)LHS.ssub_ov(RHS, Overflow);
+            if (Overflow)
+              return std::nullopt;
+          }
+          return Ret;
+        });
+  }
+  bool visitMul(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          bool Overflow = false;
+          auto Ret = LHS.umul_ov(RHS, Overflow);
+          if (I.hasNoUnsignedWrap() && Overflow)
+            return std::nullopt;
+          if (I.hasNoSignedWrap()) {
+            (void)LHS.smul_ov(RHS, Overflow);
+            if (Overflow)
+              return std::nullopt;
+          }
+          return Ret;
+        });
+  }
+  bool visitSDiv(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          if (RHS.isZero() || (LHS.isMinSignedValue() && RHS.isAllOnes()))
+            return std::nullopt;
+          APInt Q, R;
+          APInt::sdivrem(LHS, RHS, Q, R);
+          if (I.isExact() && !R.isZero())
+            return std::nullopt;
+          return Q;
+        });
+  }
+  bool visitSRem(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          if (RHS.isZero())
+            return std::nullopt;
+          return LHS.srem(RHS);
+        });
+  }
+  bool visitUDiv(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          if (RHS.isZero())
+            return std::nullopt;
+          APInt Q, R;
+          APInt::udivrem(LHS, RHS, Q, R);
+          if (I.isExact() && !R.isZero())
+            return std::nullopt;
+          return Q;
+        });
+  }
+  bool visitURem(BinaryOperator &I) {
+    return visitIntBinOp(
+        I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+          if (RHS.isZero())
+            return std::nullopt;
+          return LHS.urem(RHS);
+        });
+  }
+  AnyValue
+  visitIntUnOp(Type *Ty, const AnyValue &Val,
                const function_ref<std::optional<APInt>(const APInt &)> &Fn) {
-    return visitUnOp(I, [&Fn](const SingleValue &V) -> SingleValue {
+    return visitUnOp(Ty, Val, [&Fn](const SingleValue &V) -> SingleValue {
       auto &C = std::get<APInt>(V);
       if (auto Res = Fn(C))
         return SingleValue{*Res};
       return poison();
     });
+  }
+  bool
+  visitIntUnOp(Instruction &I,
+               const function_ref<std::optional<APInt>(const APInt &)> &Fn) {
+    return addValue(I,
+                    visitIntUnOp(I.getType(), getValue(I.getOperand(0)), Fn));
   }
   bool visitTruncInst(TruncInst &Trunc) {
     uint32_t DestBW = Trunc.getDestTy()->getScalarSizeInBits();
@@ -718,6 +874,21 @@ public:
       if (Trunc.hasNoUnsignedWrap() && C.getActiveBits() > DestBW)
         return std::nullopt;
       return C.trunc(DestBW);
+    });
+  }
+  bool visitSExtInst(SExtInst &SExt) {
+    uint32_t DestBW = SExt.getDestTy()->getScalarSizeInBits();
+    return visitIntUnOp(SExt, [&](const APInt &C) -> std::optional<APInt> {
+      return C.sext(DestBW);
+    });
+  }
+  bool visitZExtInst(ZExtInst &ZExt) {
+    uint32_t DestBW = ZExt.getDestTy()->getScalarSizeInBits();
+    bool IsNNeg = ZExt.hasNonNeg();
+    return visitIntUnOp(ZExt, [&](const APInt &C) -> std::optional<APInt> {
+      if (IsNNeg && C.isNegative())
+        return std::nullopt;
+      return C.zext(DestBW);
     });
   }
   bool visitSelect(SelectInst &SI) {
@@ -814,8 +985,31 @@ public:
   }
   bool visitStoreInst(StoreInst &SI) {
     store(getValue(SI.getPointerOperand()), SI.getAlign().value(),
-          getValue(SI.getValueOperand()), SI.getValueOperand()->getType());
+          getValue(SI.getValueOperand()), SI.getValueOperand()->getType(),
+          SI.isVolatile());
     return true;
+  }
+  bool visitLoadInst(LoadInst &LI) {
+    return addValue(LI,
+                    load(getValue(LI.getPointerOperand()),
+                         LI.getAlign().value(), LI.getType(), LI.isVolatile()));
+  }
+  AnyValue handleCall(CallBase &CB) {
+    SmallVector<AnyValue> Args;
+    for (auto &Arg : CB.args())
+      Args.push_back(getValue(Arg));
+    // TODO: handle param attrs
+    auto RetVal = call(cast<Function>(CB.getCalledOperand()), Args);
+    // TODO: handle ret attrs
+    return RetVal;
+  }
+  bool visitCallInst(CallInst &CI) { return addValue(CI, handleCall(CI)); }
+  bool visitReturnInst(ReturnInst &RI) {
+    if (auto *RV = RI.getReturnValue())
+      CurrentFrame->RetVal = getValue(RV);
+    else
+      CurrentFrame->RetVal = none();
+    return false;
   }
   bool visitInstruction(Instruction &I) {
     errs() << I << '\n';
@@ -823,10 +1017,97 @@ public:
   }
 
   AnyValue callIntrinsic(Function *Func, SmallVectorImpl<AnyValue> &Args) {
+    auto IID = Func->getIntrinsicID();
+    Type *RetTy = Func->getReturnType();
+    switch (IID) {
+    case Intrinsic::lifetime_start:
+    case Intrinsic::lifetime_end:
+      return none();
+    case Intrinsic::umin:
+      return visitIntBinOp(
+          RetTy, Args[0], Args[1],
+          [](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+            return APIntOps::umin(LHS, RHS);
+          });
+    case Intrinsic::umax:
+      return visitIntBinOp(
+          RetTy, Args[0], Args[1],
+          [](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+            return APIntOps::umax(LHS, RHS);
+          });
+    case Intrinsic::smin:
+      return visitIntBinOp(
+          RetTy, Args[0], Args[1],
+          [](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+            return APIntOps::smin(LHS, RHS);
+          });
+    case Intrinsic::smax:
+      return visitIntBinOp(
+          RetTy, Args[0], Args[1],
+          [](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+            return APIntOps::smax(LHS, RHS);
+          });
+    case Intrinsic::memcpy:
+    case Intrinsic::memcpy_inline:
+    case Intrinsic::memmove: {
+      auto Size = getInt(Args[2].getSingleValue());
+      if (!Size)
+        ImmUBReporter() << "memcpy with poison size";
+      if (Size->isZero())
+        return none();
+      auto CopySize = Size->getZExtValue();
+      bool IsVolatile = getBooleanNonPoison(Args[3].getSingleValue());
+      auto Dst =
+          getRawPtr(Args[0].getSingleValue(), CopySize, 1U, true, IsVolatile);
+      auto Src =
+          getRawPtr(Args[1].getSingleValue(), CopySize, 1U, false, IsVolatile);
+      if (IID == Intrinsic::memmove)
+        std::memmove(Dst, Src, CopySize);
+      else
+        std::memcpy(Dst, Src, CopySize);
+      return none();
+    }
+    case Intrinsic::memset:
+    case Intrinsic::memset_inline: {
+      auto Size = getInt(Args[2].getSingleValue());
+      if (!Size)
+        ImmUBReporter() << "memcpy with poison size";
+      if (Size->isZero())
+        return none();
+      auto WriteSize = Size->getZExtValue();
+      bool IsVolatile = getBooleanNonPoison(Args[3].getSingleValue());
+      auto Dst =
+          getRawPtr(Args[0].getSingleValue(), WriteSize, 1U, true, IsVolatile);
+      auto Val = getInt(Args[1].getSingleValue());
+      if (!Val)
+        ImmUBReporter() << "memset with poison value";
+      std::memset(Dst, Val->getZExtValue(), WriteSize);
+      return none();
+    }
+    default:
+      break;
+    }
+    errs() << "Intrinsic: " << Func->getName() << '\n';
     llvm_unreachable("Unsupported intrinsic");
   }
   AnyValue callLibFunc(LibFunc Func, Function *FuncDecl,
                        SmallVectorImpl<AnyValue> &Args) {
+    switch (Func) {
+    case LibFunc_printf: {
+      if (Args.size() == 2) {
+        auto Val = getInt(Args[1].getSingleValue());
+        if (!Val.has_value())
+          break;
+        int Ret =
+            printf(getRawPtr(Args[0].getSingleValue()), Val->getSExtValue());
+        return SingleValue{APInt(32, Ret)};
+      }
+      break;
+    }
+    default:
+      break;
+    }
+    errs() << "Libcall: " << FuncDecl->getName() << '\n';
     llvm_unreachable("Unsupported libcall");
   }
   AnyValue call(Function *Func, SmallVectorImpl<AnyValue> &Args) {
@@ -873,13 +1154,6 @@ public:
     auto *Entry = M.getFunction("main");
     if (!Entry) {
       errs() << "Cannot find entry function `main`\n";
-      return EXIT_FAILURE;
-    }
-    auto *FTy = Entry->getFunctionType();
-    if (!FTy->getReturnType()->isIntegerTy(32) || FTy->isFunctionVarArg() ||
-        FTy->getNumParams() != 2 || !FTy->getParamType(0)->isIntegerTy(32) ||
-        !FTy->getParamType(1)->isPointerTy()) {
-      errs() << "Unrecognized func";
       return EXIT_FAILURE;
     }
 
