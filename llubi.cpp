@@ -1538,7 +1538,7 @@ public:
   std::string getValueName(Value *V) {
     std::string Str;
     raw_string_ostream Out(Str);
-    V->print(Out);
+    V->printAsOperand(Out);
     return Str;
   }
   AnyValue handleCall(CallBase &CB) {
