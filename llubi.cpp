@@ -1869,7 +1869,53 @@ public:
       }
       return Res.has_value() ? SingleValue{*Res} : poison();
     }
-
+    case Intrinsic::vector_reduce_fadd:
+    case Intrinsic::vector_reduce_fmul:
+    case Intrinsic::vector_reduce_fmax:
+    case Intrinsic::vector_reduce_fmin:
+    case Intrinsic::vector_reduce_fmaximum:
+    case Intrinsic::vector_reduce_fminimum: {
+      std::optional<APFloat> Res;
+      for (auto &V : Args[0].getValueArray()) {
+        auto &SV = V.getSingleValue();
+        if (isPoison(SV)) {
+          Res.reset();
+          break;
+        }
+        auto &Val = std::get<APFloat>(SV);
+        if (isPoison(Val, FMF)) {
+          Res.reset();
+          break;
+        }
+        if (!Res)
+          Res = Val;
+        else {
+          switch (IID) {
+          case Intrinsic::vector_reduce_fadd:
+            *Res = *Res + Val;
+            break;
+          case Intrinsic::vector_reduce_fmul:
+            *Res = *Res * Val;
+            break;
+          case Intrinsic::vector_reduce_fmax:
+            *Res = maxnum(*Res, Val);
+            break;
+          case Intrinsic::vector_reduce_fmin:
+            *Res = minnum(*Res, Val);
+            break;
+          case Intrinsic::vector_reduce_fmaximum:
+            *Res = maximum(*Res, Val);
+            break;
+          case Intrinsic::vector_reduce_fminimum:
+            *Res = minimum(*Res, Val);
+            break;
+          default:
+            llvm_unreachable("Unexpected intrinsic ID");
+          }
+        }
+      }
+      return Res.has_value() ? handleFMF(std::move(*Res), FMF) : poison();
+    }
     case Intrinsic::fshl:
     case Intrinsic::fshr: {
       return visitIntTriOp(RetTy, Args[0], Args[1], Args[2],
