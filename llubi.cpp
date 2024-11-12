@@ -439,7 +439,8 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   const DataLayout &DL;
   TargetLibraryInfoImpl TLI;
   std::shared_ptr<MemObject> NullPtr;
-  DenseMap<GlobalVariable *, std::shared_ptr<MemObject>> GlobalVariables;
+  DenseMap<GlobalValue *, std::shared_ptr<MemObject>> GlobalValues;
+  DenseMap<size_t, Function *> ValidCallees;
   Frame *CurrentFrame = nullptr;
 
   uint32_t getVectorLength(VectorType *Ty) const {
@@ -514,8 +515,8 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
         Elts.push_back(convertFromConstant(CA->getOperand(I)));
       return std::move(Elts);
     }
-    if (auto *GV = dyn_cast<GlobalVariable>(V)) {
-      return AnyValue{Pointer{GlobalVariables.at(GV), 0}};
+    if (auto *GV = dyn_cast<GlobalValue>(V)) {
+      return AnyValue{Pointer{GlobalValues.at(GV), 0}};
     }
     if (auto *CE = dyn_cast<ConstantExpr>(V)) {
       switch (CE->getOpcode()) {
@@ -657,17 +658,22 @@ public:
     for (auto &GV : M.globals()) {
       if (!GV.hasExactDefinition())
         continue;
-      GlobalVariables.insert({&GV, std::move(MemObject::create(
-                                       GV.getName().str(), false,
-                                       DL.getTypeAllocSize(GV.getValueType()),
-                                       DL.getPreferredAlign(&GV).value()))});
+      GlobalValues.insert({&GV, std::move(MemObject::create(
+                                    GV.getName().str(), false,
+                                    DL.getTypeAllocSize(GV.getValueType()),
+                                    DL.getPreferredAlign(&GV).value()))});
     }
     for (auto &GV : M.globals()) {
       if (!GV.hasExactDefinition())
         continue;
       if (GV.hasInitializer())
-        store(*GlobalVariables.at(&GV), 0U,
+        store(*GlobalValues.at(&GV), 0U,
               convertFromConstant(GV.getInitializer()), GV.getValueType());
+    }
+    for (auto &F : M) {
+      GlobalValues.insert(
+          {&F, std::move(MemObject::create(F.getName().str(), false, 0, 16))});
+      ValidCallees.insert({GlobalValues.at(&F)->address(), &F});
     }
     // Expand constexprs
     while (true) {
@@ -1564,7 +1570,19 @@ public:
     FastMathFlags FMF;
     if (auto *FPOp = dyn_cast<FPMathOperator>(&CB))
       FMF = FPOp->getFastMathFlags();
-    auto RetVal = call(cast<Function>(CB.getCalledOperand()), FMF, Args);
+    auto *CalledFunc = CB.getCalledOperand();
+    Function *Callee = dyn_cast<Function>(CalledFunc);
+    if (!Callee) {
+      auto Addr = getValue(CalledFunc).getSingleValue();
+      if (isPoison(Addr))
+        ImmUBReporter() << "Call with poison callee";
+      auto FuncAddr = std::get<Pointer>(Addr).Address;
+      if (auto It = ValidCallees.find(FuncAddr); It != ValidCallees.end())
+        Callee = It->second;
+      else
+        ImmUBReporter() << "Call with invalid callee";
+    }
+    auto RetVal = call(Callee, FMF, Args);
     handleRangeMetadata(RetVal, CB);
     postProcessAttr(RetVal, CB.getRetAttributes());
     return std::move(RetVal);
@@ -2083,8 +2101,12 @@ public:
     SmallVector<AnyValue> Args;
     Args.push_back(SingleValue{APInt::getZero(32)});
     Args.push_back(SingleValue{Pointer{NullPtr, 0U}});
-    return std::get<APInt>(call(Entry, FastMathFlags{}, Args).getSingleValue())
-        .getSExtValue();
+    auto RetVal = call(Entry, FastMathFlags{}, Args);
+    if (Entry->getReturnType()->isVoidTy())
+      return EXIT_SUCCESS;
+    if (isPoison(RetVal.getSingleValue()))
+      ImmUBReporter() << "Return a poison value";
+    return std::get<APInt>(RetVal.getSingleValue()).getSExtValue();
   }
 };
 
