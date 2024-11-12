@@ -7,6 +7,7 @@
 #include <llvm/ADT/APInt.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/BitVector.h>
+#include <llvm/ADT/FloatingPointMode.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/STLFunctionalExtras.h>
 #include <llvm/ADT/ScopeExit.h>
@@ -15,6 +16,8 @@
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Constant.h>
+#include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -29,6 +32,7 @@
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/PassInstrumentation.h>
@@ -91,16 +95,16 @@ public:
 };
 
 class MemObject final : public std::enable_shared_from_this<MemObject> {
-  StringRef Name;
+  std::string Name;
   bool IsLocal;
   size_t Address;
   SmallVector<std::byte, 16> Data;
 
 public:
   static std::map<size_t, MemObject *> AddressMap;
-  explicit MemObject(StringRef Name, bool IsLocal, size_t Size,
+  explicit MemObject(std::string Name, bool IsLocal, size_t Size,
                      size_t Alignment)
-      : Name(Name), IsLocal(IsLocal), Data(Size) {
+      : Name(std::move(Name)), IsLocal(IsLocal), Data(Size) {
     AllocatedMem = alignTo(AllocatedMem, Alignment);
     Address = AllocatedMem;
     AllocatedMem += Size + Padding;
@@ -114,11 +118,12 @@ public:
     if (Offset + AccessSize > Data.size())
       ImmUBReporter() << "Out of bound mem op, bound = " << Data.size()
                       << ", access range = [" << Offset << ", "
-                      << Offset + AccessSize << ']';
+                      << Offset + AccessSize << ')';
   }
-  static std::shared_ptr<MemObject> create(StringRef Name, bool IsLocal,
+  static std::shared_ptr<MemObject> create(std::string Name, bool IsLocal,
                                            size_t Size, size_t Alignment) {
-    return std::make_shared<MemObject>(Name, IsLocal, Size, Alignment);
+    return std::make_shared<MemObject>(std::move(Name), IsLocal, Size,
+                                       Alignment);
   }
   void store(size_t Offset, const APInt &C) {
     //     errs() << Offset << ' ' << Data.size() << ' ' << C.getBitWidth() << '
@@ -246,24 +251,29 @@ raw_ostream &operator<<(raw_ostream &Out, const SingleValue &Val) {
       P->dumpName(Out);
     else
       Out << "dangling";
-    return Out << " + " << Ptr->Offset << ']';
+    if (Ptr->Offset)
+      Out << " + " << Ptr->Offset;
+    return Out << ']';
   }
   return Out << "poison";
 }
 
 struct AnyValue final {
-  std::variant<SingleValue, std::vector<AnyValue>, std::monostate> Val;
+  std::variant<std::monostate, SingleValue, std::vector<AnyValue>> Val;
 
   AnyValue(SingleValue SV) : Val(std::move(SV)) {}
   AnyValue(std::vector<AnyValue> MV) : Val(std::move(MV)) {}
   AnyValue() = default;
 
+  bool isSingleValue() const {
+    return std::holds_alternative<SingleValue>(Val);
+  }
   const SingleValue &getSingleValue() const {
-    assert(std::holds_alternative<SingleValue>(Val));
+    assert(isSingleValue());
     return std::get<SingleValue>(Val);
   }
   SingleValue &getSingleValue() {
-    assert(std::holds_alternative<SingleValue>(Val));
+    assert(isSingleValue());
     return std::get<SingleValue>(Val);
   }
   const std::vector<AnyValue> &getValueArray() const {
@@ -301,6 +311,91 @@ raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val) {
   return Out << "None";
 }
 
+void handleNoUndef(const SingleValue &V) {
+  if (isPoison(V))
+    ImmUBReporter() << "noundef on a poison value";
+}
+void handleRange(SingleValue &V, const ConstantRange &CR) {
+  if (auto *CI = std::get_if<APInt>(&V)) {
+    if (!CR.contains(*CI))
+      V = poison();
+  }
+}
+void handleAlign(SingleValue &V, size_t Align) {
+  if (isPoison(V))
+    return;
+  auto &Ptr = std::get<Pointer>(V);
+  if (Ptr.Address & (Align - 1))
+    V = poison();
+}
+void handleNonNull(SingleValue &V) {
+  if (isPoison(V))
+    return;
+  auto &Ptr = std::get<Pointer>(V);
+  if (Ptr.Address == 0)
+    V = poison();
+}
+void handleNoFPClass(SingleValue &V, FPClassTest Mask) {
+  if (isPoison(V))
+    return;
+  auto &AFP = std::get<APFloat>(V);
+  if (AFP.classify() & Mask)
+    V = poison();
+}
+void handleDereferenceable(SingleValue &V, uint64_t Size, bool OrNull) {
+  if (isPoison(V))
+    ImmUBReporter() << "dereferenceable on a poison value";
+  auto &Ptr = std::get<Pointer>(V);
+  if (Ptr.Address == 0) {
+    if (OrNull)
+      return;
+    ImmUBReporter() << "dereferenceable on a null pointer";
+  }
+  if (Ptr.Offset + Size > Ptr.Bound) {
+    ImmUBReporter() << "dereferenceable" << (OrNull ? "_or_null" : "") << "("
+                    << Size << ") out of bound :" << V;
+  }
+  if (Ptr.Obj.expired())
+    ImmUBReporter() << "dereferenceable" << (OrNull ? "_or_null" : "")
+                    << " on a dangling pointer";
+}
+void postProcess(AnyValue &V, const function_ref<void(SingleValue &)> &Fn) {
+  if (V.isSingleValue()) {
+    Fn(V.getSingleValue());
+  } else {
+    for (auto &Sub : V.getValueArray())
+      postProcess(Sub, Fn);
+  }
+}
+void postProcessAttr(AnyValue &V, const AttributeSet &AS) {
+  if (AS.hasAttribute(Attribute::Range)) {
+    auto CR = AS.getAttribute(Attribute::Range).getRange();
+    postProcess(V, [CR](SingleValue &SV) { handleRange(SV, CR); });
+  }
+  if (AS.hasAttribute(Attribute::NoFPClass)) {
+    auto Mask = AS.getAttribute(Attribute::NoFPClass).getNoFPClass();
+    postProcess(V, [Mask](SingleValue &SV) { handleNoFPClass(SV, Mask); });
+  }
+  if (AS.hasAttribute(Attribute::Dereferenceable)) {
+    auto Size = AS.getDereferenceableBytes();
+    postProcess(
+        V, [Size](SingleValue &SV) { handleDereferenceable(SV, Size, false); });
+  }
+  if (AS.hasAttribute(Attribute::DereferenceableOrNull)) {
+    auto Size = AS.getDereferenceableOrNullBytes();
+    postProcess(
+        V, [Size](SingleValue &SV) { handleDereferenceable(SV, Size, true); });
+  }
+  if (AS.hasAttribute(Attribute::Alignment)) {
+    auto Align = AS.getAlignment().valueOrOne().value();
+    postProcess(V, [Align](SingleValue &SV) { handleAlign(SV, Align); });
+  }
+  if (AS.hasAttribute(Attribute::NonNull))
+    postProcess(V, handleNonNull);
+  if (AS.hasAttribute(Attribute::NoUndef))
+    postProcess(V, handleNoUndef);
+}
+
 struct Frame final {
   BasicBlock *BB;
   BasicBlock::iterator PC;
@@ -328,7 +423,18 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
     if (Ty->isIntegerTy() || Ty->isFloatingPointTy() || Ty->isPointerTy())
       return poison();
     if (auto *VTy = dyn_cast<VectorType>(Ty))
-      return std::vector<AnyValue>(getVectorLength(VTy));
+      return std::vector<AnyValue>(getVectorLength(VTy), poison());
+    if (auto *ATy = dyn_cast<ArrayType>(Ty))
+      return std::vector<AnyValue>(ATy->getArrayNumElements(),
+                                   getPoison(ATy->getArrayElementType()));
+    if (auto *StructTy = dyn_cast<StructType>(Ty)) {
+      std::vector<AnyValue> Elts;
+      Elts.reserve(StructTy->getStructNumElements());
+      for (uint32_t I = 0, E = StructTy->getStructNumElements(); I != E; ++I)
+        Elts.push_back(getPoison(StructTy->getStructElementType(I)));
+      return std::move(Elts);
+    }
+    errs() << *Ty << '\n';
     llvm_unreachable("Unsupported type");
   }
   AnyValue getZero(Type *Ty) const {
@@ -425,13 +531,19 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
       auto &Ptr = std::get<Pointer>(SV);
       MO.store(Offset, APInt(DL.getPointerSizeInBits(), Ptr.Address));
     } else if (Ty->isVectorTy()) {
-      llvm_unreachable("Not Implemented");
+      Type *EltTy = Ty->getScalarType();
+      auto Step = DL.getTypeStoreSize(EltTy);
+      auto &MV = V.getValueArray();
+      for (auto &Val : MV) {
+        store(MO, Offset, Val, EltTy);
+        Offset += Step;
+      }
     } else if (auto *ArrTy = dyn_cast<ArrayType>(Ty)) {
       Type *EltTy = ArrTy->getElementType();
       auto Step = DL.getTypeStoreSize(EltTy);
       auto &MV = V.getValueArray();
-      for (uint32_t I = 0, E = ArrTy->getNumElements(); I != E; ++I) {
-        store(MO, Offset, MV[I], EltTy);
+      for (auto &Val : MV) {
+        store(MO, Offset, Val, EltTy);
         Offset += Step;
       }
     } else if (auto *StructTy = dyn_cast<StructType>(Ty)) {
@@ -477,6 +589,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   }
   void store(const AnyValue &P, uint32_t Alignment, const AnyValue &V, Type *Ty,
              bool IsVolatile) {
+    // errs() << "Store " << P << ' ' << V << '\n';
     if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
       if (auto MO = PV->Obj.lock()) {
         auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
@@ -515,10 +628,10 @@ public:
     for (auto &GV : M.globals()) {
       if (!GV.hasExactDefinition())
         continue;
-      GlobalVariables.insert(
-          {&GV, std::move(MemObject::create(
-                    GV.getName(), false, DL.getTypeAllocSize(GV.getValueType()),
-                    DL.getPreferredAlign(&GV).value()))});
+      GlobalVariables.insert({&GV, std::move(MemObject::create(
+                                       GV.getName().str(), false,
+                                       DL.getTypeAllocSize(GV.getValueType()),
+                                       DL.getPreferredAlign(&GV).value()))});
     }
     for (auto &GV : M.globals()) {
       if (!GV.hasExactDefinition())
@@ -553,14 +666,18 @@ public:
   }
 
   bool addValue(Instruction &I, AnyValue Val) {
+    if (I.getType()->isVoidTy())
+      return true;
     if (Verbose)
       errs() << " -> " << Val;
     CurrentFrame->ValueMap[&I] = std::move(Val);
     return true;
   }
   bool jumpTo(BasicBlock *To) {
-    if (Verbose)
-      errs() << " jump to " << To->getName();
+    if (Verbose) {
+      errs() << " jump to ";
+      To->printAsOperand(errs(), false);
+    }
     BasicBlock *From = CurrentFrame->BB;
     CurrentFrame->BB = To;
     CurrentFrame->PC = To->begin();
@@ -573,13 +690,18 @@ public:
       } else
         break;
     }
-    for (auto &[K, V] : IncomingValues)
+    for (auto &[K, V] : IncomingValues) {
+      if (Verbose)
+        K->printAsOperand(errs() << "\n    phi ");
       addValue(*K, std::move(V));
+    }
     return false;
   }
   AnyValue getValue(Value *V) {
     if (auto *C = dyn_cast<Constant>(V))
       return convertFromConstant(C);
+    if (isa<MetadataAsValue>(V))
+      return none();
     return CurrentFrame->ValueMap.at(V);
   }
   std::optional<APInt> getInt(const SingleValue &SV) {
@@ -639,7 +761,7 @@ public:
 
   bool visitAllocaInst(AllocaInst &AI) {
     assert(!AI.isArrayAllocation() && "VLA is not implemented yet.");
-    auto Obj = MemObject::create(AI.getName(), true,
+    auto Obj = MemObject::create(getValueName(&AI), true,
                                  DL.getTypeAllocSize(AI.getAllocatedType()),
                                  AI.getPointerAlignment(DL).value());
     Pointer Ptr{Obj, 0U};
@@ -953,13 +1075,26 @@ public:
       return C.zext(DestBW);
     });
   }
-  bool visitFreezeInst(FreezeInst &Freeze) {
-    assert(!Freeze.getType()->isStructTy() && "Not implemented");
-    return visitUnOp(Freeze, [&](const SingleValue &C) -> SingleValue {
+  AnyValue freezeValue(const AnyValue &Val, Type *Ty) {
+    if (auto *StructTy = dyn_cast<StructType>(Ty)) {
+      uint32_t Len = StructTy->getStructNumElements();
+      std::vector<AnyValue> Res;
+      Res.reserve(Len);
+      for (uint32_t I = 0; I != Len; ++I) {
+        auto *EltTy = StructTy->getStructElementType(I);
+        Res.push_back(freezeValue(Val.getValueArray().at(I), EltTy));
+      }
+      return std::move(Res);
+    }
+    return visitUnOp(Ty, Val, [&](const SingleValue &C) -> SingleValue {
       if (isPoison(C))
-        return getZero(Freeze.getType()->getScalarType()).getSingleValue();
+        return getZero(Ty->getScalarType()).getSingleValue();
       return C;
     });
+  }
+  bool visitFreezeInst(FreezeInst &Freeze) {
+    return addValue(
+        Freeze, freezeValue(getValue(Freeze.getOperand(0)), Freeze.getType()));
   }
   bool visitSelect(SelectInst &SI) {
     if (SI.getCondition()->getType()->isIntegerTy(1)) {
@@ -1061,6 +1196,15 @@ public:
     }
     return addValue(EVI, std::move(Res));
   }
+  bool visitInsertValueInst(InsertValueInst &IVI) {
+    auto Res = getValue(IVI.getAggregateOperand());
+    auto Val = getValue(IVI.getInsertedValueOperand());
+    AnyValue *Pos = &Res;
+    for (auto Idx : IVI.indices())
+      Pos = &Pos->getValueArray().at(Idx);
+    *Pos = std::move(Val);
+    return addValue(IVI, std::move(Res));
+  }
   bool visitInsertElementInst(InsertElementInst &IEI) {
     auto Res = getValue(IEI.getOperand(0));
     auto Insert = getValue(IEI.getOperand(1));
@@ -1087,7 +1231,9 @@ public:
     std::vector<AnyValue> PickedValues;
     PickedValues.reserve(SVI.getShuffleMask().size());
     for (auto Idx : SVI.getShuffleMask()) {
-      if (Idx < Size)
+      if (Idx == PoisonMaskElem)
+        PickedValues.push_back(poison());
+      else if (Idx < Size)
         PickedValues.push_back(LHS.getSingleValueAt(Idx));
       else if (RHSIsPoison)
         PickedValues.push_back(getPoison(SVI.getType()->getScalarType()));
@@ -1102,10 +1248,43 @@ public:
           SI.isVolatile());
     return true;
   }
+  void handleRangeMetadata(AnyValue &V, Instruction &I) {
+    if (auto *MD = I.getMetadata(LLVMContext::MD_range)) {
+      auto CR = getConstantRangeFromMetadata(*MD);
+      postProcess(V, [&](SingleValue &SV) { handleRange(SV, CR); });
+    }
+  }
   bool visitLoadInst(LoadInst &LI) {
-    return addValue(LI,
-                    load(getValue(LI.getPointerOperand()),
-                         LI.getAlign().value(), LI.getType(), LI.isVolatile()));
+    auto RetVal = load(getValue(LI.getPointerOperand()), LI.getAlign().value(),
+                       LI.getType(), LI.isVolatile());
+    if (LI.getType()->isPointerTy()) {
+      if (LI.hasMetadata(LLVMContext::MD_nonnull))
+        postProcess(RetVal, handleNonNull);
+      if (auto *MD = LI.getMetadata(LLVMContext::MD_dereferenceable)) {
+        size_t Deref =
+            mdconst::extract<ConstantInt>(MD->getOperand(0))->getLimitedValue();
+        postProcess(RetVal, [Deref](SingleValue &SV) {
+          handleDereferenceable(SV, Deref, false);
+        });
+      }
+      if (auto *MD = LI.getMetadata(LLVMContext::MD_dereferenceable_or_null)) {
+        size_t Deref =
+            mdconst::extract<ConstantInt>(MD->getOperand(0))->getLimitedValue();
+        postProcess(RetVal, [Deref](SingleValue &SV) {
+          handleDereferenceable(SV, Deref, true);
+        });
+      }
+      if (auto *MD = LI.getMetadata(LLVMContext::MD_align)) {
+        size_t Align =
+            mdconst::extract<ConstantInt>(MD->getOperand(0))->getLimitedValue();
+        postProcess(RetVal,
+                    [Align](SingleValue &SV) { handleAlign(SV, Align); });
+      }
+    }
+    handleRangeMetadata(RetVal, LI);
+    if (LI.hasMetadata(LLVMContext::MD_noundef))
+      postProcess(RetVal, handleNoUndef);
+    return addValue(LI, std::move(RetVal));
   }
   void writeBits(APInt &Dst, uint32_t &Offset, const APInt &Src) {
     Dst.insertBits(Src, Offset);
@@ -1129,6 +1308,21 @@ public:
       errs() << "Unrecognized type " << *Ty << '\n';
       llvm_unreachable("Not implemented");
     }
+  }
+  bool visitIntToPtr(IntToPtrInst &I) {
+    return visitUnOp(I, [](const SingleValue &V) -> SingleValue {
+      if (isPoison(V))
+        return poison();
+      return lookupPointer(std::get<APInt>(V).getZExtValue());
+    });
+  }
+  bool visitPtrToInt(PtrToIntInst &I) {
+    return visitUnOp(I, [&](const SingleValue &V) -> SingleValue {
+      if (isPoison(V))
+        return poison();
+      return APInt(I.getType()->getScalarSizeInBits(),
+                   std::get<Pointer>(V).Address);
+    });
   }
   APInt readBits(const APInt &Src, uint32_t &Offset, uint32_t Width) {
     auto Res = Src.extractBits(Width, Offset);
@@ -1168,14 +1362,36 @@ public:
     Offset = 0;
     return addValue(BCI, fromBits(Bits, Offset, BCI.getType()));
   }
+  std::string getValueName(Value *V) {
+    std::string Str;
+    raw_string_ostream Out(Str);
+    V->print(Out);
+    return Str;
+  }
   AnyValue handleCall(CallBase &CB) {
     SmallVector<AnyValue> Args;
-    for (auto &Arg : CB.args())
-      Args.push_back(getValue(Arg));
-    // TODO: handle param attrs
+    SmallVector<std::shared_ptr<MemObject>> ByValTempObjects;
+    for (const auto &[Idx, Arg] : enumerate(CB.args())) {
+      auto ArgVal = getValue(Arg);
+
+      if (CB.isByValArgument(Idx)) {
+        auto *Ty = CB.getParamByValType(Idx);
+        auto TmpMO = MemObject::create(getValueName(Arg.get()), true,
+                                       DL.getTypeAllocSize(Ty),
+                                       DL.getPrefTypeAlign(Ty).value());
+        memcpy(TmpMO->rawPointer(), getRawPtr(ArgVal.getSingleValue()),
+               DL.getTypeStoreSize(Ty));
+        ArgVal = SingleValue{Pointer{TmpMO, 0}};
+        ByValTempObjects.push_back(std::move(TmpMO));
+      }
+
+      postProcessAttr(ArgVal, CB.getParamAttributes(Idx));
+      Args.push_back(std::move(ArgVal));
+    }
     auto RetVal = call(cast<Function>(CB.getCalledOperand()), Args);
-    // TODO: handle ret attrs
-    return RetVal;
+    handleRangeMetadata(RetVal, CB);
+    postProcessAttr(RetVal, CB.getRetAttributes());
+    return std::move(RetVal);
   }
   bool visitCallInst(CallInst &CI) { return addValue(CI, handleCall(CI)); }
   bool visitReturnInst(ReturnInst &RI) {
@@ -1239,6 +1455,7 @@ public:
     switch (IID) {
     case Intrinsic::lifetime_start:
     case Intrinsic::lifetime_end:
+    case Intrinsic::experimental_noalias_scope_decl:
       return none();
     case Intrinsic::umin:
       return visitIntBinOp(
@@ -1473,7 +1690,7 @@ public:
           }
         }
       }
-      return Res.has_value() ? poison() : SingleValue{*Res};
+      return Res.has_value() ? SingleValue{*Res} : poison();
     }
 
     case Intrinsic::fshl:
@@ -1504,9 +1721,13 @@ public:
       if (Args.size() == 2) {
         auto Val = getInt(Args[1].getSingleValue());
         if (!Val.has_value())
-          break;
+          ImmUBReporter() << "print a poison value";
+        if (Verbose)
+          errs() << "\n    Printf: ";
         int Ret =
             printf(getRawPtr(Args[0].getSingleValue()), Val->getSExtValue());
+        if (Verbose)
+          errs() << "  ";
         return SingleValue{APInt(32, Ret)};
       }
       break;
@@ -1518,9 +1739,9 @@ public:
     llvm_unreachable("Unsupported libcall");
   }
   AnyValue call(Function *Func, SmallVectorImpl<AnyValue> &Args) {
-    // TODO: handle param attrs
-    for (auto &Param : Func->args()) {
-    }
+    auto FnAttrs = Func->getAttributes();
+    for (const auto &[Idx, Param] : enumerate(Func->args()))
+      postProcessAttr(Args[Idx], FnAttrs.getParamAttrs(Idx));
 
     if (Func->isIntrinsic()) {
       return callIntrinsic(Func, Args);
@@ -1542,6 +1763,9 @@ public:
     for (auto &Param : Func->args())
       CallFrame.ValueMap[&Param] = std::move(Args[Param.getArgNo()]);
 
+    if (Verbose) {
+      errs() << "\n\nEntering function " << Func->getName() << '\n';
+    }
     CallFrame.BB = &Func->getEntryBlock();
     CallFrame.PC = CallFrame.BB->begin();
     while (!CallFrame.RetVal.has_value()) {
@@ -1553,9 +1777,12 @@ public:
         errs() << '\n';
     }
 
-    // TODO: handle retval attrs
     auto RetVal = std::move(*CallFrame.RetVal);
-    if (!Func->getReturnType()->isVoidTy()) {
+    if (!Func->getReturnType()->isVoidTy())
+      postProcessAttr(RetVal, Func->getAttributes().getRetAttrs());
+
+    if (Verbose) {
+      errs() << "Exiting function " << Func->getName() << '\n';
     }
 
     return RetVal;
