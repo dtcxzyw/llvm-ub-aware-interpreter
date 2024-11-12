@@ -5,6 +5,7 @@
 
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/APInt.h>
+#include <llvm/ADT/APSInt.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/FloatingPointMode.h>
@@ -22,6 +23,7 @@
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Dominators.h>
+#include <llvm/IR/FMF.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
@@ -203,6 +205,13 @@ using SingleValue = std::variant<APInt, APFloat, Pointer, std::monostate>;
 bool isPoison(const SingleValue &SV) {
   return std::holds_alternative<std::monostate>(SV);
 }
+bool isPoison(const APFloat &AFP, FastMathFlags FMF) {
+  if (FMF.noNaNs() && AFP.isNaN())
+    return true;
+  if (FMF.noInfs() && AFP.isInfinity())
+    return true;
+  return false;
+}
 SingleValue boolean(bool Val) { return SingleValue{APInt(1, Val)}; }
 SingleValue poison() { return std::monostate{}; }
 SingleValue lookupPointer(size_t Addr) {
@@ -315,6 +324,19 @@ void handleNoUndef(const SingleValue &V) {
   if (isPoison(V))
     ImmUBReporter() << "noundef on a poison value";
 }
+// TODO: denormal behaviour
+void handleFMF(SingleValue &V, FastMathFlags FMF) {
+  if (isPoison(V))
+    return;
+  auto &AFP = std::get<APFloat>(V);
+  if (isPoison(AFP, FMF))
+    V = poison();
+}
+SingleValue handleFMF(APFloat V, FastMathFlags FMF) {
+  if (isPoison(V, FMF))
+    return poison();
+  return std::move(V);
+}
 void handleRange(SingleValue &V, const ConstantRange &CR) {
   if (auto *CI = std::get_if<APInt>(&V)) {
     if (!CR.contains(*CI))
@@ -366,6 +388,13 @@ void postProcess(AnyValue &V, const function_ref<void(SingleValue &)> &Fn) {
     for (auto &Sub : V.getValueArray())
       postProcess(Sub, Fn);
   }
+}
+AnyValue postProcessFMF(AnyValue V, Instruction &FMFSource) {
+  if (FMFSource.getType()->isFPOrFPVectorTy()) {
+    FastMathFlags FMF = FMFSource.getFastMathFlags();
+    postProcess(V, [FMF](SingleValue &SV) { handleFMF(SV, FMF); });
+  }
+  return std::move(V);
 }
 void postProcessAttr(AnyValue &V, const AttributeSet &AS) {
   if (AS.hasAttribute(Attribute::Range)) {
@@ -685,7 +714,8 @@ public:
     while (true) {
       if (auto *PHI = dyn_cast<PHINode>(CurrentFrame->PC)) {
         IncomingValues.emplace_back(
-            PHI, getValue(PHI->getIncomingValueForBlock(From)));
+            PHI, postProcessFMF(getValue(PHI->getIncomingValueForBlock(From)),
+                                *PHI));
         ++CurrentFrame->PC;
       } else
         break;
@@ -755,7 +785,7 @@ public:
     ImmUBReporter() << "dangling pointer";
   }
 
-  // TODO
+  // TODO: checksum for volatile ops
   void volatileLoad(size_t Addr, size_t Size, size_t Alignment) {}
   void volatileStore(size_t Addr, size_t Size, size_t Alignment) {}
 
@@ -877,10 +907,33 @@ public:
           return poison();
         });
   }
+  AnyValue visitFPBinOp(Type *RetTy, FastMathFlags FMF, const AnyValue &LHS,
+                        const AnyValue &RHS,
+                        const function_ref<std::optional<APFloat>(
+                            const APFloat &, const APFloat &)> &Fn) {
+    return visitBinOp(RetTy, LHS, RHS,
+                      [&Fn, FMF](const SingleValue &LHS,
+                                 const SingleValue &RHS) -> SingleValue {
+                        auto &LHSC = std::get<APFloat>(LHS);
+                        auto &RHSC = std::get<APFloat>(RHS);
+                        if (isPoison(LHSC, FMF) || isPoison(RHSC, FMF))
+                          return poison();
+                        if (auto Res = Fn(LHSC, RHSC))
+                          return handleFMF(*Res, FMF);
+                        return poison();
+                      });
+  }
   bool visitIntBinOp(Instruction &I, const function_ref<std::optional<APInt>(
                                          const APInt &, const APInt &)> &Fn) {
     return addValue(I, visitIntBinOp(I.getType(), getValue(I.getOperand(0)),
                                      getValue(I.getOperand(1)), Fn));
+  }
+  bool visitFPBinOp(Instruction &I,
+                    const function_ref<std::optional<APFloat>(
+                        const APFloat &, const APFloat &)> &Fn) {
+    return addValue(I, visitFPBinOp(I.getType(), I.getFastMathFlags(),
+                                    getValue(I.getOperand(0)),
+                                    getValue(I.getOperand(1)), Fn));
   }
   AnyValue visitIntTriOp(
       Type *RetTy, const AnyValue &X, const AnyValue &Y, const AnyValue &Z,
@@ -894,6 +947,25 @@ public:
                         auto &ZC = std::get<APInt>(Z);
                         if (auto Res = Fn(XC, YC, ZC))
                           return SingleValue{*Res};
+                        return poison();
+                      });
+  }
+  AnyValue
+  visitFPTriOp(Type *RetTy, FastMathFlags FMF, const AnyValue &X,
+               const AnyValue &Y, const AnyValue &Z,
+               const function_ref<std::optional<APFloat>(
+                   const APFloat &, const APFloat &, const APFloat &)> &Fn) {
+    return visitTriOp(RetTy, X, Y, Z,
+                      [&Fn, FMF](const SingleValue &X, const SingleValue &Y,
+                                 const SingleValue &Z) -> SingleValue {
+                        auto &XC = std::get<APFloat>(X);
+                        auto &YC = std::get<APFloat>(Y);
+                        auto &ZC = std::get<APFloat>(Z);
+                        if (isPoison(XC, FMF) || isPoison(YC, FMF) ||
+                            isPoison(ZC, FMF))
+                          return poison();
+                        if (auto Res = Fn(XC, YC, ZC))
+                          return handleFMF(*Res, FMF);
                         return poison();
                       });
   }
@@ -1050,6 +1122,24 @@ public:
     return addValue(I,
                     visitIntUnOp(I.getType(), getValue(I.getOperand(0)), Fn));
   }
+  AnyValue
+  visitFPUnOp(Type *Ty, FastMathFlags FMF, const AnyValue &Val,
+              const function_ref<std::optional<APFloat>(const APFloat &)> &Fn) {
+    return visitUnOp(Ty, Val, [&Fn, FMF](const SingleValue &V) -> SingleValue {
+      auto &C = std::get<APFloat>(V);
+      if (isPoison(C, FMF))
+        return poison();
+      if (auto Res = Fn(C))
+        return handleFMF(*Res, FMF);
+      return poison();
+    });
+  }
+  bool
+  visitFPUnOp(Instruction &I,
+              const function_ref<std::optional<APFloat>(const APFloat &)> &Fn) {
+    return addValue(I, visitFPUnOp(I.getType(), I.getFastMathFlags(),
+                                   getValue(I.getOperand(0)), Fn));
+  }
   bool visitTruncInst(TruncInst &Trunc) {
     uint32_t DestBW = Trunc.getDestTy()->getScalarSizeInBits();
     return visitIntUnOp(Trunc, [&](const APInt &C) -> std::optional<APInt> {
@@ -1074,6 +1164,89 @@ public:
         return std::nullopt;
       return C.zext(DestBW);
     });
+  }
+  bool fpCast(Instruction &I) {
+    auto &DstSem = I.getType()->getScalarType()->getFltSemantics();
+    return visitFPUnOp(I, [&](const APFloat &C) -> std::optional<APFloat> {
+      auto V = C;
+      bool LosesInfo;
+      V.convert(DstSem, APFloat::rmNearestTiesToEven, &LosesInfo);
+      return V;
+    });
+  }
+  bool visitFPExtInst(FPExtInst &FPExt) { return fpCast(FPExt); }
+  bool visitFPTruncInst(FPTruncInst &FPTrunc) { return fpCast(FPTrunc); }
+  bool visitIntToFPInst(Instruction &I, bool IsSigned) {
+    auto &DstSem = I.getType()->getScalarType()->getFltSemantics();
+    return visitUnOp(I, [&](const SingleValue &C) -> SingleValue {
+      if (isPoison(C))
+        return poison();
+      auto &CI = std::get<APInt>(C);
+      if (!IsSigned && I.hasNonNeg() && CI.isNegative())
+        return poison();
+      APFloat V(DstSem);
+      V.convertFromAPInt(CI, IsSigned, APFloat::rmNearestTiesToEven);
+      return V;
+    });
+  }
+  bool visitSIToFPInst(SIToFPInst &I) { return visitIntToFPInst(I, true); }
+  bool visitUIToFPInst(UIToFPInst &I) { return visitIntToFPInst(I, false); }
+  bool visitFPToIntInst(Instruction &I, bool IsSigned) {
+    auto BitWidth = I.getType()->getScalarSizeInBits();
+    return visitUnOp(I, [&](const SingleValue &C) -> SingleValue {
+      if (isPoison(C))
+        return poison();
+      auto &CFP = std::get<APFloat>(C);
+      APSInt V(BitWidth, !IsSigned);
+      bool IsExact;
+      auto Status =
+          CFP.convertToInteger(V, APFloat::rmNearestTiesToEven, &IsExact);
+      if (Status == APFloat::opOK || Status == APFloat::opInexact)
+        return V;
+      return poison();
+    });
+  }
+  bool visitFPToSIInst(FPToSIInst &I) { return visitFPToIntInst(I, true); }
+  bool visitFPToUIInst(FPToUIInst &I) { return visitFPToIntInst(I, false); }
+  bool visitFNeg(UnaryOperator &I) {
+    return visitFPUnOp(I, [](const APFloat &X) { return -X; });
+  }
+  bool visitFAdd(BinaryOperator &I) {
+    return visitFPBinOp(
+        I, [](const APFloat &X, const APFloat &Y) { return X + Y; });
+  }
+  bool visitFSub(BinaryOperator &I) {
+    return visitFPBinOp(
+        I, [](const APFloat &X, const APFloat &Y) { return X - Y; });
+  }
+  bool visitFMul(BinaryOperator &I) {
+    return visitFPBinOp(
+        I, [](const APFloat &X, const APFloat &Y) { return X * Y; });
+  }
+  bool visitFDiv(BinaryOperator &I) {
+    return visitFPBinOp(
+        I, [](const APFloat &X, const APFloat &Y) { return X / Y; });
+  }
+  bool visitFRem(BinaryOperator &I) {
+    return visitFPBinOp(I, [](const APFloat &X, const APFloat &Y) {
+      auto Z = X;
+      Z.mod(Y);
+      return Z;
+    });
+  }
+  bool visitFCmpInst(FCmpInst &FCmp) {
+    auto FMF = FCmp.getFastMathFlags();
+    return visitBinOp(
+        FCmp,
+        [&](const SingleValue &LHS, const SingleValue &RHS) -> SingleValue {
+          if (isPoison(LHS) || isPoison(RHS))
+            return poison();
+          auto &LHSC = std::get<APFloat>(LHS);
+          auto &RHSC = std::get<APFloat>(RHS);
+          if (isPoison(LHSC, FMF) || isPoison(RHSC, FMF))
+            return poison();
+          return boolean(FCmpInst::compare(LHSC, RHSC, FCmp.getPredicate()));
+        });
   }
   AnyValue freezeValue(const AnyValue &Val, Type *Ty) {
     if (auto *StructTy = dyn_cast<StructType>(Ty)) {
@@ -1100,9 +1273,9 @@ public:
     if (SI.getCondition()->getType()->isIntegerTy(1)) {
       switch (getBoolean(SI.getCondition())) {
       case BooleanVal::True:
-        return addValue(SI, getValue(SI.getTrueValue()));
+        return addValue(SI, postProcessFMF(getValue(SI.getTrueValue()), SI));
       case BooleanVal::False:
-        return addValue(SI, getValue(SI.getFalseValue()));
+        return addValue(SI, postProcessFMF(getValue(SI.getFalseValue()), SI));
       case BooleanVal::Poison:
         return addValue(SI, getPoison(SI.getType()));
       }
@@ -1127,7 +1300,7 @@ public:
         break;
       }
     }
-    return addValue(SI, std::move(Res));
+    return addValue(SI, postProcessFMF(std::move(Res), SI));
   }
   bool visitBranchInst(BranchInst &BI) {
     if (BI.isConditional()) {
@@ -1388,7 +1561,10 @@ public:
       postProcessAttr(ArgVal, CB.getParamAttributes(Idx));
       Args.push_back(std::move(ArgVal));
     }
-    auto RetVal = call(cast<Function>(CB.getCalledOperand()), Args);
+    FastMathFlags FMF;
+    if (auto *FPOp = dyn_cast<FPMathOperator>(&CB))
+      FMF = FPOp->getFastMathFlags();
+    auto RetVal = call(cast<Function>(CB.getCalledOperand()), FMF, Args);
     handleRangeMetadata(RetVal, CB);
     postProcessAttr(RetVal, CB.getRetAttributes());
     return std::move(RetVal);
@@ -1449,7 +1625,8 @@ public:
     return std::vector<AnyValue>{std::move(K), std::move(V)};
   }
 
-  AnyValue callIntrinsic(Function *Func, SmallVectorImpl<AnyValue> &Args) {
+  AnyValue callIntrinsic(Function *Func, FastMathFlags FMF,
+                         SmallVectorImpl<AnyValue> &Args) {
     auto IID = Func->getIntrinsicID();
     Type *RetTy = Func->getReturnType();
     switch (IID) {
@@ -1708,6 +1885,67 @@ public:
                              return X.shl(ShlAmt) | Y.lshr(LShrAmt);
                            });
     }
+    case Intrinsic::fabs: {
+      return visitFPUnOp(RetTy, FMF, Args[0],
+                         [](const APFloat &X) { return abs(X); });
+    }
+    case Intrinsic::fma: {
+      return visitFPTriOp(RetTy, FMF, Args[0], Args[1], Args[2],
+                          [](const APFloat &X, const APFloat &Y,
+                             const APFloat &Z) -> std::optional<APFloat> {
+                            auto Res = X;
+                            Res.fusedMultiplyAdd(
+                                Y, Z, RoundingMode::NearestTiesToEven);
+                            return Res;
+                          });
+    }
+    case Intrinsic::fmuladd: {
+      return visitFPTriOp(
+          RetTy, FMF, Args[0], Args[1], Args[2],
+          [](const APFloat &X, const APFloat &Y,
+             const APFloat &Z) -> std::optional<APFloat> { return X * Y + Z; });
+    }
+    case Intrinsic::is_fpclass: {
+      FPClassTest Mask = static_cast<FPClassTest>(
+          getInt(Args[1].getSingleValue())->getZExtValue());
+      return visitUnOp(RetTy, Args[0],
+                       [Mask](const SingleValue &X) -> SingleValue {
+                         if (isPoison(X))
+                           return poison();
+                         return boolean(std::get<APFloat>(X).classify() & Mask);
+                       });
+    }
+    case Intrinsic::copysign:
+    case Intrinsic::maxnum:
+    case Intrinsic::minnum:
+    case Intrinsic::maximum:
+    case Intrinsic::minimum:
+    case Intrinsic::maximumnum:
+    case Intrinsic::minimumnum: {
+      return visitFPBinOp(
+          RetTy, FMF, Args[0], Args[1],
+          [IID](const APFloat &X, const APFloat &Y) -> std::optional<APFloat> {
+            switch (IID) {
+            case Intrinsic::copysign:
+              return APFloat::copySign(X, Y);
+            case Intrinsic::maxnum:
+              return maxnum(X, Y);
+            case Intrinsic::maximum:
+              return maximum(X, Y);
+            case Intrinsic::maximumnum:
+              return maximumnum(X, Y);
+            case Intrinsic::minnum:
+              return minnum(X, Y);
+            case Intrinsic::minimum:
+              return minimum(X, Y);
+            case Intrinsic::minimumnum:
+              return minimumnum(X, Y);
+            default:
+              llvm_unreachable("Unexpected intrinsic ID");
+            }
+          });
+    }
+
     default:
       break;
     }
@@ -1738,13 +1976,14 @@ public:
     errs() << "Libcall: " << FuncDecl->getName() << '\n';
     llvm_unreachable("Unsupported libcall");
   }
-  AnyValue call(Function *Func, SmallVectorImpl<AnyValue> &Args) {
+  AnyValue call(Function *Func, FastMathFlags FMF,
+                SmallVectorImpl<AnyValue> &Args) {
     auto FnAttrs = Func->getAttributes();
     for (const auto &[Idx, Param] : enumerate(Func->args()))
       postProcessAttr(Args[Idx], FnAttrs.getParamAttrs(Idx));
 
     if (Func->isIntrinsic()) {
-      return callIntrinsic(Func, Args);
+      return callIntrinsic(Func, FMF, Args);
     } else {
       LibFunc F;
       if (TLI.getLibFunc(*Func, F))
@@ -1798,7 +2037,8 @@ public:
     SmallVector<AnyValue> Args;
     Args.push_back(SingleValue{APInt::getZero(32)});
     Args.push_back(SingleValue{Pointer{NullPtr, 0U}});
-    return std::get<APInt>(call(Entry, Args).getSingleValue()).getSExtValue();
+    return std::get<APInt>(call(Entry, FastMathFlags{}, Args).getSingleValue())
+        .getSExtValue();
   }
 };
 
