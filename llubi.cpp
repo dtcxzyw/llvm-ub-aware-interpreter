@@ -78,7 +78,7 @@ class ImmUBReporter final {
   raw_ostream &Out;
 
 public:
-  ImmUBReporter() : Out(errs()) { Out << "UB triggered: "; }
+  ImmUBReporter() : Out(errs()) { Out << "\nUB triggered: "; }
   [[noreturn]] ~ImmUBReporter() {
     Out << "\nExited with immediate UB.\n";
     Out.flush();
@@ -344,6 +344,13 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
     if (auto *ATy = dyn_cast<ArrayType>(Ty))
       return std::vector<AnyValue>(ATy->getArrayNumElements(),
                                    getZero(ATy->getArrayElementType()));
+    if (auto *StructTy = dyn_cast<StructType>(Ty)) {
+      std::vector<AnyValue> Elts;
+      Elts.reserve(StructTy->getStructNumElements());
+      for (uint32_t I = 0, E = StructTy->getStructNumElements(); I != E; ++I)
+        Elts.push_back(getZero(StructTy->getStructElementType(I)));
+      return std::move(Elts);
+    }
     errs() << *Ty << '\n';
     llvm_unreachable("Unsupported type");
   }
@@ -442,7 +449,8 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   AnyValue load(const MemObject &MO, uint32_t Offset, Type *Ty) {
     if (Ty->isIntegerTy()) {
       return SingleValue{
-          MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue())};
+          MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue())
+              .trunc(Ty->getScalarSizeInBits())};
     } else if (Ty->isFloatingPointTy()) {
       return SingleValue{APFloat(
           Ty->getFltSemantics(),
@@ -451,8 +459,17 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
       auto Addr =
           MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
       return SingleValue{lookupPointer(Addr.getZExtValue())};
-    } else if (Ty->isVectorTy()) {
-      llvm_unreachable("Not Implemented");
+    } else if (auto *VTy = dyn_cast<VectorType>(Ty)) {
+      uint32_t Len = getVectorLength(VTy);
+      Type *EltTy = VTy->getElementType();
+      size_t Step = DL.getTypeStoreSize(EltTy);
+      std::vector<AnyValue> Res;
+      Res.reserve(Len);
+      for (uint32_t I = 0; I != Len; ++I) {
+        Res.push_back(load(MO, Offset, EltTy));
+        Offset += Step;
+      }
+      return std::move(Res);
     } else {
       errs() << "Unsupproted type: " << *Ty << '\n';
       llvm_unreachable("Unsupported mem store");
@@ -537,11 +554,13 @@ public:
 
   bool addValue(Instruction &I, AnyValue Val) {
     if (Verbose)
-      errs() << I << " -> " << Val << '\n';
+      errs() << " -> " << Val;
     CurrentFrame->ValueMap[&I] = std::move(Val);
     return true;
   }
   bool jumpTo(BasicBlock *To) {
+    if (Verbose)
+      errs() << " jump to " << To->getName();
     BasicBlock *From = CurrentFrame->BB;
     CurrentFrame->BB = To;
     CurrentFrame->PC = To->begin();
@@ -570,6 +589,11 @@ public:
   }
   std::optional<APInt> getInt(Value *V) {
     return getInt(getValue(V).getSingleValue());
+  }
+  APInt getIntNonPoison(Value *V) {
+    if (auto Res = getInt(getValue(V).getSingleValue()))
+      return *Res;
+    ImmUBReporter() << "Expect a non-poison integer";
   }
   enum class BooleanVal { Poison, False, True };
   BooleanVal getBoolean(const SingleValue &SV) {
@@ -670,6 +694,29 @@ public:
                  const function_ref<SingleValue(const SingleValue &)> &Fn) {
     return addValue(I, visitUnOp(I.getType(), getValue(I.getOperand(0)), Fn));
   }
+  AnyValue visitTriOp(
+      Type *RetTy, const AnyValue &X, const AnyValue &Y, const AnyValue &Z,
+      const function_ref<SingleValue(const SingleValue &, const SingleValue &,
+                                     const SingleValue &)> &Fn) {
+    auto FnPoison = [&Fn](const SingleValue &XV, const SingleValue &YV,
+                          const SingleValue &ZV) -> SingleValue {
+      if (isPoison(XV) || isPoison(YV) || isPoison(ZV))
+        return poison();
+      return Fn(XV, YV, ZV);
+    };
+    if (auto *VTy = dyn_cast<VectorType>(RetTy)) {
+      uint32_t Len = getVectorLength(VTy);
+      std::vector<AnyValue> Res;
+      Res.reserve(Len);
+      for (uint32_t I = 0; I != Len; ++I)
+        Res.push_back(
+            AnyValue{FnPoison(X.getSingleValueAt(I), Y.getSingleValueAt(I),
+                              Z.getSingleValueAt(I))});
+      return std::move(Res);
+    }
+    return AnyValue{
+        FnPoison(X.getSingleValue(), Y.getSingleValue(), Z.getSingleValue())};
+  }
 
   bool visitICmpInst(ICmpInst &I) {
     auto ICmp = [&I](const SingleValue &LHS,
@@ -712,6 +759,21 @@ public:
                                          const APInt &, const APInt &)> &Fn) {
     return addValue(I, visitIntBinOp(I.getType(), getValue(I.getOperand(0)),
                                      getValue(I.getOperand(1)), Fn));
+  }
+  AnyValue visitIntTriOp(
+      Type *RetTy, const AnyValue &X, const AnyValue &Y, const AnyValue &Z,
+      const function_ref<std::optional<APInt>(const APInt &, const APInt &,
+                                              const APInt &)> &Fn) {
+    return visitTriOp(RetTy, X, Y, Z,
+                      [&Fn](const SingleValue &X, const SingleValue &Y,
+                            const SingleValue &Z) -> SingleValue {
+                        auto &XC = std::get<APInt>(X);
+                        auto &YC = std::get<APInt>(Y);
+                        auto &ZC = std::get<APInt>(Z);
+                        if (auto Res = Fn(XC, YC, ZC))
+                          return SingleValue{*Res};
+                        return poison();
+                      });
   }
   bool visitAnd(BinaryOperator &I) {
     return visitIntBinOp(
@@ -891,6 +953,14 @@ public:
       return C.zext(DestBW);
     });
   }
+  bool visitFreezeInst(FreezeInst &Freeze) {
+    assert(!Freeze.getType()->isStructTy() && "Not implemented");
+    return visitUnOp(Freeze, [&](const SingleValue &C) -> SingleValue {
+      if (isPoison(C))
+        return getZero(Freeze.getType()->getScalarType()).getSingleValue();
+      return C;
+    });
+  }
   bool visitSelect(SelectInst &SI) {
     if (SI.getCondition()->getType()->isIntegerTy(1)) {
       switch (getBoolean(SI.getCondition())) {
@@ -983,6 +1053,49 @@ public:
     }
     return addValue(GEP, computeGEP(Res, Offset, InBounds));
   }
+  bool visitExtractValueInst(ExtractValueInst &EVI) {
+    AnyValue Res = getValue(EVI.getAggregateOperand());
+    for (auto Idx : EVI.indices()) {
+      auto Sub = std::move(Res.getValueArray().at(Idx));
+      Res = std::move(Sub);
+    }
+    return addValue(EVI, std::move(Res));
+  }
+  bool visitInsertElementInst(InsertElementInst &IEI) {
+    auto Res = getValue(IEI.getOperand(0));
+    auto Insert = getValue(IEI.getOperand(1));
+    auto Idx = getInt(IEI.getOperand(2));
+    if (!Idx.has_value() || Idx->uge(Res.getValueArray().size()))
+      return addValue(IEI, getPoison(IEI.getType()));
+    Res.getValueArray().at(Idx->getZExtValue()) = std::move(Insert);
+    return addValue(IEI, std::move(Res));
+  }
+  bool visitExtractElementInst(ExtractElementInst &EEI) {
+    auto Src = getValue(EEI.getOperand(0));
+    auto Idx = getInt(EEI.getOperand(1));
+    if (!Idx.has_value() || Idx->uge(Src.getValueArray().size()))
+      return addValue(EEI, getPoison(EEI.getType()));
+    return addValue(EEI,
+                    std::move(Src.getValueArray().at(Idx->getZExtValue())));
+  }
+  bool visitShuffleVectorInst(ShuffleVectorInst &SVI) {
+    assert(!SVI.getType()->isScalableTy() && "Not implemented");
+    auto LHS = getValue(SVI.getOperand(0));
+    uint32_t Size = LHS.getValueArray().size();
+    bool RHSIsPoison = isa<PoisonValue>(SVI.getOperand(1));
+    auto RHS = RHSIsPoison ? AnyValue{} : getValue(SVI.getOperand(1));
+    std::vector<AnyValue> PickedValues;
+    PickedValues.reserve(SVI.getShuffleMask().size());
+    for (auto Idx : SVI.getShuffleMask()) {
+      if (Idx < Size)
+        PickedValues.push_back(LHS.getSingleValueAt(Idx));
+      else if (RHSIsPoison)
+        PickedValues.push_back(getPoison(SVI.getType()->getScalarType()));
+      else
+        PickedValues.push_back(RHS.getSingleValueAt(Idx - Size));
+    }
+    return addValue(SVI, std::move(PickedValues));
+  }
   bool visitStoreInst(StoreInst &SI) {
     store(getValue(SI.getPointerOperand()), SI.getAlign().value(),
           getValue(SI.getValueOperand()), SI.getValueOperand()->getType(),
@@ -993,6 +1106,67 @@ public:
     return addValue(LI,
                     load(getValue(LI.getPointerOperand()),
                          LI.getAlign().value(), LI.getType(), LI.isVolatile()));
+  }
+  void writeBits(APInt &Dst, uint32_t &Offset, const APInt &Src) {
+    Dst.insertBits(Src, Offset);
+    Offset += Src.getBitWidth();
+  }
+  void toBits(APInt &Bits, uint32_t &Offset, const AnyValue &Val, Type *Ty) {
+    if (Ty->isIntegerTy()) {
+      writeBits(Bits, Offset, std::get<APInt>(Val.getSingleValue()));
+    } else if (Ty->isFloatingPointTy()) {
+      writeBits(Bits, Offset,
+                std::get<APFloat>(Val.getSingleValue()).bitcastToAPInt());
+    } else if (Ty->isPointerTy()) {
+      writeBits(Bits, Offset,
+                APInt(DL.getPointerSizeInBits(),
+                      std::get<Pointer>(Val.getSingleValue()).Address));
+    } else if (auto *VTy = dyn_cast<VectorType>(Ty)) {
+      Type *EltTy = VTy->getElementType();
+      for (auto &Sub : Val.getValueArray())
+        toBits(Bits, Offset, Sub, EltTy);
+    } else {
+      errs() << "Unrecognized type " << *Ty << '\n';
+      llvm_unreachable("Not implemented");
+    }
+  }
+  APInt readBits(const APInt &Src, uint32_t &Offset, uint32_t Width) {
+    auto Res = Src.extractBits(Width, Offset);
+    Offset += Width;
+    return Res;
+  }
+  AnyValue fromBits(const APInt &Bits, uint32_t &Offset, Type *Ty) {
+    if (Ty->isIntegerTy()) {
+      return SingleValue{readBits(Bits, Offset, Ty->getIntegerBitWidth())};
+    } else if (Ty->isFloatingPointTy()) {
+      return SingleValue{
+          APFloat(Ty->getFltSemantics(),
+                  readBits(Bits, Offset, Ty->getScalarSizeInBits()))};
+    } else if (Ty->isPointerTy()) {
+      return SingleValue{lookupPointer(
+          readBits(Bits, Offset, DL.getPointerSizeInBits()).getZExtValue())};
+    } else if (auto *VTy = dyn_cast<VectorType>(Ty)) {
+      Type *EltTy = VTy->getElementType();
+      uint32_t Len = getVectorLength(VTy);
+      std::vector<AnyValue> Elts;
+      Elts.reserve(Len);
+      for (uint32_t I = 0; I != Len; ++I) {
+        Elts.push_back(fromBits(Bits, Offset, EltTy));
+      }
+      return std::move(Elts);
+    } else {
+      errs() << "Unrecognized type " << *Ty << '\n';
+      llvm_unreachable("Not implemented");
+    }
+  }
+  bool visitBitCastInst(BitCastInst &BCI) {
+    APInt Bits =
+        APInt::getZero(DL.getTypeSizeInBits(BCI.getType()).getFixedValue());
+    uint32_t Offset = 0;
+    toBits(Bits, Offset, getValue(BCI.getOperand(0)),
+           BCI.getOperand(0)->getType());
+    Offset = 0;
+    return addValue(BCI, fromBits(Bits, Offset, BCI.getType()));
   }
   AnyValue handleCall(CallBase &CB) {
     SmallVector<AnyValue> Args;
@@ -1011,9 +1185,52 @@ public:
       CurrentFrame->RetVal = none();
     return false;
   }
+  bool visitUnreachableInst(UnreachableInst &) {
+    ImmUBReporter() << "Unreachable code";
+  }
+  bool visitSwitchInst(SwitchInst &SI) {
+    auto Cond = getInt(SI.getCondition());
+    if (!Cond)
+      ImmUBReporter() << "Switch on poison condition";
+    for (auto &Case : SI.cases()) {
+      if (Case.getCaseValue()->getValue() == *Cond)
+        return jumpTo(Case.getCaseSuccessor());
+    }
+    return jumpTo(SI.getDefaultDest());
+  }
   bool visitInstruction(Instruction &I) {
     errs() << I << '\n';
     llvm_unreachable("Unsupported inst");
+  }
+
+  AnyValue handleWithOverflow(
+      Type *OpTy, const AnyValue &LHS, const AnyValue &RHS,
+      const function_ref<std::pair<APInt, bool>(const APInt &, const APInt &)>
+          &Fn) {
+    auto FnPoison =
+        [&Fn](const SingleValue &LHS,
+              const SingleValue &RHS) -> std::pair<SingleValue, SingleValue> {
+      if (isPoison(LHS) || isPoison(RHS))
+        return {poison(), poison()};
+      auto [Val, Overflow] = Fn(std::get<APInt>(LHS), std::get<APInt>(RHS));
+      return {Val, boolean(Overflow)};
+    };
+    if (auto *VTy = dyn_cast<VectorType>(OpTy)) {
+      uint32_t Len = getVectorLength(VTy);
+      std::vector<AnyValue> Res;
+      std::vector<AnyValue> Overflow;
+      Res.reserve(Len);
+      Overflow.reserve(Len);
+      for (uint32_t I = 0; I != Len; ++I) {
+        auto [K, V] =
+            FnPoison(LHS.getSingleValueAt(I), RHS.getSingleValueAt(I));
+        Res.push_back(std::move(K));
+        Overflow.push_back(std::move(V));
+      }
+      return std::vector<AnyValue>{std::move(Res), std::move(Overflow)};
+    }
+    auto [K, V] = FnPoison(LHS.getSingleValue(), RHS.getSingleValue());
+    return std::vector<AnyValue>{std::move(K), std::move(V)};
   }
 
   AnyValue callIntrinsic(Function *Func, SmallVectorImpl<AnyValue> &Args) {
@@ -1084,6 +1301,196 @@ public:
       std::memset(Dst, Val->getZExtValue(), WriteSize);
       return none();
     }
+    case Intrinsic::ctlz:
+    case Intrinsic::cttz: {
+      bool IsZeroPoison = getBooleanNonPoison(Args[1].getSingleValue());
+      return visitIntUnOp(
+          RetTy, Args[0], [&](const APInt &V) -> std::optional<APInt> {
+            if (IsZeroPoison && V.isZero())
+              return std::nullopt;
+            return APInt(V.getBitWidth(), IID == Intrinsic::ctlz
+                                              ? V.countl_zero()
+                                              : V.countr_zero());
+          });
+    }
+    case Intrinsic::abs: {
+      bool IsIntMinPoison = getBooleanNonPoison(Args[1].getSingleValue());
+      return visitIntUnOp(RetTy, Args[0],
+                          [&](const APInt &V) -> std::optional<APInt> {
+                            if (IsIntMinPoison && V.isMinSignedValue())
+                              return std::nullopt;
+                            return V.abs();
+                          });
+    }
+    case Intrinsic::ctpop:
+      return visitIntUnOp(RetTy, Args[0],
+                          [&](const APInt &V) -> std::optional<APInt> {
+                            return APInt(V.getBitWidth(), V.popcount());
+                          });
+    case Intrinsic::bitreverse:
+      return visitIntUnOp(RetTy, Args[0],
+                          [&](const APInt &V) -> std::optional<APInt> {
+                            return V.reverseBits();
+                          });
+    case Intrinsic::bswap:
+      return visitIntUnOp(
+          RetTy, Args[0],
+          [&](const APInt &V) -> std::optional<APInt> { return V.byteSwap(); });
+    case Intrinsic::ucmp:
+    case Intrinsic::scmp:
+      return visitIntBinOp(
+          RetTy, Args[0], Args[1],
+          [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+            uint32_t BitWidth = LHS.getBitWidth();
+            if (LHS == RHS)
+              return APInt::getZero(BitWidth);
+            return (IID == Intrinsic::ucmp ? LHS.ult(RHS) : LHS.slt(RHS))
+                       ? APInt::getAllOnes(BitWidth)
+                       : APInt(BitWidth, 1);
+          });
+    case Intrinsic::assume: {
+      // TODO: handle operand bundles
+      switch (getBoolean(Args[0].getSingleValue())) {
+      case BooleanVal::Poison:
+        ImmUBReporter() << "assumption violation (poison)";
+      case BooleanVal::False:
+        ImmUBReporter() << "assumption violation (false)";
+      case BooleanVal::True:
+        return none();
+      }
+    }
+    case Intrinsic::sadd_with_overflow:
+    case Intrinsic::ssub_with_overflow:
+    case Intrinsic::smul_with_overflow:
+    case Intrinsic::uadd_with_overflow:
+    case Intrinsic::usub_with_overflow:
+    case Intrinsic::umul_with_overflow:
+      return handleWithOverflow(
+          Func->getArg(0)->getType(), Args[0], Args[1],
+          [IID](const APInt &LHS, const APInt &RHS) -> std::pair<APInt, bool> {
+            APInt Res;
+            bool Overflow = false;
+            switch (IID) {
+            case Intrinsic::sadd_with_overflow:
+              Res = LHS.sadd_ov(RHS, Overflow);
+              break;
+            case Intrinsic::ssub_with_overflow:
+              Res = LHS.ssub_ov(RHS, Overflow);
+              break;
+            case Intrinsic::smul_with_overflow:
+              Res = LHS.smul_ov(RHS, Overflow);
+              break;
+            case Intrinsic::uadd_with_overflow:
+              Res = LHS.uadd_ov(RHS, Overflow);
+              break;
+            case Intrinsic::usub_with_overflow:
+              Res = LHS.usub_ov(RHS, Overflow);
+              break;
+            case Intrinsic::umul_with_overflow:
+              Res = LHS.umul_ov(RHS, Overflow);
+              break;
+            default:
+              llvm_unreachable("Unexpected intrinsic ID");
+            }
+            return {Res, Overflow};
+          });
+    case Intrinsic::sadd_sat:
+    case Intrinsic::ssub_sat:
+    case Intrinsic::sshl_sat:
+    case Intrinsic::uadd_sat:
+    case Intrinsic::usub_sat:
+    case Intrinsic::ushl_sat:
+      return visitIntBinOp(
+          RetTy, Args[0], Args[1],
+          [IID](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
+            switch (IID) {
+            case Intrinsic::sadd_sat:
+              return LHS.sadd_sat(RHS);
+            case Intrinsic::ssub_sat:
+              return LHS.ssub_sat(RHS);
+            case Intrinsic::sshl_sat:
+              return LHS.sshl_sat(RHS);
+            case Intrinsic::uadd_sat:
+              return LHS.uadd_sat(RHS);
+            case Intrinsic::usub_sat:
+              return LHS.usub_sat(RHS);
+            case Intrinsic::ushl_sat:
+              return LHS.ushl_sat(RHS);
+            default:
+              llvm_unreachable("Unexpected intrinsic ID");
+            }
+          });
+    case Intrinsic::vector_reduce_add:
+    case Intrinsic::vector_reduce_mul:
+    case Intrinsic::vector_reduce_and:
+    case Intrinsic::vector_reduce_or:
+    case Intrinsic::vector_reduce_xor:
+    case Intrinsic::vector_reduce_smax:
+    case Intrinsic::vector_reduce_umax:
+    case Intrinsic::vector_reduce_smin:
+    case Intrinsic::vector_reduce_umin: {
+      std::optional<APInt> Res;
+      for (auto &V : Args[0].getValueArray()) {
+        auto &SV = V.getSingleValue();
+        if (isPoison(SV)) {
+          Res.reset();
+          break;
+        }
+        auto &Val = std::get<APInt>(SV);
+        if (!Res)
+          Res = Val;
+        else {
+          switch (IID) {
+          case Intrinsic::vector_reduce_add:
+            *Res += Val;
+            break;
+          case Intrinsic::vector_reduce_mul:
+            *Res *= Val;
+            break;
+          case Intrinsic::vector_reduce_and:
+            *Res &= Val;
+            break;
+          case Intrinsic::vector_reduce_or:
+            *Res |= Val;
+            break;
+          case Intrinsic::vector_reduce_xor:
+            *Res ^= Val;
+            break;
+          case Intrinsic::vector_reduce_smax:
+            *Res = APIntOps::smax(*Res, Val);
+            break;
+          case Intrinsic::vector_reduce_smin:
+            *Res = APIntOps::smin(*Res, Val);
+            break;
+          case Intrinsic::vector_reduce_umax:
+            *Res = APIntOps::umax(*Res, Val);
+            break;
+          case Intrinsic::vector_reduce_umin:
+            *Res = APIntOps::umin(*Res, Val);
+            break;
+          default:
+            llvm_unreachable("Unexpected intrinsic ID");
+          }
+        }
+      }
+      return Res.has_value() ? poison() : SingleValue{*Res};
+    }
+
+    case Intrinsic::fshl:
+    case Intrinsic::fshr: {
+      return visitIntTriOp(RetTy, Args[0], Args[1], Args[2],
+                           [IID](const APInt &X, const APInt &Y,
+                                 const APInt &Z) -> std::optional<APInt> {
+                             uint32_t BitWidth = X.getBitWidth();
+                             uint32_t ShAmt = Z.urem(BitWidth);
+                             bool IsFShr = IID == Intrinsic::fshr;
+                             uint32_t LShrAmt =
+                                 IsFShr ? ShAmt : BitWidth - ShAmt;
+                             uint32_t ShlAmt =
+                                 !IsFShr ? ShAmt : BitWidth - ShAmt;
+                             return X.shl(ShlAmt) | Y.lshr(LShrAmt);
+                           });
+    }
     default:
       break;
     }
@@ -1138,8 +1545,12 @@ public:
     CallFrame.BB = &Func->getEntryBlock();
     CallFrame.PC = CallFrame.BB->begin();
     while (!CallFrame.RetVal.has_value()) {
+      if (Verbose)
+        errs() << *CallFrame.PC;
       if (visit(*CallFrame.PC))
         ++CallFrame.PC;
+      if (Verbose)
+        errs() << '\n';
     }
 
     // TODO: handle retval attrs

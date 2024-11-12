@@ -41,7 +41,7 @@ def csmith_test(i):
         return True
     
     try:
-        ref_out = subprocess.check_output([llvm_dir+"/bin/lli", file_out], timeout=exec_timeout)
+        ref_out = subprocess.check_output([llvm_dir+"/bin/lli", file_out], timeout=exec_timeout,stderr=subprocess.DEVNULL)
     except Exception:
         os.remove(file_c)
         os.remove(file_out)
