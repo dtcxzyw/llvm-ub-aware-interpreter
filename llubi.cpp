@@ -80,7 +80,7 @@ static cl::opt<bool> IgnoreParamAttrsOnIntrinsic(
 static cl::opt<bool> Verbose("verbose", cl::desc("Print step-by-step log"),
                              cl::init(false));
 
-// TODO: handle llvm.lifetime.start/end and llvm.invariant.start.end
+// TODO: handle llvm.lifetime.start/end and llvm.invariant.start.end/TBAA
 size_t AllocatedMem = 0;
 constexpr size_t Padding = 16U;
 
