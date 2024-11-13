@@ -73,6 +73,10 @@ static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input>"),
 static cl::opt<uint32_t> VScaleValue(cl::desc("vscale"),
                                      cl::value_desc("value for llvm.vscale"),
                                      cl::init(4U));
+static cl::opt<bool> IgnoreParamAttrsOnIntrinsic(
+    "ignore-param-attrs-intrinsic",
+    cl::desc("Ignore parameter attributes of intrinsic calls"),
+    cl::init(false));
 static cl::opt<bool> Verbose("verbose", cl::desc("Print step-by-step log"),
                              cl::init(false));
 
@@ -324,18 +328,38 @@ void handleNoUndef(const SingleValue &V) {
   if (isPoison(V))
     ImmUBReporter() << "noundef on a poison value";
 }
-// TODO: denormal behaviour
-void handleFMF(SingleValue &V, FastMathFlags FMF) {
+APFloat handleDenormal(APFloat V, DenormalMode::DenormalModeKind Denormal) {
+  if (V.isDenormal()) {
+    switch (Denormal) {
+    case DenormalMode::PreserveSign:
+      return APFloat::getZero(V.getSemantics(), V.isNegative());
+    case DenormalMode::PositiveZero:
+      return APFloat::getZero(V.getSemantics());
+    case DenormalMode::Invalid:
+    case DenormalMode::IEEE:
+    case DenormalMode::Dynamic:
+    default:
+      break;
+    }
+  }
+  return std::move(V);
+}
+void handleFPVal(SingleValue &V, FastMathFlags FMF,
+                 DenormalMode::DenormalModeKind Denormal) {
   if (isPoison(V))
     return;
   auto &AFP = std::get<APFloat>(V);
-  if (isPoison(AFP, FMF))
+  if (isPoison(AFP, FMF)) {
     V = poison();
+    return;
+  }
+  AFP = handleDenormal(AFP, Denormal);
 }
-SingleValue handleFMF(APFloat V, FastMathFlags FMF) {
+SingleValue handleFPVal(APFloat V, FastMathFlags FMF,
+                        DenormalMode::DenormalModeKind Denormal) {
   if (isPoison(V, FMF))
     return poison();
-  return std::move(V);
+  return handleDenormal(std::move(V), Denormal);
 }
 void handleRange(SingleValue &V, const ConstantRange &CR) {
   if (auto *CI = std::get_if<APInt>(&V)) {
@@ -389,10 +413,12 @@ void postProcess(AnyValue &V, const function_ref<void(SingleValue &)> &Fn) {
       postProcess(Sub, Fn);
   }
 }
-AnyValue postProcessFMF(AnyValue V, Instruction &FMFSource) {
+AnyValue postProcessFPVal(AnyValue V, Instruction &FMFSource) {
   if (FMFSource.getType()->isFPOrFPVectorTy()) {
     FastMathFlags FMF = FMFSource.getFastMathFlags();
-    postProcess(V, [FMF](SingleValue &SV) { handleFMF(SV, FMF); });
+    postProcess(V, [FMF](SingleValue &SV) {
+      handleFPVal(SV, FMF, DenormalMode::IEEE);
+    });
   }
   return std::move(V);
 }
@@ -441,6 +467,8 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   std::shared_ptr<MemObject> NullPtr;
   DenseMap<GlobalValue *, std::shared_ptr<MemObject>> GlobalValues;
   DenseMap<size_t, Function *> ValidCallees;
+  DenseMap<size_t, BasicBlock *> ValidBlockTargets;
+  DenseMap<BasicBlock *, std::shared_ptr<MemObject>> BlockTargets;
   Frame *CurrentFrame = nullptr;
 
   uint32_t getVectorLength(VectorType *Ty) const {
@@ -539,6 +567,8 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
         break;
       }
     }
+    if (auto *BA = dyn_cast<BlockAddress>(V))
+      return SingleValue{Pointer{BlockTargets.at(BA->getBasicBlock()), 0}};
     errs() << *V << '\n';
     llvm_unreachable("Unexpected constant");
   }
@@ -674,6 +704,15 @@ public:
       GlobalValues.insert(
           {&F, std::move(MemObject::create(F.getName().str(), false, 0, 16))});
       ValidCallees.insert({GlobalValues.at(&F)->address(), &F});
+      for (auto &BB : F) {
+        if (BB.isEntryBlock())
+          continue;
+        BlockTargets.insert(
+            {&BB,
+             std::move(MemObject::create(
+                 F.getName().str() + ":" + getValueName(&BB), true, 0, 16))});
+        ValidBlockTargets.insert({GlobalValues.at(&F)->address(), &BB});
+      }
     }
     // Expand constexprs
     while (true) {
@@ -720,8 +759,8 @@ public:
     while (true) {
       if (auto *PHI = dyn_cast<PHINode>(CurrentFrame->PC)) {
         IncomingValues.emplace_back(
-            PHI, postProcessFMF(getValue(PHI->getIncomingValueForBlock(From)),
-                                *PHI));
+            PHI, postProcessFPVal(getValue(PHI->getIncomingValueForBlock(From)),
+                                  *PHI));
         ++CurrentFrame->PC;
       } else
         break;
@@ -789,6 +828,13 @@ public:
       return MO->rawPointer() + Ptr.Offset;
     }
     ImmUBReporter() << "dangling pointer";
+  }
+  DenormalMode getCurrentDenormalMode(Type *Ty) {
+    if (Ty->isFPOrFPVectorTy() && CurrentFrame) {
+      return CurrentFrame->BB->getParent()->getDenormalMode(
+          Ty->getScalarType()->getFltSemantics());
+    }
+    return DenormalMode::getDefault();
   }
 
   // TODO: checksum for volatile ops
@@ -917,17 +963,20 @@ public:
                         const AnyValue &RHS,
                         const function_ref<std::optional<APFloat>(
                             const APFloat &, const APFloat &)> &Fn) {
-    return visitBinOp(RetTy, LHS, RHS,
-                      [&Fn, FMF](const SingleValue &LHS,
-                                 const SingleValue &RHS) -> SingleValue {
-                        auto &LHSC = std::get<APFloat>(LHS);
-                        auto &RHSC = std::get<APFloat>(RHS);
-                        if (isPoison(LHSC, FMF) || isPoison(RHSC, FMF))
-                          return poison();
-                        if (auto Res = Fn(LHSC, RHSC))
-                          return handleFMF(*Res, FMF);
-                        return poison();
-                      });
+    auto Denormal = getCurrentDenormalMode(RetTy);
+    return visitBinOp(
+        RetTy, LHS, RHS,
+        [&Fn, FMF, Denormal](const SingleValue &LHS,
+                             const SingleValue &RHS) -> SingleValue {
+          auto &LHSC = std::get<APFloat>(LHS);
+          auto &RHSC = std::get<APFloat>(RHS);
+          if (isPoison(LHSC, FMF) || isPoison(RHSC, FMF))
+            return poison();
+          if (auto Res = Fn(handleDenormal(LHSC, Denormal.Input),
+                            handleDenormal(RHSC, Denormal.Input)))
+            return handleFPVal(*Res, FMF, Denormal.Output);
+          return poison();
+        });
   }
   bool visitIntBinOp(Instruction &I, const function_ref<std::optional<APInt>(
                                          const APInt &, const APInt &)> &Fn) {
@@ -961,19 +1010,22 @@ public:
                const AnyValue &Y, const AnyValue &Z,
                const function_ref<std::optional<APFloat>(
                    const APFloat &, const APFloat &, const APFloat &)> &Fn) {
-    return visitTriOp(RetTy, X, Y, Z,
-                      [&Fn, FMF](const SingleValue &X, const SingleValue &Y,
-                                 const SingleValue &Z) -> SingleValue {
-                        auto &XC = std::get<APFloat>(X);
-                        auto &YC = std::get<APFloat>(Y);
-                        auto &ZC = std::get<APFloat>(Z);
-                        if (isPoison(XC, FMF) || isPoison(YC, FMF) ||
-                            isPoison(ZC, FMF))
-                          return poison();
-                        if (auto Res = Fn(XC, YC, ZC))
-                          return handleFMF(*Res, FMF);
-                        return poison();
-                      });
+    auto Denormal = getCurrentDenormalMode(RetTy);
+    return visitTriOp(
+        RetTy, X, Y, Z,
+        [&Fn, FMF, Denormal](const SingleValue &X, const SingleValue &Y,
+                             const SingleValue &Z) -> SingleValue {
+          auto &XC = std::get<APFloat>(X);
+          auto &YC = std::get<APFloat>(Y);
+          auto &ZC = std::get<APFloat>(Z);
+          if (isPoison(XC, FMF) || isPoison(YC, FMF) || isPoison(ZC, FMF))
+            return poison();
+          if (auto Res = Fn(handleDenormal(XC, Denormal.Input),
+                            handleDenormal(YC, Denormal.Input),
+                            handleDenormal(ZC, Denormal.Input)))
+            return handleFPVal(*Res, FMF, Denormal.Output);
+          return poison();
+        });
   }
   bool visitAnd(BinaryOperator &I) {
     return visitIntBinOp(
@@ -1129,16 +1181,18 @@ public:
                     visitIntUnOp(I.getType(), getValue(I.getOperand(0)), Fn));
   }
   AnyValue
-  visitFPUnOp(Type *Ty, FastMathFlags FMF, const AnyValue &Val,
+  visitFPUnOp(Type *RetTy, FastMathFlags FMF, const AnyValue &Val,
               const function_ref<std::optional<APFloat>(const APFloat &)> &Fn) {
-    return visitUnOp(Ty, Val, [&Fn, FMF](const SingleValue &V) -> SingleValue {
-      auto &C = std::get<APFloat>(V);
-      if (isPoison(C, FMF))
-        return poison();
-      if (auto Res = Fn(C))
-        return handleFMF(*Res, FMF);
-      return poison();
-    });
+    auto Denormal = getCurrentDenormalMode(RetTy);
+    return visitUnOp(RetTy, Val,
+                     [&Fn, FMF, Denormal](const SingleValue &V) -> SingleValue {
+                       auto &C = std::get<APFloat>(V);
+                       if (isPoison(C, FMF))
+                         return poison();
+                       if (auto Res = Fn(handleDenormal(C, Denormal.Input)))
+                         return handleFPVal(*Res, FMF, Denormal.Output);
+                       return poison();
+                     });
   }
   bool
   visitFPUnOp(Instruction &I,
@@ -1279,9 +1333,9 @@ public:
     if (SI.getCondition()->getType()->isIntegerTy(1)) {
       switch (getBoolean(SI.getCondition())) {
       case BooleanVal::True:
-        return addValue(SI, postProcessFMF(getValue(SI.getTrueValue()), SI));
+        return addValue(SI, postProcessFPVal(getValue(SI.getTrueValue()), SI));
       case BooleanVal::False:
-        return addValue(SI, postProcessFMF(getValue(SI.getFalseValue()), SI));
+        return addValue(SI, postProcessFPVal(getValue(SI.getFalseValue()), SI));
       case BooleanVal::Poison:
         return addValue(SI, getPoison(SI.getType()));
       }
@@ -1306,7 +1360,7 @@ public:
         break;
       }
     }
-    return addValue(SI, postProcessFMF(std::move(Res), SI));
+    return addValue(SI, postProcessFPVal(std::move(Res), SI));
   }
   bool visitBranchInst(BranchInst &BI) {
     if (BI.isConditional()) {
@@ -1320,6 +1374,21 @@ public:
       }
     }
     return jumpTo(BI.getSuccessor(0));
+  }
+  bool visitIndirectBrInst(IndirectBrInst &IBI) {
+    auto Ptr = getValue(IBI.getAddress()).getSingleValue();
+    if (isPoison(Ptr))
+      ImmUBReporter() << "Indirect branch on poison";
+    auto It = ValidBlockTargets.find(std::get<Pointer>(Ptr).Address);
+    if (It == ValidBlockTargets.end())
+      ImmUBReporter() << "Indirect branch on invalid target BB";
+    auto DestBB = It->second;
+    for (uint32_t I = 0, E = IBI.getNumDestinations(); I != E; ++I) {
+      if (IBI.getDestination(I) == DestBB)
+        return jumpTo(DestBB);
+    }
+    ImmUBReporter() << "Indirect branch on unlisted target BB "
+                    << *BlockAddress::get(DestBB);
   }
   SingleValue computeGEP(const SingleValue &Base, const APInt &Offset,
                          bool InBounds) {
@@ -1550,6 +1619,8 @@ public:
   AnyValue handleCall(CallBase &CB) {
     SmallVector<AnyValue> Args;
     SmallVector<std::shared_ptr<MemObject>> ByValTempObjects;
+    bool HandleParamAttr =
+        !isa<IntrinsicInst>(CB) || !IgnoreParamAttrsOnIntrinsic;
     for (const auto &[Idx, Arg] : enumerate(CB.args())) {
       auto ArgVal = getValue(Arg);
 
@@ -1564,7 +1635,8 @@ public:
         ByValTempObjects.push_back(std::move(TmpMO));
       }
 
-      postProcessAttr(ArgVal, CB.getParamAttributes(Idx));
+      if (HandleParamAttr)
+        postProcessAttr(ArgVal, CB.getParamAttributes(Idx));
       Args.push_back(std::move(ArgVal));
     }
     FastMathFlags FMF;
@@ -1893,6 +1965,7 @@ public:
     case Intrinsic::vector_reduce_fmin:
     case Intrinsic::vector_reduce_fmaximum:
     case Intrinsic::vector_reduce_fminimum: {
+      auto Denormal = getCurrentDenormalMode(RetTy);
       std::optional<APFloat> Res;
       for (auto &V : Args[0].getValueArray()) {
         auto &SV = V.getSingleValue();
@@ -1905,6 +1978,7 @@ public:
           Res.reset();
           break;
         }
+        Val = handleDenormal(std::move(Val), Denormal.Input);
         if (!Res)
           Res = Val;
         else {
@@ -1932,7 +2006,9 @@ public:
           }
         }
       }
-      return Res.has_value() ? handleFMF(std::move(*Res), FMF) : poison();
+      return Res.has_value()
+                 ? handleFPVal(std::move(*Res), FMF, Denormal.Output)
+                 : poison();
     }
     case Intrinsic::fshl:
     case Intrinsic::fshr: {

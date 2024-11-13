@@ -19,6 +19,11 @@ csmith_command = csmith_dir +"/bin/csmith --max-funcs 3 --max-block-depth 5 --qu
 compile_command = llvm_dir + "/bin/clang -DNDEBUG -g0 -w -I" + csmith_dir + "/include "
 comp_timeout = 10.0
 exec_timeout = 1.0
+llubi_workarounds = [
+# https://github.com/llvm/llvm-project/issues/115890
+# https://github.com/llvm/llvm-project/issues/115976
+'--ignore-param-attrs-intrinsic'
+]
 
 cwd = "csmith"+datetime.datetime.now().strftime("%Y-%m-%d@%H:%M")
 os.makedirs(cwd)
@@ -52,7 +57,7 @@ def csmith_test(i):
         return None
 
     try:
-        out = subprocess.check_output([llubi_bin, file_out], timeout=exec_timeout * 2)
+        out = subprocess.check_output([llubi_bin, file_out] + llubi_workarounds, timeout=exec_timeout * 2)
     except subprocess.TimeoutExpired:
         # Ignore timeout
         os.remove(file_c)
