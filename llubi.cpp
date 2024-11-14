@@ -878,25 +878,29 @@ public:
                                   getValue(I.getOperand(1)), Fn));
   }
   AnyValue visitUnOp(Type *RetTy, const AnyValue &Val,
-                     const function_ref<SingleValue(const SingleValue &)> &Fn) {
+                     const function_ref<SingleValue(const SingleValue &)> &Fn,
+                     bool PropagatesPoison = true) {
     auto FnPoison = [&Fn](const SingleValue &V) -> SingleValue {
       if (isPoison(V))
         return poison();
       return Fn(V);
     };
+    auto &UsedFn = PropagatesPoison ? FnPoison : Fn;
     if (auto *VTy = dyn_cast<VectorType>(RetTy)) {
       uint32_t Len = getVectorLength(VTy);
       std::vector<AnyValue> Res;
       Res.reserve(Len);
       for (uint32_t I = 0; I != Len; ++I)
-        Res.push_back(AnyValue{FnPoison(Val.getSingleValueAt(I))});
+        Res.push_back(AnyValue{UsedFn(Val.getSingleValueAt(I))});
       return std::move(Res);
     }
-    return AnyValue{FnPoison(Val.getSingleValue())};
+    return AnyValue{UsedFn(Val.getSingleValue())};
   }
   bool visitUnOp(Instruction &I,
-                 const function_ref<SingleValue(const SingleValue &)> &Fn) {
-    return addValue(I, visitUnOp(I.getType(), getValue(I.getOperand(0)), Fn));
+                 const function_ref<SingleValue(const SingleValue &)> &Fn,
+                 bool PropagatesPoison = true) {
+    return addValue(I, visitUnOp(I.getType(), getValue(I.getOperand(0)), Fn,
+                                 PropagatesPoison));
   }
   AnyValue visitTriOp(
       Type *RetTy, const AnyValue &X, const AnyValue &Y, const AnyValue &Z,
@@ -1319,11 +1323,14 @@ public:
       }
       return std::move(Res);
     }
-    return visitUnOp(Ty, Val, [&](const SingleValue &C) -> SingleValue {
-      if (isPoison(C))
-        return getZero(Ty->getScalarType()).getSingleValue();
-      return C;
-    });
+    return visitUnOp(
+        Ty, Val,
+        [&](const SingleValue &C) -> SingleValue {
+          if (isPoison(C))
+            return getZero(Ty->getScalarType()).getSingleValue();
+          return C;
+        },
+        /*PropagatesPoison=*/false);
   }
   bool visitFreezeInst(FreezeInst &Freeze) {
     return addValue(
