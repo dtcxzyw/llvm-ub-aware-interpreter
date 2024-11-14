@@ -1538,7 +1538,12 @@ public:
     Dst.insertBits(Src, Offset);
     Offset += Src.getBitWidth();
   }
-  void toBits(APInt &Bits, uint32_t &Offset, const AnyValue &Val, Type *Ty) {
+  void toBits(APInt &Bits, uint32_t &Offset, const AnyValue &Val, Type *Ty,
+              bool &HasPoisonBits) {
+    if (Val.isSingleValue() && isPoison(Val.getSingleValue())) {
+      HasPoisonBits = true;
+      return;
+    }
     if (Ty->isIntegerTy()) {
       writeBits(Bits, Offset, std::get<APInt>(Val.getSingleValue()));
     } else if (Ty->isFloatingPointTy()) {
@@ -1551,7 +1556,7 @@ public:
     } else if (auto *VTy = dyn_cast<VectorType>(Ty)) {
       Type *EltTy = VTy->getElementType();
       for (auto &Sub : Val.getValueArray())
-        toBits(Bits, Offset, Sub, EltTy);
+        toBits(Bits, Offset, Sub, EltTy, HasPoisonBits);
     } else {
       errs() << "Unrecognized type " << *Ty << '\n';
       llvm_unreachable("Not implemented");
@@ -1605,8 +1610,11 @@ public:
     APInt Bits =
         APInt::getZero(DL.getTypeSizeInBits(BCI.getType()).getFixedValue());
     uint32_t Offset = 0;
+    bool HasPoisonBits = false;
     toBits(Bits, Offset, getValue(BCI.getOperand(0)),
-           BCI.getOperand(0)->getType());
+           BCI.getOperand(0)->getType(), HasPoisonBits);
+    if (HasPoisonBits)
+      return addValue(BCI, getPoison(BCI.getType()));
     Offset = 0;
     return addValue(BCI, fromBits(Bits, Offset, BCI.getType()));
   }
