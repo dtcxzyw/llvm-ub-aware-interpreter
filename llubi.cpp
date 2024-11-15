@@ -1545,10 +1545,11 @@ public:
     Dst.insertBits(Src, Offset);
     Offset += Src.getBitWidth();
   }
-  void toBits(APInt &Bits, uint32_t &Offset, const AnyValue &Val, Type *Ty,
-              bool &HasPoisonBits) {
+  void toBits(APInt &Bits, APInt &PoisonBits, uint32_t &Offset,
+              const AnyValue &Val, Type *Ty) {
     if (Val.isSingleValue() && isPoison(Val.getSingleValue())) {
-      HasPoisonBits = true;
+      unsigned BW = DL.getTypeSizeInBits(Ty).getFixedValue();
+      PoisonBits.setBits(Offset, Offset + BW);
       return;
     }
     if (Ty->isIntegerTy()) {
@@ -1563,7 +1564,7 @@ public:
     } else if (auto *VTy = dyn_cast<VectorType>(Ty)) {
       Type *EltTy = VTy->getElementType();
       for (auto &Sub : Val.getValueArray())
-        toBits(Bits, Offset, Sub, EltTy, HasPoisonBits);
+        toBits(Bits, PoisonBits, Offset, Sub, EltTy);
     } else {
       errs() << "Unrecognized type " << *Ty << '\n';
       llvm_unreachable("Not implemented");
@@ -1589,7 +1590,14 @@ public:
     Offset += Width;
     return Res;
   }
-  AnyValue fromBits(const APInt &Bits, uint32_t &Offset, Type *Ty) {
+  AnyValue fromBits(const APInt &Bits, const APInt &PoisonBits,
+                    uint32_t &Offset, Type *Ty) {
+    if (Ty->isIntOrPtrTy() || Ty->isFloatingPointTy()) {
+      if (APInt::getBitsSet(Bits.getBitWidth(), Offset,
+                            Offset + Ty->getScalarSizeInBits())
+              .intersects(PoisonBits))
+        return getPoison(Ty);
+    }
     if (Ty->isIntegerTy()) {
       return SingleValue{readBits(Bits, Offset, Ty->getIntegerBitWidth())};
     } else if (Ty->isFloatingPointTy()) {
@@ -1605,7 +1613,7 @@ public:
       std::vector<AnyValue> Elts;
       Elts.reserve(Len);
       for (uint32_t I = 0; I != Len; ++I) {
-        Elts.push_back(fromBits(Bits, Offset, EltTy));
+        Elts.push_back(fromBits(Bits, PoisonBits, Offset, EltTy));
       }
       return std::move(Elts);
     } else {
@@ -1616,14 +1624,12 @@ public:
   bool visitBitCastInst(BitCastInst &BCI) {
     APInt Bits =
         APInt::getZero(DL.getTypeSizeInBits(BCI.getType()).getFixedValue());
+    APInt PoisonBits = Bits;
     uint32_t Offset = 0;
-    bool HasPoisonBits = false;
-    toBits(Bits, Offset, getValue(BCI.getOperand(0)),
-           BCI.getOperand(0)->getType(), HasPoisonBits);
-    if (HasPoisonBits)
-      return addValue(BCI, getPoison(BCI.getType()));
+    toBits(Bits, PoisonBits, Offset, getValue(BCI.getOperand(0)),
+           BCI.getOperand(0)->getType());
     Offset = 0;
-    return addValue(BCI, fromBits(Bits, Offset, BCI.getType()));
+    return addValue(BCI, fromBits(Bits, PoisonBits, Offset, BCI.getType()));
   }
   std::string getValueName(Value *V) {
     std::string Str;
