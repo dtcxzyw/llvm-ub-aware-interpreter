@@ -17,7 +17,7 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 include(AddLLVM)
 
 include_directories(${LLVM_INCLUDE_DIRS})
-set(LLVM_LINK_COMPONENTS core support irreader irprinter)
+set(LLVM_LINK_COMPONENTS core support irreader irprinter targetparser analysis)
 if (LLUBI_ENABLE_ASAN)
 add_compile_options("-ggdb")
 add_compile_options("-fsanitize=address")
