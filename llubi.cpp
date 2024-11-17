@@ -1842,17 +1842,18 @@ public:
           RetTy, Args[0],
           [&](const APInt &V) -> std::optional<APInt> { return V.byteSwap(); });
     case Intrinsic::ucmp:
-    case Intrinsic::scmp:
+    case Intrinsic::scmp: {
+      uint32_t BitWidth = RetTy->getScalarSizeInBits();
       return visitIntBinOp(
           RetTy, Args[0], Args[1],
           [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
-            uint32_t BitWidth = LHS.getBitWidth();
             if (LHS == RHS)
               return APInt::getZero(BitWidth);
             return (IID == Intrinsic::ucmp ? LHS.ult(RHS) : LHS.slt(RHS))
                        ? APInt::getAllOnes(BitWidth)
                        : APInt(BitWidth, 1);
           });
+    }
     case Intrinsic::assume: {
       // TODO: handle operand bundles
       switch (getBoolean(Args[0].getSingleValue())) {
