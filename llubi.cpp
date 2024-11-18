@@ -25,6 +25,7 @@
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/FMF.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/GEPNoWrapFlags.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstVisitor.h>
@@ -1398,36 +1399,86 @@ public:
                     << *BlockAddress::get(DestBB);
   }
   SingleValue computeGEP(const SingleValue &Base, const APInt &Offset,
-                         bool InBounds) {
+                         GEPNoWrapFlags Flags) {
     if (isPoison(Base))
       return Base;
     auto &Ptr = std::get<Pointer>(Base);
-    return offsetPointer(Ptr, Offset.getSExtValue(), InBounds);
+    // TODO: nusw/nsw
+    return offsetPointer(Ptr, Offset.getSExtValue(), Flags.isInBounds());
   }
   bool visitGetElementPtrInst(GetElementPtrInst &GEP) {
-    // TODO: handle nuw/nusw/inrange
+    // TODO: handle inrange
     uint32_t BitWidth = DL.getIndexSizeInBits(0);
     APInt Offset = APInt::getZero(BitWidth);
     SmallMapVector<Value *, APInt, 4> VarOffsets;
     if (!GEP.collectOffset(DL, BitWidth, VarOffsets, Offset))
       llvm_unreachable("Unsupported GEP");
-    bool InBounds = GEP.isInBounds();
+    auto Flags = GEP.getNoWrapFlags();
+    auto CanonicalizeBitWidth = [&](APInt &Idx) {
+      if (Idx.getBitWidth() == BitWidth)
+        return true;
+      if (Idx.getBitWidth() > BitWidth) {
+        if (Flags.hasNoUnsignedSignedWrap() &&
+            Idx.getSignificantBits() > BitWidth)
+          return false;
+        if (Flags.hasNoUnsignedWrap() && Idx.getActiveBits() > BitWidth)
+          return false;
+        Idx = Idx.trunc(BitWidth);
+        return true;
+      }
+      Idx = Idx.sext(BitWidth);
+      return true;
+    };
+    auto MulIdxScale = [&](const APInt &Idx,
+                           const APInt &Scale) -> std::optional<APInt> {
+      if (Flags.hasNoUnsignedSignedWrap() && Flags.hasNoUnsignedWrap()) {
+        bool Overflow = false;
+        APInt Res = Idx.smul_ov(Scale, Overflow);
+        if (Overflow)
+          return std::nullopt;
+        (void)Idx.umul_ov(Scale, Overflow);
+        if (Overflow)
+          return std::nullopt;
+        return Res;
+      }
+      if (Flags.hasNoUnsignedSignedWrap()) {
+        bool Overflow = false;
+        APInt Res = Idx.smul_ov(Scale, Overflow);
+        if (Overflow)
+          return std::nullopt;
+        return Res;
+      }
+      if (Flags.hasNoUnsignedWrap()) {
+        bool Overflow = false;
+        APInt Res = Idx.umul_ov(Scale, Overflow);
+        if (Overflow)
+          return std::nullopt;
+        return Res;
+      }
+      return Idx * Scale;
+    };
     if (auto *VTy = dyn_cast<VectorType>(GEP.getType())) {
       uint32_t Len = getVectorLength(VTy);
       AnyValue Res = getValue(GEP.getPointerOperand());
       for (auto &[K, V] : VarOffsets) {
         auto KV = getValue(K);
         for (uint32_t I = 0; I != Len; ++I) {
-          if (auto Idx = getInt(KV.getSingleValueAt(I)))
-            Res.getSingleValueAt(I) =
-                computeGEP(Res.getSingleValueAt(I), *Idx * V, InBounds);
-          else
-            Res.getSingleValueAt(I) = poison();
+          if (auto Idx = getInt(KV.getSingleValueAt(I))) {
+            auto &IdxVal = *Idx;
+            if (CanonicalizeBitWidth(IdxVal)) {
+              if (auto Off = MulIdxScale(IdxVal, V)) {
+                Res.getSingleValueAt(I) =
+                    computeGEP(Res.getSingleValueAt(I), *Off, Flags);
+                continue;
+              }
+            }
+          }
+          Res.getSingleValueAt(I) = poison();
         }
       }
       for (uint32_t I = 0; I != Len; ++I) {
         Res.getSingleValueAt(I) =
-            computeGEP(Res.getSingleValueAt(I), Offset, InBounds);
+            computeGEP(Res.getSingleValueAt(I), Offset, Flags);
       }
       return addValue(GEP, std::move(Res));
     }
@@ -1436,12 +1487,18 @@ public:
     if (isPoison(Res))
       return addValue(GEP, Res);
     for (auto &[K, V] : VarOffsets) {
-      if (auto Idx = getInt(K))
-        Res = computeGEP(Res, *Idx * V, InBounds);
-      else
-        return addValue(GEP, poison());
+      if (auto Idx = getInt(K)) {
+        auto &IdxVal = *Idx;
+        if (CanonicalizeBitWidth(IdxVal)) {
+          if (auto Off = MulIdxScale(IdxVal, V)) {
+            Res = computeGEP(Res, *Off, Flags);
+            continue;
+          }
+        }
+      }
+      return addValue(GEP, poison());
     }
-    return addValue(GEP, computeGEP(Res, Offset, InBounds));
+    return addValue(GEP, computeGEP(Res, Offset, Flags));
   }
   bool visitExtractValueInst(ExtractValueInst &EVI) {
     AnyValue Res = getValue(EVI.getAggregateOperand());
