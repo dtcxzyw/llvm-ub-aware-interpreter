@@ -73,24 +73,27 @@
 #include <variant>
 
 using namespace llvm;
+static cl::OptionCategory Category("LLUBI Options");
 static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input>"),
                                       cl::Required,
-                                      cl::value_desc("path to input IR"));
+                                      cl::value_desc("path to input IR"),
+                                      cl::cat(Category));
 static cl::opt<uint32_t> VScaleValue(cl::desc("vscale"),
                                      cl::value_desc("value for llvm.vscale"),
-                                     cl::init(4U));
+                                     cl::init(4U), cl::cat(Category));
 static cl::opt<bool> IgnoreParamAttrsOnIntrinsic(
     "ignore-param-attrs-intrinsic",
-    cl::desc("Ignore parameter attributes of intrinsic calls"),
-    cl::init(false));
+    cl::desc("Ignore parameter attributes of intrinsic calls"), cl::init(false),
+    cl::cat(Category));
 static cl::opt<bool> Verbose("verbose", cl::desc("Print step-by-step log"),
-                             cl::init(false));
+                             cl::init(false), cl::cat(Category));
 static cl::opt<std::string> EMIMutate("emi",
                                       cl::desc("Enable EMI-based mutation"),
-                                      cl::value_desc("Path to output IR file"));
+                                      cl::value_desc("Path to output IR file"),
+                                      cl::cat(Category));
 static cl::opt<bool> DumpEMI("dump-emi",
                              cl::desc("Dump EMI-based mutation scheme"),
-                             cl::init(false));
+                             cl::init(false), cl::cat(Category));
 
 // TODO: handle llvm.lifetime.start/end and llvm.invariant.start.end/TBAA
 size_t AllocatedMem = 0;
@@ -2455,7 +2458,9 @@ public:
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
-  cl::ParseCommandLineOptions(argc, argv, "llubi\n");
+  cl::HideUnrelatedOptions(Category);
+  cl::ParseCommandLineOptions(argc, argv,
+                              "llubi -- LLVM ub-aware interpreter\n");
 
   LLVMContext Ctx;
   SMDiagnostic Err;
