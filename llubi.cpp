@@ -830,12 +830,23 @@ public:
       for (auto &F : M) {
         for (auto &BB : F) {
           for (auto &I : BB) {
+            DenseMap<ConstantExpr *, DenseMap<BasicBlock *, Instruction *>>
+                Cache;
             for (auto &U : I.operands()) {
               if (auto *CE = dyn_cast<ConstantExpr>(U.get())) {
                 auto *Inst = CE->getAsInstruction();
-                if (auto *PHI = dyn_cast<PHINode>(&I))
-                  Inst->insertBefore(PHI->getIncomingBlock(U)->getTerminator());
-                else
+                if (auto *PHI = dyn_cast<PHINode>(&I)) {
+                  auto &Table = Cache[CE];
+                  auto *PredBB = PHI->getIncomingBlock(U);
+                  if (auto It = Table.find(PredBB); It != Table.end()) {
+                    Inst->deleteValue();
+                    Inst = It->second;
+                  } else {
+                    Inst->insertBefore(
+                        PHI->getIncomingBlock(U)->getTerminator());
+                    Table.insert({PredBB, Inst});
+                  }
+                } else
                   Inst->insertBefore(&I);
                 U.set(Inst);
                 Changed = true;
