@@ -259,6 +259,19 @@ std::optional<APInt> addNoWrap(const APInt &LHS, const APInt &RHS, bool HasNSW,
   }
   return Ret;
 }
+std::optional<APInt> subNoWrap(const APInt &LHS, const APInt &RHS, bool HasNSW,
+                               bool HasNUW) {
+  bool Overflow = false;
+  auto Ret = LHS.ssub_ov(RHS, Overflow);
+  if (HasNSW && Overflow)
+    return std::nullopt;
+  if (HasNUW) {
+    (void)LHS.usub_ov(RHS, Overflow);
+    if (Overflow)
+      return std::nullopt;
+  }
+  return Ret;
+}
 std::optional<APInt> mulNoWrap(const APInt &LHS, const APInt &RHS, bool HasNSW,
                                bool HasNUW) {
   bool Overflow = false;
@@ -505,8 +518,8 @@ struct EMITrackingInfo final {
   bool Enabled;
   DenseMap<Value *, bool> MayBeUndef;
   DenseMap<Value *, ConstantRange> Range;
-  // DenseMap<BinaryOperator *, uint32_t> NoWrapFlags;
-  // DenseMap<TruncInst *, uint32_t> TruncNoWrapFlags;
+  DenseMap<BinaryOperator *, uint32_t> NoWrapFlags;
+  DenseMap<TruncInst *, uint32_t> TruncNoWrapFlags;
   DenseMap<PossiblyNonNegInst *, bool> NNegFlags;
   DenseMap<ICmpInst *, bool> ICmpFlags;
   DenseMap<IntrinsicInst *, bool> IsPoisonFlags;
@@ -1157,16 +1170,26 @@ public:
         });
   }
   bool visitShl(BinaryOperator &I) {
-    return visitIntBinOp(
+    bool HasNSW = true, HasNUW = true;
+    auto RetVal = visitIntBinOp(
         I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
           if (RHS.uge(LHS.getBitWidth()))
             return std::nullopt;
+          if (EMIInfo.Enabled) {
+            if (HasNSW && RHS.uge(LHS.getNumSignBits()))
+              HasNSW = false;
+            if (HasNUW && RHS.ugt(LHS.countl_zero()))
+              HasNUW = false;
+          }
           if (I.hasNoSignedWrap() && RHS.uge(LHS.getNumSignBits()))
             return std::nullopt;
           if (I.hasNoUnsignedWrap() && RHS.ugt(LHS.countl_zero()))
             return std::nullopt;
           return LHS.shl(RHS);
         });
+    if (EMIInfo.Enabled && !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
+      EMIInfo.NoWrapFlags[&I] |= (!HasNSW ? 2 : 0) | (!HasNUW ? 1 : 0);
+    return RetVal;
   }
   bool visitLShr(BinaryOperator &I) {
     return visitIntBinOp(
@@ -1189,33 +1212,71 @@ public:
         });
   }
   bool visitAdd(BinaryOperator &I) {
-    return visitIntBinOp(
+    bool AllNSW = true, AllNUW = true;
+    auto RetVal = visitIntBinOp(
         I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
-          return addNoWrap(LHS, RHS, I.hasNoSignedWrap(),
-                           I.hasNoUnsignedWrap());
+          auto Res =
+              addNoWrap(LHS, RHS, I.hasNoSignedWrap(), I.hasNoUnsignedWrap());
+          if (EMIInfo.Enabled && AllNSW) {
+            bool Overflow = false;
+            (void)LHS.sadd_ov(RHS, Overflow);
+            AllNSW &= !Overflow;
+          }
+          if (EMIInfo.Enabled && AllNUW) {
+            bool Overflow = false;
+            (void)LHS.uadd_ov(RHS, Overflow);
+            AllNUW &= !Overflow;
+          }
+          return std::move(Res);
         });
+
+    if (EMIInfo.Enabled && !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
+      EMIInfo.NoWrapFlags[&I] |= (!AllNSW ? 2 : 0) | (!AllNUW ? 1 : 0);
+    return RetVal;
   }
   bool visitSub(BinaryOperator &I) {
-    return visitIntBinOp(
+    bool AllNSW = true, AllNUW = true;
+    auto RetVal = visitIntBinOp(
         I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
-          bool Overflow = false;
-          auto Ret = LHS.usub_ov(RHS, Overflow);
-          if (I.hasNoUnsignedWrap() && Overflow)
-            return std::nullopt;
-          if (I.hasNoSignedWrap()) {
+          auto Res =
+              subNoWrap(LHS, RHS, I.hasNoSignedWrap(), I.hasNoUnsignedWrap());
+          if (EMIInfo.Enabled && AllNSW) {
+            bool Overflow = false;
             (void)LHS.ssub_ov(RHS, Overflow);
-            if (Overflow)
-              return std::nullopt;
+            AllNSW &= !Overflow;
           }
-          return Ret;
+          if (EMIInfo.Enabled && AllNUW) {
+            bool Overflow = false;
+            (void)LHS.usub_ov(RHS, Overflow);
+            AllNUW &= !Overflow;
+          }
+          return std::move(Res);
         });
+    if (EMIInfo.Enabled && !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
+      EMIInfo.NoWrapFlags[&I] |= (!AllNSW ? 2 : 0) | (!AllNUW ? 1 : 0);
+    return RetVal;
   }
   bool visitMul(BinaryOperator &I) {
-    return visitIntBinOp(
+    bool AllNSW = true, AllNUW = true;
+    auto RetVal = visitIntBinOp(
         I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
-          return mulNoWrap(LHS, RHS, I.hasNoSignedWrap(),
-                           I.hasNoUnsignedWrap());
+          auto Res =
+              mulNoWrap(LHS, RHS, I.hasNoSignedWrap(), I.hasNoUnsignedWrap());
+          if (EMIInfo.Enabled && AllNSW) {
+            bool Overflow = false;
+            (void)LHS.smul_ov(RHS, Overflow);
+            AllNSW &= !Overflow;
+          }
+          if (EMIInfo.Enabled && AllNUW) {
+            bool Overflow = false;
+            (void)LHS.umul_ov(RHS, Overflow);
+            AllNUW &= !Overflow;
+          }
+          return std::move(Res);
         });
+    if (EMIInfo.Enabled && !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
+      EMIInfo.NoWrapFlags[&I] |= (!AllNSW ? 2 : 0) | (!AllNUW ? 1 : 0);
+    return RetVal;
   }
   bool visitSDiv(BinaryOperator &I) {
     return visitIntBinOp(
@@ -1296,14 +1357,26 @@ public:
                                    getValue(I.getOperand(0)), Fn));
   }
   bool visitTruncInst(TruncInst &Trunc) {
+    bool HasNSW = true, HasNUW = true;
     uint32_t DestBW = Trunc.getDestTy()->getScalarSizeInBits();
-    return visitIntUnOp(Trunc, [&](const APInt &C) -> std::optional<APInt> {
-      if (Trunc.hasNoSignedWrap() && C.getSignificantBits() > DestBW)
-        return std::nullopt;
-      if (Trunc.hasNoUnsignedWrap() && C.getActiveBits() > DestBW)
-        return std::nullopt;
-      return C.trunc(DestBW);
-    });
+    auto RetVal =
+        visitIntUnOp(Trunc, [&](const APInt &C) -> std::optional<APInt> {
+          if (EMIInfo.Enabled) {
+            if (HasNSW && C.getSignificantBits() > DestBW)
+              HasNSW = false;
+            if (HasNUW && C.getActiveBits() > DestBW)
+              HasNUW = false;
+          }
+          if (Trunc.hasNoSignedWrap() && C.getSignificantBits() > DestBW)
+            return std::nullopt;
+          if (Trunc.hasNoUnsignedWrap() && C.getActiveBits() > DestBW)
+            return std::nullopt;
+          return C.trunc(DestBW);
+        });
+    if (EMIInfo.Enabled &&
+        !(Trunc.hasNoSignedWrap() && Trunc.hasNoUnsignedWrap()))
+      EMIInfo.TruncNoWrapFlags[&Trunc] |= (!HasNSW ? 2 : 0) | (!HasNUW ? 1 : 0);
+    return RetVal;
   }
   bool visitSExtInst(SExtInst &SExt) {
     uint32_t DestBW = SExt.getDestTy()->getScalarSizeInBits();
@@ -2452,6 +2525,33 @@ public:
         errs() << "is_val_poison " << *K << '\n';
       if (Sample())
         K->setArgOperand(1, ConstantInt::getTrue(K->getContext()));
+    }
+
+    for (auto &[K, V] : EMIInfo.NoWrapFlags) {
+      if (V == 3)
+        continue;
+
+      if (DumpEMI)
+        errs() << *K << " " << (V & 2 ? "" : "nsw") << (V & 1 ? "" : "nuw")
+               << '\n';
+
+      if (!(V & 2) && !K->hasNoSignedWrap() && Sample())
+        K->setHasNoSignedWrap();
+      if (!(V & 1) && !K->hasNoUnsignedWrap() && Sample())
+        K->setHasNoUnsignedWrap();
+    }
+    for (auto &[K, V] : EMIInfo.TruncNoWrapFlags) {
+      if (V == 3)
+        continue;
+
+      if (DumpEMI)
+        errs() << *K << " " << (V & 2 ? "" : "nsw") << (V & 1 ? "" : "nuw")
+               << '\n';
+
+      if (!(V & 2) && !K->hasNoSignedWrap() && Sample())
+        K->setHasNoSignedWrap(true);
+      if (!(V & 1) && !K->hasNoUnsignedWrap() && Sample())
+        K->setHasNoUnsignedWrap(true);
     }
   }
 };

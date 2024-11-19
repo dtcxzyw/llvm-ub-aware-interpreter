@@ -57,20 +57,27 @@ def csmith_test(i):
         try:
             ref_out = subprocess.check_output([llubi_bin, file_out, '--emi', file_emi_out] + llubi_workarounds, timeout=exec_timeout)
         except subprocess.TimeoutExpired:
+            # Ignore timeout
             os.remove(file_c)
             os.remove(file_out)
             if os.path.exists(file_emi_out):
                 os.remove(file_emi_out)
-            return True
+            return None
         except Exception:
             return False
         
         file_emi_opt_out = basename + ".emiopt.ll"
         try:
             subprocess.check_call([llvm_dir+"/bin/opt", '-O3', file_emi_out, '-S', '-o', file_emi_opt_out], timeout=comp_timeout,stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            # Ignore timeout
+            os.remove(file_c)
+            os.remove(file_out)
+            os.remove(file_emi_out)
+            return None
         except Exception:
             return False
-        
+
         try:
             out = subprocess.check_output([llubi_bin, file_emi_opt_out] + llubi_workarounds, timeout=exec_timeout * 2)
         except subprocess.TimeoutExpired:
@@ -82,7 +89,7 @@ def csmith_test(i):
             return True
         except Exception:
             return False
-        
+
         if out == ref_out:
             os.remove(file_c)
             os.remove(file_out)
