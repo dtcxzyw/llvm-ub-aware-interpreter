@@ -1234,7 +1234,9 @@ public:
   bool
   visitFPUnOp(Instruction &I,
               const function_ref<std::optional<APFloat>(const APFloat &)> &Fn) {
-    return addValue(I, visitFPUnOp(I.getType(), I.getFastMathFlags(),
+    return addValue(I, visitFPUnOp(I.getType(),
+                                   isa<FPMathOperator>(I) ? I.getFastMathFlags()
+                                                          : FastMathFlags{},
                                    getValue(I.getOperand(0)), Fn));
   }
   bool visitTruncInst(TruncInst &Trunc) {
@@ -1919,7 +1921,8 @@ public:
           });
     }
     case Intrinsic::assume: {
-      // TODO: handle operand bundles
+      assert(isAssumeWithEmptyBundle(cast<AssumeInst>(*II)) &&
+             "Assume bundles have not supported yet");
       switch (getBoolean(Args[0].getSingleValue())) {
       case BooleanVal::Poison:
         ImmUBReporter() << "assumption violation (poison)";
