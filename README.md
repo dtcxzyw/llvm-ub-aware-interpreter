@@ -52,4 +52,4 @@ cmake --build . -j
 - [ ] Fine-grained UB check control
 - [ ] Turn it into a library
 - [ ] Per-pass UB-aware testing
-- [ ] EMI-based fuzzing
+- [x] EMI-based fuzzing

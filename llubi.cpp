@@ -8,6 +8,7 @@
 #include <llvm/ADT/APSInt.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/BitVector.h>
+#include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/FloatingPointMode.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/STLFunctionalExtras.h>
@@ -62,9 +63,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
+#include <random>
+#include <system_error>
 #include <variant>
 
 using namespace llvm;
@@ -79,6 +83,12 @@ static cl::opt<bool> IgnoreParamAttrsOnIntrinsic(
     cl::desc("Ignore parameter attributes of intrinsic calls"),
     cl::init(false));
 static cl::opt<bool> Verbose("verbose", cl::desc("Print step-by-step log"),
+                             cl::init(false));
+static cl::opt<std::string> EMIMutate("emi",
+                                      cl::desc("Enable EMI-based mutation"),
+                                      cl::value_desc("Path to output IR file"));
+static cl::opt<bool> DumpEMI("dump-emi",
+                             cl::desc("Dump EMI-based mutation scheme"),
                              cl::init(false));
 
 // TODO: handle llvm.lifetime.start/end and llvm.invariant.start.end/TBAA
@@ -489,6 +499,15 @@ struct Frame final {
   std::optional<AnyValue> RetVal;
 };
 
+struct EMITrackingInfo final {
+  bool Enabled;
+  DenseMap<Value *, bool> MayBeUndef;
+  // TODO: nonnull
+  // TODO: align
+  // TODO: flags
+  DenseSet<BasicBlock *> ReachableBlocks;
+};
+
 class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   LLVMContext &Ctx;
   Module &M;
@@ -500,6 +519,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   DenseMap<size_t, Function *> ValidCallees;
   DenseMap<size_t, BasicBlock *> ValidBlockTargets;
   DenseMap<BasicBlock *, std::shared_ptr<MemObject>> BlockTargets;
+  EMITrackingInfo EMIInfo;
   Frame *CurrentFrame = nullptr;
 
   uint32_t getVectorLength(VectorType *Ty) const {
@@ -666,6 +686,15 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
       auto Addr =
           MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
       return SingleValue{lookupPointer(Addr)};
+    } else if (auto *StructTy = dyn_cast<StructType>(Ty)) {
+      auto *Layout = DL.getStructLayout(StructTy);
+      std::vector<AnyValue> Res;
+      Res.reserve(StructTy->getNumElements());
+      for (uint32_t I = 0, E = StructTy->getStructNumElements(); I != E; ++I) {
+        auto NewOffset = Offset + Layout->getElementOffset(I).getFixedValue();
+        Res.push_back(load(MO, NewOffset, StructTy->getStructElementType(I)));
+      }
+      return std::move(Res);
     } else if (auto *VTy = dyn_cast<VectorType>(Ty)) {
       uint32_t Len = getVectorLength(VTy);
       Type *EltTy = VTy->getElementType();
@@ -721,6 +750,7 @@ public:
     static_assert(sys::IsLittleEndianHost);
     assert(DL.getIndexSizeInBits(0) == DL.getPointerSizeInBits());
 
+    EMIInfo.Enabled = !EMIMutate.empty();
     NullPtrStorage =
         MemObject::create(DL.getPointerSizeInBits(), "null", false, 0U, 1U);
     NullPtr =
@@ -1606,6 +1636,8 @@ public:
     handleRangeMetadata(RetVal, LI);
     if (LI.hasMetadata(LLVMContext::MD_noundef))
       postProcess(RetVal, handleNoUndef);
+    else if (EMIInfo.Enabled && RetVal.isSingleValue())
+      EMIInfo.MayBeUndef[&LI] = isPoison(RetVal.getSingleValue());
     return addValue(LI, std::move(RetVal));
   }
   void writeBits(APInt &Dst, uint32_t &Offset, const APInt &Src) {
@@ -1745,7 +1777,12 @@ public:
     postProcessAttr(RetVal, CB.getRetAttributes());
     return std::move(RetVal);
   }
-  bool visitCallInst(CallInst &CI) { return addValue(CI, handleCall(CI)); }
+  bool visitCallInst(CallInst &CI) {
+    auto RetVal = handleCall(CI);
+    if (EMIInfo.Enabled && RetVal.isSingleValue())
+      EMIInfo.MayBeUndef[&CI] |= isPoison(RetVal.getSingleValue());
+    return addValue(CI, std::move(RetVal));
+  }
   bool visitReturnInst(ReturnInst &RI) {
     if (auto *RV = RI.getReturnValue())
       CurrentFrame->RetVal = getValue(RV);
@@ -2239,6 +2276,8 @@ public:
     while (!CallFrame.RetVal.has_value()) {
       if (Verbose)
         errs() << *CallFrame.PC;
+      if (EMIInfo.Enabled)
+        EMIInfo.ReachableBlocks.insert(CallFrame.BB);
       if (visit(*CallFrame.PC))
         ++CallFrame.PC;
       if (Verbose)
@@ -2273,6 +2312,47 @@ public:
       ImmUBReporter() << "Return a poison value";
     return std::get<APInt>(RetVal.getSingleValue()).getSExtValue();
   }
+
+  void mutate() {
+    assert(EMIInfo.Enabled);
+    constexpr double Prob = 0.1;
+    std::mt19937_64 Gen{std::random_device{}()};
+    auto Sample = [&] {
+      return std::generate_canonical<double,
+                                     std::numeric_limits<size_t>::max()>(Gen) <
+             Prob;
+    };
+
+    for (auto [K, V] : EMIInfo.MayBeUndef) {
+      if (V)
+        continue;
+      if (DumpEMI)
+        errs() << *K << '\n';
+      if (Sample()) {
+        if (auto *Call = dyn_cast<CallBase>(K)) {
+          Call->addRetAttr(Attribute::NoUndef);
+        } else if (auto *Load = dyn_cast<LoadInst>(K)) {
+          Load->setMetadata(llvm::LLVMContext::MD_noundef,
+                            llvm::MDNode::get(Ctx, {}));
+        } else
+          llvm_unreachable("Unreachable");
+      }
+    }
+
+    for (auto &F : M)
+      for (auto &BB : F) {
+        if (EMIInfo.ReachableBlocks.contains(&BB))
+          continue;
+        if (DumpEMI)
+          errs() << "Unreachable BB: " << F.getName() << ":"
+                 << getValueName(&BB) << '\n';
+        if (Sample()) {
+          IRBuilder<> Builder(&BB, BB.getFirstInsertionPt());
+          Builder.CreateStore(PoisonValue::get(Builder.getInt8Ty()),
+                              PoisonValue::get(Builder.getPtrTy()));
+        }
+      }
+  }
 };
 
 int main(int argc, char **argv) {
@@ -2288,5 +2368,17 @@ int main(int argc, char **argv) {
   }
 
   UBAwareInterpreter Executor(*M);
-  return Executor.runMain();
+  int32_t Ret = Executor.runMain();
+  if (!EMIMutate.empty()) {
+    Executor.mutate();
+    std::error_code EC;
+    raw_fd_ostream Out{EMIMutate.getValue(), EC, sys::fs::OF_Text};
+    if (EC) {
+      errs() << "Error: " << EC.message() << '\n';
+      return EXIT_FAILURE;
+    }
+    Out << *M;
+    Out.flush();
+  }
+  return Ret;
 }
