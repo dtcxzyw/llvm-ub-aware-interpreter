@@ -8,6 +8,7 @@ import subprocess
 import shutil
 import tqdm
 import datetime
+import random
 
 # python3 ../csmith.py /usr ../../csmith/install/ ./llubi 1
 
@@ -45,7 +46,7 @@ def csmith_test(i):
         comp_command = compile_command +" -o "+file_out+" "+file_c
         subprocess.check_call(comp_command.split(' '), timeout=comp_timeout)
         subprocess.check_call([file_out], timeout=exec_timeout,stderr=subprocess.DEVNULL,stdout=subprocess.DEVNULL)
-        subprocess.check_call((comp_command + " -O3 -emit-llvm -S" + (" -mllvm -opt-bisect-limit=0" if emi else "")).split(' '), timeout=comp_timeout,stderr=subprocess.DEVNULL)
+        subprocess.check_call((comp_command + " -O3 -emit-llvm -S" + (" -mllvm -opt-bisect-limit=" + str(random.randint(0, 1000)) if emi else "")).split(' '), timeout=comp_timeout,stderr=subprocess.DEVNULL)
     except Exception:
         if os.path.exists(file_out):
             os.remove(file_out)

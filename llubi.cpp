@@ -523,6 +523,7 @@ struct EMITrackingInfo final {
   DenseMap<PossiblyNonNegInst *, bool> NNegFlags;
   DenseMap<ICmpInst *, bool> ICmpFlags;
   DenseMap<IntrinsicInst *, bool> IsPoisonFlags;
+  DenseMap<PossiblyDisjointInst *, bool> DisjointFlags;
 
   // TODO: nonnull
   // TODO: align
@@ -1162,12 +1163,18 @@ public:
         });
   }
   bool visitOr(BinaryOperator &I) {
-    return visitIntBinOp(
+    bool AllDisjoint = true;
+    auto RetVal = visitIntBinOp(
         I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
           if (cast<PossiblyDisjointInst>(I).isDisjoint() && LHS.intersects(RHS))
             return std::nullopt;
+          if (EMIInfo.Enabled && AllDisjoint)
+            AllDisjoint &= !LHS.intersects(RHS);
           return LHS | RHS;
         });
+    if (EMIInfo.Enabled && !cast<PossiblyDisjointInst>(I).isDisjoint())
+      EMIInfo.DisjointFlags[cast<PossiblyDisjointInst>(&I)] |= !AllDisjoint;
+    return RetVal;
   }
   bool visitShl(BinaryOperator &I) {
     bool HasNSW = true, HasNUW = true;
@@ -2525,6 +2532,15 @@ public:
         errs() << "is_val_poison " << *K << '\n';
       if (Sample())
         K->setArgOperand(1, ConstantInt::getTrue(K->getContext()));
+    }
+    for (auto &[K, V] : EMIInfo.DisjointFlags) {
+      if (V)
+        continue;
+
+      if (DumpEMI)
+        errs() << "disjoint " << *K << '\n';
+      if (Sample())
+        K->setIsDisjoint(true);
     }
 
     for (auto &[K, V] : EMIInfo.NoWrapFlags) {
