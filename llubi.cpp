@@ -36,6 +36,7 @@
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
@@ -145,8 +146,6 @@ public:
                                        Size, Alignment);
   }
   void store(size_t Offset, const APInt &C) {
-    //     errs() << Offset << ' ' << Data.size() << ' ' << C.getBitWidth() << '
-    //     '<< C.getNumWords() << '\n';
     constexpr uint32_t Scale = sizeof(APInt::WordType);
     const size_t Size = alignTo(C.getBitWidth(), 8) / 8;
     uint32_t WriteCnt = 0;
@@ -502,10 +501,28 @@ struct Frame final {
 struct EMITrackingInfo final {
   bool Enabled;
   DenseMap<Value *, bool> MayBeUndef;
+  DenseMap<Value *, ConstantRange> Range;
+  // DenseMap<BinaryOperator *, uint32_t> NoWrapFlags;
+  // DenseMap<TruncInst *, uint32_t> TruncNoWrapFlags;
+  DenseMap<PossiblyNonNegInst *, bool> NNegFlags;
+  DenseMap<ICmpInst *, bool> ICmpFlags;
+  DenseMap<IntrinsicInst *, bool> IsPoisonFlags;
+
   // TODO: nonnull
   // TODO: align
-  // TODO: flags
+  // TODO: Use -> attributes mapping for arguments
   DenseSet<BasicBlock *> ReachableBlocks;
+
+  void trackRange(Value *K, const APInt &V) {
+    if (V.getBitWidth() <= 1)
+      return;
+    if (!Range.contains(K))
+      Range.insert({K, V});
+    else {
+      auto &Ref = Range.find(K)->second;
+      Ref = Ref.unionWith(V);
+    }
+  }
 };
 
 class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
@@ -1006,13 +1023,16 @@ public:
   }
 
   bool visitICmpInst(ICmpInst &I) {
-    auto ICmp = [&I](const SingleValue &LHS,
-                     const SingleValue &RHS) -> SingleValue {
+    bool SameSign = true;
+    auto ICmp = [&](const SingleValue &LHS,
+                    const SingleValue &RHS) -> SingleValue {
       const auto &LHSC = std::get<APInt>(LHS);
       const auto &RHSC = std::get<APInt>(RHS);
       if (I.hasSameSign()) {
         if (LHSC.isNonNegative() != RHSC.isNonNegative())
           return poison();
+      } else if (EMIInfo.Enabled) {
+        SameSign &= LHSC.isNonNegative() == RHSC.isNonNegative();
       }
       return boolean(ICmpInst::compare(LHSC, RHSC, I.getPredicate()));
     };
@@ -1026,7 +1046,10 @@ public:
       }
       return ICmp(LHS, RHS);
     };
-    return visitBinOp(I, ICmpPtr);
+    auto RetVal = visitBinOp(I, ICmpPtr);
+    if (EMIInfo.Enabled && !I.hasSameSign())
+      EMIInfo.ICmpFlags[&I] |= !SameSign;
+    return RetVal;
   }
   AnyValue visitIntBinOp(
       Type *RetTy, const AnyValue &LHS, const AnyValue &RHS,
@@ -1288,11 +1311,18 @@ public:
   bool visitZExtInst(ZExtInst &ZExt) {
     uint32_t DestBW = ZExt.getDestTy()->getScalarSizeInBits();
     bool IsNNeg = ZExt.hasNonNeg();
-    return visitIntUnOp(ZExt, [&](const APInt &C) -> std::optional<APInt> {
-      if (IsNNeg && C.isNegative())
-        return std::nullopt;
-      return C.zext(DestBW);
-    });
+    bool HasNNeg = true;
+    auto RetVal =
+        visitIntUnOp(ZExt, [&](const APInt &C) -> std::optional<APInt> {
+          if (IsNNeg && C.isNegative())
+            return std::nullopt;
+          if (EMIInfo.Enabled)
+            HasNNeg &= C.isNonNegative();
+          return C.zext(DestBW);
+        });
+    if (EMIInfo.Enabled && !ZExt.hasNonNeg())
+      EMIInfo.NNegFlags[cast<PossiblyNonNegInst>(&ZExt)] |= !HasNNeg;
+    return RetVal;
   }
   bool fpCast(Instruction &I) {
     auto &DstSem = I.getType()->getScalarType()->getFltSemantics();
@@ -1636,8 +1666,11 @@ public:
     handleRangeMetadata(RetVal, LI);
     if (LI.hasMetadata(LLVMContext::MD_noundef))
       postProcess(RetVal, handleNoUndef);
-    else if (EMIInfo.Enabled && RetVal.isSingleValue())
+    else if (EMIInfo.Enabled && RetVal.isSingleValue()) {
       EMIInfo.MayBeUndef[&LI] = isPoison(RetVal.getSingleValue());
+      if (LI.getType()->isIntegerTy() && !isPoison(RetVal.getSingleValue()))
+        EMIInfo.trackRange(&LI, std::get<APInt>(RetVal.getSingleValue()));
+    }
     return addValue(LI, std::move(RetVal));
   }
   void writeBits(APInt &Dst, uint32_t &Offset, const APInt &Src) {
@@ -1779,8 +1812,11 @@ public:
   }
   bool visitCallInst(CallInst &CI) {
     auto RetVal = handleCall(CI);
-    if (EMIInfo.Enabled && RetVal.isSingleValue())
+    if (EMIInfo.Enabled && RetVal.isSingleValue()) {
       EMIInfo.MayBeUndef[&CI] |= isPoison(RetVal.getSingleValue());
+      if (CI.getType()->isIntegerTy() && !isPoison(RetVal.getSingleValue()))
+        EMIInfo.trackRange(&CI, std::get<APInt>(RetVal.getSingleValue()));
+    }
     return addValue(CI, std::move(RetVal));
   }
   bool visitReturnInst(ReturnInst &RI) {
@@ -1912,23 +1948,37 @@ public:
     case Intrinsic::ctlz:
     case Intrinsic::cttz: {
       bool IsZeroPoison = getBooleanNonPoison(Args[1].getSingleValue());
-      return visitIntUnOp(
+      bool AllNonZero = true;
+      auto RetVal = visitIntUnOp(
           RetTy, Args[0], [&](const APInt &V) -> std::optional<APInt> {
             if (IsZeroPoison && V.isZero())
               return std::nullopt;
+            if (EMIInfo.Enabled)
+              AllNonZero &= !V.isZero();
             return APInt(V.getBitWidth(), IID == Intrinsic::ctlz
                                               ? V.countl_zero()
                                               : V.countr_zero());
           });
+      if (EMIInfo.Enabled && !IsZeroPoison)
+        EMIInfo.IsPoisonFlags[cast<IntrinsicInst>(CurrentFrame->PC)] |=
+            !AllNonZero;
+      return RetVal;
     }
     case Intrinsic::abs: {
       bool IsIntMinPoison = getBooleanNonPoison(Args[1].getSingleValue());
-      return visitIntUnOp(RetTy, Args[0],
-                          [&](const APInt &V) -> std::optional<APInt> {
-                            if (IsIntMinPoison && V.isMinSignedValue())
-                              return std::nullopt;
-                            return V.abs();
-                          });
+      bool AllNonSMin = true;
+      auto RetVal = visitIntUnOp(RetTy, Args[0],
+                                 [&](const APInt &V) -> std::optional<APInt> {
+                                   if (IsIntMinPoison && V.isMinSignedValue())
+                                     return std::nullopt;
+                                   if (EMIInfo.Enabled)
+                                     AllNonSMin &= !V.isMinSignedValue();
+                                   return V.abs();
+                                 });
+      if (EMIInfo.Enabled && !IsIntMinPoison)
+        EMIInfo.IsPoisonFlags[cast<IntrinsicInst>(CurrentFrame->PC)] |=
+            !AllNonSMin;
+      return RetVal;
     }
     case Intrinsic::ctpop:
       return visitIntUnOp(RetTy, Args[0],
@@ -2352,6 +2402,54 @@ public:
                               PoisonValue::get(Builder.getPtrTy()));
         }
       }
+
+    for (auto &[K, V] : EMIInfo.Range) {
+      if (V.isEmptySet() || V.isFullSet() || V.isSingleElement())
+        continue;
+
+      if (DumpEMI)
+        errs() << "Range of " << *K << " : " << V << '\n';
+      if (Sample()) {
+        if (auto *Call = dyn_cast<CallBase>(K)) {
+          Call->addRangeRetAttr(V);
+        } else if (auto *Load = dyn_cast<LoadInst>(K)) {
+          MDBuilder MDHelper(Load->getContext());
+          auto *MDNode = MDHelper.createRange(V.getLower(), V.getUpper());
+          Load->setMetadata(LLVMContext::MD_range, MDNode);
+        } else
+          llvm_unreachable("Unreachable");
+      }
+    }
+
+    for (auto &[K, V] : EMIInfo.ICmpFlags) {
+      if (V)
+        continue;
+
+      if (DumpEMI)
+        errs() << "samesign " << *K << '\n';
+      if (Sample())
+        K->setSameSign();
+    }
+
+    for (auto &[K, V] : EMIInfo.NNegFlags) {
+      if (V)
+        continue;
+
+      if (DumpEMI)
+        errs() << "nneg " << *K << '\n';
+      if (Sample())
+        K->setNonNeg();
+    }
+
+    for (auto &[K, V] : EMIInfo.IsPoisonFlags) {
+      if (V)
+        continue;
+
+      if (DumpEMI)
+        errs() << "is_val_poison " << *K << '\n';
+      if (Sample())
+        K->setArgOperand(1, ConstantInt::getTrue(K->getContext()));
+    }
   }
 };
 

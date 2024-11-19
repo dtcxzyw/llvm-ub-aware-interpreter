@@ -67,7 +67,7 @@ def csmith_test(i):
         
         file_emi_opt_out = basename + ".emiopt.ll"
         try:
-            subprocess.check_call([llvm_dir+"/bin/opt", file_emi_out, '-S', '-o', file_emi_opt_out], timeout=comp_timeout,stderr=subprocess.DEVNULL)
+            subprocess.check_call([llvm_dir+"/bin/opt", '-O3', file_emi_out, '-S', '-o', file_emi_opt_out], timeout=comp_timeout,stderr=subprocess.DEVNULL)
         except Exception:
             return False
         
