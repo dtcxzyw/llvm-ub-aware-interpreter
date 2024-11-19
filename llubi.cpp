@@ -11,6 +11,7 @@
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/FloatingPointMode.h>
 #include <llvm/ADT/MapVector.h>
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/STLFunctionalExtras.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/ADT/SmallVector.h>
@@ -846,6 +847,8 @@ public:
       if (!Changed)
         break;
     }
+    // if (verifyModule(M, &errs()))
+    //   std::exit(EXIT_FAILURE);
   }
 
   bool addValue(Instruction &I, AnyValue Val) {
@@ -2480,8 +2483,8 @@ public:
           errs() << "Unreachable BB: " << F.getName() << ":"
                  << getValueName(&BB) << '\n';
         if (Sample()) {
-          IRBuilder<> Builder(&BB, BB.getFirstInsertionPt());
-          Builder.CreateStore(PoisonValue::get(Builder.getInt8Ty()),
+          IRBuilder<> Builder(&BB, BB.getFirstNonPHIOrDbgOrAlloca());
+          Builder.CreateStore(Constant::getNullValue(Builder.getInt8Ty()),
                               PoisonValue::get(Builder.getPtrTy()));
         }
       }
