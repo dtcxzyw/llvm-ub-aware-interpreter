@@ -9,6 +9,7 @@
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/FloatingPointMode.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/STLExtras.h>
@@ -54,6 +55,7 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/FormattedStream.h>
 #include <llvm/Support/InitLLVM.h>
+#include <llvm/Support/KnownBits.h>
 #include <llvm/Support/MathExtras.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/SourceMgr.h>
@@ -95,6 +97,9 @@ static cl::opt<std::string> EMIMutate("emi",
 static cl::opt<bool> DumpEMI("dump-emi",
                              cl::desc("Dump EMI-based mutation scheme"),
                              cl::init(false), cl::cat(Category));
+
+constexpr double EMIProb = 0.1;
+constexpr double EMIUseProb = 0.001;
 
 // TODO: handle llvm.lifetime.start/end and llvm.invariant.start.end/TBAA
 size_t AllocatedMem = 0;
@@ -515,6 +520,28 @@ struct Frame final {
   std::optional<AnyValue> RetVal;
 };
 
+struct IntConstraintInfo final {
+  ConstantRange Range;
+  KnownBits Bits;
+  bool HasPoison;
+
+  explicit IntConstraintInfo(const std::optional<APInt> &InitV)
+      : Range(InitV.has_value() ? *InitV : APInt::getZero(32)),
+        Bits(KnownBits::makeConstant(InitV.has_value() ? *InitV
+                                                       : APInt::getZero(32))),
+        HasPoison(!InitV.has_value()) {}
+  void update(const std::optional<APInt> &V) {
+    if (HasPoison)
+      return;
+    if (!V.has_value()) {
+      HasPoison = true;
+      return;
+    }
+    Range = Range.unionWith(*V);
+    Bits = Bits.intersectWith(KnownBits::makeConstant(*V));
+  }
+};
+
 struct EMITrackingInfo final {
   bool Enabled;
   DenseMap<Value *, bool> MayBeUndef;
@@ -525,6 +552,9 @@ struct EMITrackingInfo final {
   DenseMap<ICmpInst *, bool> ICmpFlags;
   DenseMap<IntrinsicInst *, bool> IsPoisonFlags;
   DenseMap<PossiblyDisjointInst *, bool> DisjointFlags;
+
+  DenseMap<Instruction *, SmallVector<Use *>> InterestingUses;
+  DenseMap<Use *, IntConstraintInfo> UseIntInfo;
 
   // TODO: nonnull
   // TODO: align
@@ -555,6 +585,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   DenseMap<size_t, BasicBlock *> ValidBlockTargets;
   DenseMap<BasicBlock *, std::shared_ptr<MemObject>> BlockTargets;
   EMITrackingInfo EMIInfo;
+  std::mt19937_64 Gen;
   Frame *CurrentFrame = nullptr;
 
   uint32_t getVectorLength(VectorType *Ty) const {
@@ -857,6 +888,32 @@ public:
       }
       if (!Changed)
         break;
+    }
+
+    if (EMIInfo.Enabled) {
+      Gen.seed(std::random_device{}());
+      auto Sample = [&] {
+        return std::generate_canonical<double,
+                                       std::numeric_limits<size_t>::max()>(
+                   Gen) < EMIUseProb;
+      };
+      for (auto &F : M) {
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            if (isa<PHINode>(&I))
+              continue;
+            for (auto &Op : I.operands()) {
+              if (!Op->getType()->isIntegerTy() ||
+                  Op->getType()->isIntegerTy(1))
+                continue;
+              if (!isa<Instruction>(Op))
+                continue;
+              if (Sample())
+                EMIInfo.InterestingUses[&I].push_back(&Op);
+            }
+          }
+        }
+      }
     }
     // if (verifyModule(M, &errs()))
     //   std::exit(EXIT_FAILURE);
@@ -2423,8 +2480,20 @@ public:
     while (!CallFrame.RetVal.has_value()) {
       if (Verbose)
         errs() << *CallFrame.PC;
-      if (EMIInfo.Enabled)
+      if (EMIInfo.Enabled) {
         EMIInfo.ReachableBlocks.insert(CallFrame.BB);
+        auto Iter = EMIInfo.InterestingUses.find(&*CallFrame.PC);
+        if (Iter != EMIInfo.InterestingUses.end()) {
+          for (auto Op : Iter->second) {
+            auto Val = getInt(*Op);
+            if (auto Iter = EMIInfo.UseIntInfo.find(Op);
+                Iter != EMIInfo.UseIntInfo.end())
+              Iter->second.update(Val);
+            else
+              EMIInfo.UseIntInfo.insert({Op, IntConstraintInfo(Val)});
+          }
+        }
+      }
       if (visit(*CallFrame.PC))
         ++CallFrame.PC;
       if (Verbose)
@@ -2462,12 +2531,10 @@ public:
 
   void mutate() {
     assert(EMIInfo.Enabled);
-    constexpr double Prob = 0.1;
-    std::mt19937_64 Gen{std::random_device{}()};
     auto Sample = [&] {
       return std::generate_canonical<double,
                                      std::numeric_limits<size_t>::max()>(Gen) <
-             Prob;
+             EMIProb;
     };
 
     for (auto [K, V] : EMIInfo.MayBeUndef) {
@@ -2582,6 +2649,40 @@ public:
         K->setHasNoSignedWrap(true);
       if (!(V & 1) && !K->hasNoUnsignedWrap() && Sample())
         K->setHasNoUnsignedWrap(true);
+    }
+    for (auto &[K, V] : EMIInfo.UseIntInfo) {
+      if (V.HasPoison)
+        continue;
+      if (DumpEMI)
+        errs() << *K << " at " << *K->getUser() << ' ' << V.Bits << ' '
+               << V.Range << '\n';
+      IRBuilder<> Builder(cast<Instruction>(K->getUser()));
+      Type *Ty = K->get()->getType();
+      bool RangeIsValid = !V.Range.isEmptySet() && !V.Range.isFullSet() &&
+                          !V.Range.isSingleElement();
+      bool BitIsValid =
+          !V.Bits.hasConflict() && !V.Bits.isUnknown() && !V.Bits.isConstant();
+      if (!RangeIsValid && !BitIsValid)
+        continue;
+
+      if (!BitIsValid || std::uniform_int_distribution<int>(0, 1)(Gen)) {
+        // Use Range
+        ICmpInst::Predicate Pred;
+        APInt RHS, Offset;
+        V.Range.getEquivalentICmp(Pred, RHS, Offset);
+        Builder.CreateAssumption(Builder.CreateICmp(
+            Pred,
+            Offset.isZero()
+                ? *K
+                : Builder.CreateAdd(*K, ConstantInt::get(Ty, Offset)),
+            ConstantInt::get(Ty, RHS)));
+      } else {
+        // Use Knownbits
+        const auto Mask = V.Bits.One | V.Bits.Zero;
+        Builder.CreateAssumption(Builder.CreateICmpEQ(
+            Builder.CreateAnd(*K, ConstantInt::get(Ty, Mask)),
+            ConstantInt::get(Ty, V.Bits.One)));
+      }
     }
   }
 };
