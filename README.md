@@ -53,3 +53,4 @@ cmake --build . -j
 - [ ] Turn it into a library
 - [ ] Per-pass UB-aware testing
 - [x] EMI-based fuzzing
+- [ ] EMI-based test reduction
