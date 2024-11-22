@@ -23,4 +23,7 @@ add_compile_options("-ggdb")
 add_compile_options("-fsanitize=address")
 add_link_options("-fsanitize=address")
 endif(LLUBI_ENABLE_ASAN)
+
+add_llvm_library(ubi PARTIAL_SOURCES_INTENDED ubi.cpp)
 add_llvm_executable(llubi PARTIAL_SOURCES_INTENDED llubi.cpp)
+target_link_libraries(llubi PRIVATE ubi)
