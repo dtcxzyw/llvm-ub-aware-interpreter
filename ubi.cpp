@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/IR/Argument.h"
 #include <cassert>
 #include <utility>
 
@@ -564,6 +565,7 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
   static_assert(sys::IsLittleEndianHost);
 
   EMIInfo.Enabled = Option.EnableEMITracking;
+  EMIInfo.EnablePGFTracking = EMIInfo.Enabled && Option.EnablePGFTracking;
   NullPtrStorage = MemMgr.create("null", false, 0U, 1U);
   NullPtr = Pointer{NullPtrStorage, APInt::getZero(DL.getPointerSizeInBits())};
   assert(NullPtr->address().isZero());
@@ -629,7 +631,7 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
       break;
   }
 
-  if (EMIInfo.Enabled) {
+  if (EMIInfo.Enabled && Option.EMIUseProb > 0.0) {
     Gen.seed(std::random_device{}());
     auto Sample = [&] {
       return std::generate_canonical<double,
@@ -642,9 +644,9 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
           if (isa<PHINode>(&I))
             continue;
           for (auto &Op : I.operands()) {
-            if (!Op->getType()->isIntegerTy() || Op->getType()->isIntegerTy(1))
+            if (!Op->getType()->isIntegerTy())
               continue;
-            if (!isa<Instruction>(Op))
+            if (isa<Constant>(Op))
               continue;
             if (Sample())
               EMIInfo.InterestingUses[&I].push_back(&Op);
@@ -729,8 +731,11 @@ UBAwareInterpreter::BooleanVal UBAwareInterpreter::getBoolean(Value *V) {
 }
 char *UBAwareInterpreter::getRawPtr(const SingleValue &SV) {
   auto Ptr = std::get<Pointer>(SV);
-  if (auto MO = Ptr.Obj.lock())
+  if (auto MO = Ptr.Obj.lock()) {
+    if (MO == NullPtrStorage)
+      return nullptr;
     return MO->rawPointer() + Ptr.Offset.getSExtValue();
+  }
   ImmUBReporter() << "dangling pointer";
   llvm_unreachable("Unreachable code");
 }
@@ -860,7 +865,7 @@ bool UBAwareInterpreter::visitICmpInst(ICmpInst &I) {
     if (I.hasSameSign()) {
       if (LHSC.isNonNegative() != RHSC.isNonNegative())
         return poison();
-    } else if (EMIInfo.Enabled) {
+    } else if (EMIInfo.EnablePGFTracking) {
       SameSign &= LHSC.isNonNegative() == RHSC.isNonNegative();
     }
     return boolean(ICmpInst::compare(LHSC, RHSC, I.getPredicate()));
@@ -876,7 +881,7 @@ bool UBAwareInterpreter::visitICmpInst(ICmpInst &I) {
     return ICmp(LHS, RHS);
   };
   auto RetVal = visitBinOp(I, ICmpPtr);
-  if (EMIInfo.Enabled && !I.hasSameSign())
+  if (EMIInfo.EnablePGFTracking && !I.hasSameSign())
     EMIInfo.ICmpFlags[&I] |= !SameSign;
   return RetVal;
 }
@@ -983,11 +988,11 @@ bool UBAwareInterpreter::visitOr(BinaryOperator &I) {
       I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
         if (cast<PossiblyDisjointInst>(I).isDisjoint() && LHS.intersects(RHS))
           return std::nullopt;
-        if (EMIInfo.Enabled && AllDisjoint)
+        if (EMIInfo.EnablePGFTracking && AllDisjoint)
           AllDisjoint &= !LHS.intersects(RHS);
         return LHS | RHS;
       });
-  if (EMIInfo.Enabled && !cast<PossiblyDisjointInst>(I).isDisjoint())
+  if (EMIInfo.EnablePGFTracking && !cast<PossiblyDisjointInst>(I).isDisjoint())
     EMIInfo.DisjointFlags[cast<PossiblyDisjointInst>(&I)] |= !AllDisjoint;
   return RetVal;
 }
@@ -997,7 +1002,7 @@ bool UBAwareInterpreter::visitShl(BinaryOperator &I) {
       I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
         if (RHS.uge(LHS.getBitWidth()))
           return std::nullopt;
-        if (EMIInfo.Enabled) {
+        if (EMIInfo.EnablePGFTracking) {
           if (HasNSW && RHS.uge(LHS.getNumSignBits()))
             HasNSW = false;
           if (HasNUW && RHS.ugt(LHS.countl_zero()))
@@ -1009,7 +1014,8 @@ bool UBAwareInterpreter::visitShl(BinaryOperator &I) {
           return std::nullopt;
         return LHS.shl(RHS);
       });
-  if (EMIInfo.Enabled && !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
+  if (EMIInfo.EnablePGFTracking &&
+      !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
     EMIInfo.NoWrapFlags[&I] |= (!HasNSW ? 2 : 0) | (!HasNUW ? 1 : 0);
   return RetVal;
 }
@@ -1039,12 +1045,12 @@ bool UBAwareInterpreter::visitAdd(BinaryOperator &I) {
       I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
         auto Res =
             addNoWrap(LHS, RHS, I.hasNoSignedWrap(), I.hasNoUnsignedWrap());
-        if (EMIInfo.Enabled && AllNSW) {
+        if (EMIInfo.EnablePGFTracking && AllNSW) {
           bool Overflow = false;
           (void)LHS.sadd_ov(RHS, Overflow);
           AllNSW &= !Overflow;
         }
-        if (EMIInfo.Enabled && AllNUW) {
+        if (EMIInfo.EnablePGFTracking && AllNUW) {
           bool Overflow = false;
           (void)LHS.uadd_ov(RHS, Overflow);
           AllNUW &= !Overflow;
@@ -1052,7 +1058,8 @@ bool UBAwareInterpreter::visitAdd(BinaryOperator &I) {
         return std::move(Res);
       });
 
-  if (EMIInfo.Enabled && !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
+  if (EMIInfo.EnablePGFTracking &&
+      !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
     EMIInfo.NoWrapFlags[&I] |= (!AllNSW ? 2 : 0) | (!AllNUW ? 1 : 0);
   return RetVal;
 }
@@ -1062,19 +1069,20 @@ bool UBAwareInterpreter::visitSub(BinaryOperator &I) {
       I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
         auto Res =
             subNoWrap(LHS, RHS, I.hasNoSignedWrap(), I.hasNoUnsignedWrap());
-        if (EMIInfo.Enabled && AllNSW) {
+        if (EMIInfo.EnablePGFTracking && AllNSW) {
           bool Overflow = false;
           (void)LHS.ssub_ov(RHS, Overflow);
           AllNSW &= !Overflow;
         }
-        if (EMIInfo.Enabled && AllNUW) {
+        if (EMIInfo.EnablePGFTracking && AllNUW) {
           bool Overflow = false;
           (void)LHS.usub_ov(RHS, Overflow);
           AllNUW &= !Overflow;
         }
         return std::move(Res);
       });
-  if (EMIInfo.Enabled && !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
+  if (EMIInfo.EnablePGFTracking &&
+      !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
     EMIInfo.NoWrapFlags[&I] |= (!AllNSW ? 2 : 0) | (!AllNUW ? 1 : 0);
   return RetVal;
 }
@@ -1084,19 +1092,20 @@ bool UBAwareInterpreter::visitMul(BinaryOperator &I) {
       I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
         auto Res =
             mulNoWrap(LHS, RHS, I.hasNoSignedWrap(), I.hasNoUnsignedWrap());
-        if (EMIInfo.Enabled && AllNSW) {
+        if (EMIInfo.EnablePGFTracking && AllNSW) {
           bool Overflow = false;
           (void)LHS.smul_ov(RHS, Overflow);
           AllNSW &= !Overflow;
         }
-        if (EMIInfo.Enabled && AllNUW) {
+        if (EMIInfo.EnablePGFTracking && AllNUW) {
           bool Overflow = false;
           (void)LHS.umul_ov(RHS, Overflow);
           AllNUW &= !Overflow;
         }
         return std::move(Res);
       });
-  if (EMIInfo.Enabled && !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
+  if (EMIInfo.EnablePGFTracking &&
+      !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
     EMIInfo.NoWrapFlags[&I] |= (!AllNSW ? 2 : 0) | (!AllNUW ? 1 : 0);
   return RetVal;
 }
@@ -1182,7 +1191,7 @@ bool UBAwareInterpreter::visitTruncInst(TruncInst &Trunc) {
   uint32_t DestBW = Trunc.getDestTy()->getScalarSizeInBits();
   auto RetVal =
       visitIntUnOp(Trunc, [&](const APInt &C) -> std::optional<APInt> {
-        if (EMIInfo.Enabled) {
+        if (EMIInfo.EnablePGFTracking) {
           if (HasNSW && C.getSignificantBits() > DestBW)
             HasNSW = false;
           if (HasNUW && C.getActiveBits() > DestBW)
@@ -1194,7 +1203,7 @@ bool UBAwareInterpreter::visitTruncInst(TruncInst &Trunc) {
           return std::nullopt;
         return C.trunc(DestBW);
       });
-  if (EMIInfo.Enabled &&
+  if (EMIInfo.EnablePGFTracking &&
       !(Trunc.hasNoSignedWrap() && Trunc.hasNoUnsignedWrap()))
     EMIInfo.TruncNoWrapFlags[&Trunc] |= (!HasNSW ? 2 : 0) | (!HasNUW ? 1 : 0);
   return RetVal;
@@ -1212,11 +1221,11 @@ bool UBAwareInterpreter::visitZExtInst(ZExtInst &ZExt) {
   auto RetVal = visitIntUnOp(ZExt, [&](const APInt &C) -> std::optional<APInt> {
     if (IsNNeg && C.isNegative())
       return std::nullopt;
-    if (EMIInfo.Enabled)
+    if (EMIInfo.EnablePGFTracking)
       HasNNeg &= C.isNonNegative();
     return C.zext(DestBW);
   });
-  if (EMIInfo.Enabled && !ZExt.hasNonNeg())
+  if (EMIInfo.EnablePGFTracking && !ZExt.hasNonNeg())
     EMIInfo.NNegFlags[cast<PossiblyNonNegInst>(&ZExt)] |= !HasNNeg;
   return RetVal;
 }
@@ -1571,7 +1580,7 @@ bool UBAwareInterpreter::visitLoadInst(LoadInst &LI) {
   handleRangeMetadata(RetVal, LI);
   if (LI.hasMetadata(LLVMContext::MD_noundef))
     postProcess(RetVal, handleNoUndef);
-  else if (EMIInfo.Enabled && RetVal.isSingleValue()) {
+  else if (EMIInfo.EnablePGFTracking && RetVal.isSingleValue()) {
     EMIInfo.MayBeUndef[&LI] = isPoison(RetVal.getSingleValue());
     if (LI.getType()->isIntegerTy() && !isPoison(RetVal.getSingleValue()))
       EMIInfo.trackRange(&LI, std::get<APInt>(RetVal.getSingleValue()));
@@ -1721,7 +1730,7 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
 }
 bool UBAwareInterpreter::visitCallInst(CallInst &CI) {
   auto RetVal = handleCall(CI);
-  if (EMIInfo.Enabled && RetVal.isSingleValue()) {
+  if (EMIInfo.EnablePGFTracking && RetVal.isSingleValue()) {
     EMIInfo.MayBeUndef[&CI] |= isPoison(RetVal.getSingleValue());
     if (CI.getType()->isIntegerTy() && !isPoison(RetVal.getSingleValue()))
       EMIInfo.trackRange(&CI, std::get<APInt>(RetVal.getSingleValue()));
@@ -1863,13 +1872,13 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
         RetTy, Args[0], [&](const APInt &V) -> std::optional<APInt> {
           if (IsZeroPoison && V.isZero())
             return std::nullopt;
-          if (EMIInfo.Enabled)
+          if (EMIInfo.EnablePGFTracking)
             AllNonZero &= !V.isZero();
           return APInt(V.getBitWidth(), IID == Intrinsic::ctlz
                                             ? V.countl_zero()
                                             : V.countr_zero());
         });
-    if (EMIInfo.Enabled && !IsZeroPoison)
+    if (EMIInfo.EnablePGFTracking && !IsZeroPoison)
       EMIInfo.IsPoisonFlags[cast<IntrinsicInst>(CurrentFrame->PC)] |=
           !AllNonZero;
     return RetVal;
@@ -1881,11 +1890,11 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
                                [&](const APInt &V) -> std::optional<APInt> {
                                  if (IsIntMinPoison && V.isMinSignedValue())
                                    return std::nullopt;
-                                 if (EMIInfo.Enabled)
+                                 if (EMIInfo.EnablePGFTracking)
                                    AllNonSMin &= !V.isMinSignedValue();
                                  return V.abs();
                                });
-    if (EMIInfo.Enabled && !IsIntMinPoison)
+    if (EMIInfo.EnablePGFTracking && !IsIntMinPoison)
       EMIInfo.IsPoisonFlags[cast<IntrinsicInst>(CurrentFrame->PC)] |=
           !AllNonSMin;
     return RetVal;
@@ -2179,6 +2188,9 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
   switch (Func) {
   case LibFunc_printf: {
     if (Args.size() == 2) {
+      auto Format = getRawPtr(Args[0].getSingleValue());
+      if (!Format)
+        ImmUBReporter() << "invalid printf format";
       auto Val = getInt(Args[1].getSingleValue());
       if (!Val.has_value())
         ImmUBReporter() << "print a poison value";
@@ -2245,6 +2257,10 @@ AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
             EMIInfo.UseIntInfo.insert({Op, IntConstraintInfo(Val)});
         }
       }
+    }
+    if (++Steps >= Option.MaxSteps) {
+      errs() << "Exceed maximum steps\n";
+      std::exit(EXIT_FAILURE);
     }
     if (visit(*CallFrame.PC))
       ++CallFrame.PC;
@@ -2434,4 +2450,25 @@ void UBAwareInterpreter::mutate() {
           ConstantInt::get(Ty, V.Bits.One)));
     }
   }
+}
+bool UBAwareInterpreter::simplify() {
+  auto Sample = [&] {
+    return std::generate_canonical<double, std::numeric_limits<size_t>::max()>(
+               Gen) < Option.EMIProb;
+  };
+
+  bool Changed = false;
+  for (auto &[K, V] : EMIInfo.UseIntInfo) {
+    if (V.HasPoison)
+      continue;
+    if (!Sample())
+      continue;
+    if (auto *C = V.Range.getSingleElement()) {
+      if (Option.EnableEMIDebugging)
+        errs() << "Simplify " << *K << " to " << *C << '\n';
+      K->set(ConstantInt::get(K->get()->getType(), *C));
+      Changed = true;
+    }
+  }
+  return Changed;
 }

@@ -64,6 +64,7 @@
 #include <llvm/Support/SwapByteOrder.h>
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Support/TypeSize.h>
+#include <limits>
 #include <map>
 #include <random>
 #include <variant>
@@ -220,6 +221,7 @@ struct IntConstraintInfo final {
 
 struct EMITrackingInfo final {
   bool Enabled;
+  bool EnablePGFTracking;
   DenseMap<Value *, bool> MayBeUndef;
   DenseMap<Value *, ConstantRange> Range;
   DenseMap<BinaryOperator *, uint32_t> NoWrapFlags;
@@ -251,9 +253,11 @@ struct EMITrackingInfo final {
 
 struct InterpreterOption {
   uint32_t VScale = 4;
+  uint32_t MaxSteps = std::numeric_limits<uint32_t>::max();
   bool Verbose = false;
 
   bool EnableEMITracking = false;
+  bool EnablePGFTracking = true;
   bool EnableEMIDebugging = false;
   double EMIProb = 0.1;
   double EMIUseProb = 0.001;
@@ -277,6 +281,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   EMITrackingInfo EMIInfo;
   std::mt19937_64 Gen;
   Frame *CurrentFrame = nullptr;
+  uint32_t Steps = 0;
 
   uint32_t getVectorLength(VectorType *Ty) const;
   AnyValue getPoison(Type *Ty) const;
@@ -443,4 +448,5 @@ public:
                 SmallVectorImpl<AnyValue> &Args);
   int32_t runMain();
   void mutate();
+  bool simplify();
 };

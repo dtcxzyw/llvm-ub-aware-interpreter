@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <system_error>
 
@@ -17,9 +18,12 @@ static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input>"),
                                       cl::Required,
                                       cl::value_desc("path to input IR"),
                                       cl::cat(Category));
-static cl::opt<uint32_t> VScaleValue(cl::desc("vscale"),
+static cl::opt<uint32_t> VScaleValue("vscale",
                                      cl::value_desc("value for llvm.vscale"),
                                      cl::init(4U), cl::cat(Category));
+static cl::opt<uint32_t>
+    MaxSteps("max-steps", cl::value_desc("Max steps to run"),
+             cl::init(std::numeric_limits<uint32_t>::max()), cl::cat(Category));
 static cl::opt<bool> IgnoreParamAttrsOnIntrinsic(
     "ignore-param-attrs-intrinsic",
     cl::desc("Ignore parameter attributes of intrinsic calls"), cl::init(false),
@@ -33,9 +37,6 @@ static cl::opt<std::string> EMIMutate("emi",
 static cl::opt<bool> DumpEMI("dump-emi",
                              cl::desc("Dump EMI-based mutation scheme"),
                              cl::init(false), cl::cat(Category));
-
-constexpr double EMIProb = 0.1;
-constexpr double EMIUseProb = 0.001;
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -54,6 +55,7 @@ int main(int argc, char **argv) {
   InterpreterOption Option;
 
   Option.VScale = VScaleValue;
+  Option.MaxSteps = MaxSteps;
   Option.Verbose = Verbose;
   Option.EnableEMITracking = !EMIMutate.empty();
   Option.EnableEMIDebugging = DumpEMI;
