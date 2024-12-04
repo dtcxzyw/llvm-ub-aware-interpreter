@@ -65,6 +65,7 @@
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Support/TypeSize.h>
 #include <map>
+#include <random>
 #include <variant>
 
 using namespace llvm;
@@ -150,4 +151,296 @@ public:
   std::shared_ptr<MemObject> create(std::string Name, bool IsLocal, size_t Size,
                                     size_t Alignment);
   SingleValue lookupPointer(const APInt &Addr) const;
+};
+struct AnyValue final {
+  std::variant<std::monostate, SingleValue, std::vector<AnyValue>> Val;
+
+  AnyValue(SingleValue SV) : Val(std::move(SV)) {}
+  AnyValue(std::vector<AnyValue> MV) : Val(std::move(MV)) {}
+  AnyValue() = default;
+
+  bool isSingleValue() const {
+    return std::holds_alternative<SingleValue>(Val);
+  }
+  const SingleValue &getSingleValue() const {
+    assert(isSingleValue());
+    return std::get<SingleValue>(Val);
+  }
+  SingleValue &getSingleValue() {
+    assert(isSingleValue());
+    return std::get<SingleValue>(Val);
+  }
+  const std::vector<AnyValue> &getValueArray() const {
+    assert(std::holds_alternative<std::vector<AnyValue>>(Val));
+    return std::get<std::vector<AnyValue>>(Val);
+  }
+  std::vector<AnyValue> &getValueArray() {
+    assert(std::holds_alternative<std::vector<AnyValue>>(Val));
+    return std::get<std::vector<AnyValue>>(Val);
+  }
+  const SingleValue &getSingleValueAt(uint32_t Idx) const {
+    return getValueArray().at(Idx).getSingleValue();
+  }
+  SingleValue &getSingleValueAt(uint32_t Idx) {
+    return getValueArray().at(Idx).getSingleValue();
+  }
+};
+inline AnyValue none() { return AnyValue{std::monostate{}}; }
+raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val);
+
+struct Frame final {
+  BasicBlock *BB;
+  BasicBlock::iterator PC;
+  SmallVector<std::shared_ptr<MemObject>> Allocas;
+  DenseMap<Value *, AnyValue> ValueMap;
+  std::optional<AnyValue> RetVal;
+};
+
+struct IntConstraintInfo final {
+  ConstantRange Range;
+  KnownBits Bits;
+  bool HasPoison;
+
+  explicit IntConstraintInfo(const std::optional<APInt> &InitV)
+      : Range(InitV.has_value() ? *InitV : APInt::getZero(32)),
+        Bits(KnownBits::makeConstant(InitV.has_value() ? *InitV
+                                                       : APInt::getZero(32))),
+        HasPoison(!InitV.has_value()) {}
+  void update(const std::optional<APInt> &V) {
+    if (HasPoison)
+      return;
+    if (!V.has_value()) {
+      HasPoison = true;
+      return;
+    }
+    Range = Range.unionWith(*V);
+    Bits = Bits.intersectWith(KnownBits::makeConstant(*V));
+  }
+};
+
+struct EMITrackingInfo final {
+  bool Enabled;
+  DenseMap<Value *, bool> MayBeUndef;
+  DenseMap<Value *, ConstantRange> Range;
+  DenseMap<BinaryOperator *, uint32_t> NoWrapFlags;
+  DenseMap<TruncInst *, uint32_t> TruncNoWrapFlags;
+  DenseMap<PossiblyNonNegInst *, bool> NNegFlags;
+  DenseMap<ICmpInst *, bool> ICmpFlags;
+  DenseMap<IntrinsicInst *, bool> IsPoisonFlags;
+  DenseMap<PossiblyDisjointInst *, bool> DisjointFlags;
+
+  DenseMap<Instruction *, SmallVector<Use *>> InterestingUses;
+  DenseMap<Use *, IntConstraintInfo> UseIntInfo;
+
+  // TODO: nonnull
+  // TODO: align
+  // TODO: Use -> attributes mapping for arguments
+  DenseSet<BasicBlock *> ReachableBlocks;
+
+  void trackRange(Value *K, const APInt &V) {
+    if (V.getBitWidth() <= 1)
+      return;
+    if (!Range.contains(K))
+      Range.insert({K, V});
+    else {
+      auto &Ref = Range.find(K)->second;
+      Ref = Ref.unionWith(V);
+    }
+  }
+};
+
+struct InterpreterOption {
+  uint32_t VScale = 4;
+  bool Verbose = false;
+
+  bool EnableEMITracking = false;
+  bool EnableEMIDebugging = false;
+  double EMIProb = 0.1;
+  double EMIUseProb = 0.001;
+
+  bool IgnoreParamAttrsOnIntrinsic = false;
+};
+
+class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
+  LLVMContext &Ctx;
+  Module &M;
+  const DataLayout &DL;
+  InterpreterOption Option;
+  TargetLibraryInfoImpl TLI;
+  MemoryManager MemMgr;
+  std::shared_ptr<MemObject> NullPtrStorage;
+  std::optional<Pointer> NullPtr;
+  DenseMap<GlobalValue *, std::shared_ptr<MemObject>> GlobalValues;
+  DenseMap<size_t, Function *> ValidCallees;
+  DenseMap<size_t, BasicBlock *> ValidBlockTargets;
+  DenseMap<BasicBlock *, std::shared_ptr<MemObject>> BlockTargets;
+  EMITrackingInfo EMIInfo;
+  std::mt19937_64 Gen;
+  Frame *CurrentFrame = nullptr;
+
+  uint32_t getVectorLength(VectorType *Ty) const;
+  AnyValue getPoison(Type *Ty) const;
+  AnyValue getZero(Type *Ty) const;
+  AnyValue convertFromConstant(Constant *V) const;
+  void store(MemObject &MO, uint32_t Offset, const AnyValue &V, Type *Ty);
+  AnyValue load(const MemObject &MO, uint32_t Offset, Type *Ty);
+  void store(const AnyValue &P, uint32_t Alignment, const AnyValue &V, Type *Ty,
+             bool IsVolatile);
+  AnyValue load(const AnyValue &P, uint32_t Alignment, Type *Ty,
+                bool IsVolatile);
+  SingleValue offsetPointer(const Pointer &Ptr, const APInt &Offset,
+                            GEPNoWrapFlags Flags) const;
+
+public:
+  explicit UBAwareInterpreter(Module &M, InterpreterOption Option);
+
+  bool addValue(Instruction &I, AnyValue Val);
+  bool jumpTo(BasicBlock *To);
+  AnyValue getValue(Value *V);
+  std::optional<APInt> getInt(const SingleValue &SV);
+  std::optional<APInt> getInt(Value *V);
+  APInt getIntNonPoison(Value *V);
+  enum class BooleanVal { Poison, False, True };
+  BooleanVal getBoolean(const SingleValue &SV);
+  bool getBooleanNonPoison(const SingleValue &SV);
+  BooleanVal getBoolean(Value *V);
+  char *getRawPtr(const SingleValue &SV);
+  char *getRawPtr(const SingleValue &SV, size_t Size, size_t Alignment,
+                  bool IsStore, bool IsVolatile);
+  DenormalMode getCurrentDenormalMode(Type *Ty);
+
+  // TODO: checksum for volatile ops
+  void volatileLoad(const APInt &Addr, size_t Size, size_t Alignment);
+  void volatileStore(const APInt &Addr, size_t Size, size_t Alignment);
+
+  bool visitAllocaInst(AllocaInst &AI);
+  AnyValue visitBinOp(Type *RetTy, const AnyValue &LHS, const AnyValue &RHS,
+                      const function_ref<SingleValue(const SingleValue &,
+                                                     const SingleValue &)> &Fn);
+  bool visitBinOp(Instruction &I,
+                  const function_ref<SingleValue(const SingleValue &,
+                                                 const SingleValue &)> &Fn);
+  AnyValue visitUnOp(Type *RetTy, const AnyValue &Val,
+                     const function_ref<SingleValue(const SingleValue &)> &Fn,
+                     bool PropagatesPoison = true);
+  bool visitUnOp(Instruction &I,
+                 const function_ref<SingleValue(const SingleValue &)> &Fn,
+                 bool PropagatesPoison = true);
+  AnyValue visitTriOp(
+      Type *RetTy, const AnyValue &X, const AnyValue &Y, const AnyValue &Z,
+      const function_ref<SingleValue(const SingleValue &, const SingleValue &,
+                                     const SingleValue &)> &Fn);
+
+  bool visitICmpInst(ICmpInst &I);
+  AnyValue visitIntBinOp(
+      Type *RetTy, const AnyValue &LHS, const AnyValue &RHS,
+      const function_ref<std::optional<APInt>(const APInt &, const APInt &)>
+          &Fn);
+  AnyValue
+  visitFPBinOp(Type *RetTy, FastMathFlags FMF, const AnyValue &LHS,
+               const AnyValue &RHS,
+               const function_ref<std::optional<APFloat>(const APFloat &,
+                                                         const APFloat &)> &Fn);
+  bool visitIntBinOp(Instruction &I, const function_ref<std::optional<APInt>(
+                                         const APInt &, const APInt &)> &Fn);
+  bool visitFPBinOp(Instruction &I, const function_ref<std::optional<APFloat>(
+                                        const APFloat &, const APFloat &)> &Fn);
+  AnyValue visitIntTriOp(Type *RetTy, const AnyValue &X, const AnyValue &Y,
+                         const AnyValue &Z,
+                         const function_ref<std::optional<APInt>(
+                             const APInt &, const APInt &, const APInt &)> &Fn);
+  AnyValue
+  visitFPTriOp(Type *RetTy, FastMathFlags FMF, const AnyValue &X,
+               const AnyValue &Y, const AnyValue &Z,
+               const function_ref<std::optional<APFloat>(
+                   const APFloat &, const APFloat &, const APFloat &)> &Fn);
+  bool visitAnd(BinaryOperator &I);
+  bool visitXor(BinaryOperator &I);
+  bool visitOr(BinaryOperator &I);
+  bool visitShl(BinaryOperator &I);
+  bool visitLShr(BinaryOperator &I);
+  bool visitAShr(BinaryOperator &I);
+  bool visitAdd(BinaryOperator &I);
+  bool visitSub(BinaryOperator &I);
+  bool visitMul(BinaryOperator &I);
+  bool visitSDiv(BinaryOperator &I);
+  bool visitSRem(BinaryOperator &I);
+  bool visitUDiv(BinaryOperator &I);
+  bool visitURem(BinaryOperator &I);
+  AnyValue
+  visitIntUnOp(Type *Ty, const AnyValue &Val,
+               const function_ref<std::optional<APInt>(const APInt &)> &Fn);
+  bool
+  visitIntUnOp(Instruction &I,
+               const function_ref<std::optional<APInt>(const APInt &)> &Fn);
+  AnyValue
+  visitFPUnOp(Type *RetTy, FastMathFlags FMF, const AnyValue &Val,
+              const function_ref<std::optional<APFloat>(const APFloat &)> &Fn);
+  bool
+  visitFPUnOp(Instruction &I,
+              const function_ref<std::optional<APFloat>(const APFloat &)> &Fn);
+  bool visitTruncInst(TruncInst &Trunc);
+  bool visitSExtInst(SExtInst &SExt);
+  bool visitZExtInst(ZExtInst &ZExt);
+  bool fpCast(Instruction &I);
+  bool visitFPExtInst(FPExtInst &FPExt);
+  bool visitFPTruncInst(FPTruncInst &FPTrunc);
+  bool visitIntToFPInst(Instruction &I, bool IsSigned);
+  bool visitSIToFPInst(SIToFPInst &I);
+  bool visitUIToFPInst(UIToFPInst &I);
+  bool visitFPToIntInst(Instruction &I, bool IsSigned);
+  bool visitFPToSIInst(FPToSIInst &I);
+  bool visitFPToUIInst(FPToUIInst &I);
+  bool visitFNeg(UnaryOperator &I);
+  bool visitFAdd(BinaryOperator &I);
+  bool visitFSub(BinaryOperator &I);
+  bool visitFMul(BinaryOperator &I);
+  bool visitFDiv(BinaryOperator &I);
+  bool visitFRem(BinaryOperator &I);
+  bool visitFCmpInst(FCmpInst &FCmp);
+  AnyValue freezeValue(const AnyValue &Val, Type *Ty);
+  bool visitFreezeInst(FreezeInst &Freeze);
+  bool visitSelect(SelectInst &SI);
+  bool visitBranchInst(BranchInst &BI);
+  bool visitIndirectBrInst(IndirectBrInst &IBI);
+  SingleValue computeGEP(const SingleValue &Base, const APInt &Offset,
+                         GEPNoWrapFlags Flags);
+  bool visitGetElementPtrInst(GetElementPtrInst &GEP);
+  bool visitExtractValueInst(ExtractValueInst &EVI);
+  bool visitInsertValueInst(InsertValueInst &IVI);
+  bool visitInsertElementInst(InsertElementInst &IEI);
+  bool visitExtractElementInst(ExtractElementInst &EEI);
+  bool visitShuffleVectorInst(ShuffleVectorInst &SVI);
+  bool visitStoreInst(StoreInst &SI);
+  void handleRangeMetadata(AnyValue &V, Instruction &I);
+  bool visitLoadInst(LoadInst &LI);
+  void writeBits(APInt &Dst, uint32_t &Offset, const APInt &Src);
+  void toBits(APInt &Bits, APInt &PoisonBits, uint32_t &Offset,
+              const AnyValue &Val, Type *Ty);
+  bool visitIntToPtr(IntToPtrInst &I);
+  bool visitPtrToInt(PtrToIntInst &I);
+  APInt readBits(const APInt &Src, uint32_t &Offset, uint32_t Width);
+  AnyValue fromBits(const APInt &Bits, const APInt &PoisonBits,
+                    uint32_t &Offset, Type *Ty);
+  bool visitBitCastInst(BitCastInst &BCI);
+  std::string getValueName(Value *V);
+  AnyValue handleCall(CallBase &CB);
+  bool visitCallInst(CallInst &CI);
+  bool visitReturnInst(ReturnInst &RI);
+  bool visitUnreachableInst(UnreachableInst &);
+  bool visitSwitchInst(SwitchInst &SI);
+  bool visitInstruction(Instruction &I);
+  AnyValue handleWithOverflow(
+      Type *OpTy, const AnyValue &LHS, const AnyValue &RHS,
+      const function_ref<std::pair<APInt, bool>(const APInt &, const APInt &)>
+          &Fn);
+
+  AnyValue callIntrinsic(Function *Func, FastMathFlags FMF,
+                         SmallVectorImpl<AnyValue> &Args);
+  AnyValue callLibFunc(LibFunc Func, Function *FuncDecl,
+                       SmallVectorImpl<AnyValue> &Args);
+  AnyValue call(Function *Func, FastMathFlags FMF,
+                SmallVectorImpl<AnyValue> &Args);
+  int32_t runMain();
+  void mutate();
 };
