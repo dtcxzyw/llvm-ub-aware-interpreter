@@ -42,15 +42,51 @@ cmake --build . -j
 ./llubi test.ll [--verbose]
 ```
 
+## Automatic UB-Free Test Case Reduction for Middle-End Miscompilation Bugs
+
+test.sh:
+```
+#!/usr/bin/bash
+
+MAX_STEPS=1000000
+a=$(<path to llubi> --max-steps $MAX_STEPS --reduce-mode $1)
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+<path to opt> <options> $1 -o $1.tmp
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+b=$(<path to llubi> --max-steps $MAX_STEPS --reduce-mode $1.tmp)
+if [ $? -ne 0 ]; then
+    rm $1.tmp
+    exit 0
+fi
+if [[ $a == $b ]]; then
+    rm $1.tmp
+    exit 1
+fi
+rm $1.tmp
+exit 0
+```
+
+Usage:
+```
+clang -O3 -Xclang -disable-llvm-passes -emit-llvm -S test.c -o test.ll
+llvm-reduce --test=test.sh --ir-passes="function(sroa,instcombine<no-verify-fixpoint>,gvn,simplifycfg,infer-address-spaces),inline" test.ll
+```
+
+## Fuzzing with Csmith
+```
+python3 csmith.py <llvm install dir> <csmith install dir> <path to llubi> <test count> [emi]
+```
+If `emi` is set, it will enable the EMI-based mutation. For more details, please refer to [Compiler validation via equivalence modulo inputs, PLDI'21](https://dl.acm.org/doi/10.1145/2594291.2594334).
+
 ## Notes
 + Undef values are not supported as we will eventually remove undef from LLVM in the future. In llubi, they are treated as zero values.
 + FFI is not supported. Currently it only supports ```printf("%d", x)``` for csmith.
 
-## Roadmap
+## TODO
 - [ ] TBAA support
 - [ ] lifetime/invariant support
 - [ ] Fine-grained UB check control
-- [ ] Turn it into a library
-- [ ] Per-pass UB-aware testing
-- [x] EMI-based fuzzing
-- [ ] EMI-based test reduction
