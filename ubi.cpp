@@ -4,7 +4,6 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
-#include "llvm/IR/Argument.h"
 #include <cassert>
 #include <utility>
 
@@ -388,9 +387,12 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
     return std::move(Elts);
   }
   if (auto *GV = dyn_cast<GlobalValue>(V)) {
-    return AnyValue{
-        Pointer{GlobalValues.at(GV),
-                APInt::getZero(DL.getTypeSizeInBits(GV->getType()))}};
+    auto Iter = GlobalValues.find(GV);
+    if (Iter == GlobalValues.end())
+      return AnyValue{*NullPtr};
+
+    return AnyValue{Pointer{
+        Iter->second, APInt::getZero(DL.getTypeSizeInBits(GV->getType()))}};
   }
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     switch (CE->getOpcode()) {
@@ -568,7 +570,7 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
   EMIInfo.EnablePGFTracking = EMIInfo.Enabled && Option.EnablePGFTracking;
   NullPtrStorage = MemMgr.create("null", false, 0U, 1U);
   NullPtr = Pointer{NullPtrStorage, APInt::getZero(DL.getPointerSizeInBits())};
-  assert(NullPtr->address().isZero());
+  assert(NullPtr->Address.isZero());
   for (auto &GV : M.globals()) {
     if (!GV.hasExactDefinition())
       continue;
@@ -1927,8 +1929,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
         });
   }
   case Intrinsic::assume: {
-    assert(isAssumeWithEmptyBundle(cast<AssumeInst>(*II)) &&
-           "Assume bundles have not supported yet");
+    // Assume bundles have not supported yet
     switch (getBoolean(Args[0].getSingleValue())) {
     case BooleanVal::Poison:
       ImmUBReporter() << "assumption violation (poison)";
@@ -2287,8 +2288,13 @@ int32_t UBAwareInterpreter::runMain() {
   }
 
   SmallVector<AnyValue> Args;
-  Args.push_back(SingleValue{APInt::getZero(32)});
-  Args.push_back(SingleValue{*NullPtr});
+  if (Option.ReduceMode) {
+    for (auto &Arg : Entry->args())
+      Args.push_back(getZero(Arg.getType()));
+  } else {
+    Args.push_back(SingleValue{APInt::getZero(32)});
+    Args.push_back(SingleValue{*NullPtr});
+  }
   auto RetVal = call(Entry, FastMathFlags{}, Args);
   if (Entry->getReturnType()->isVoidTy())
     return EXIT_SUCCESS;

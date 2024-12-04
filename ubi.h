@@ -263,6 +263,7 @@ struct InterpreterOption {
   double EMIUseProb = 0.001;
 
   bool IgnoreParamAttrsOnIntrinsic = false;
+  bool ReduceMode = false;
 };
 
 class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {

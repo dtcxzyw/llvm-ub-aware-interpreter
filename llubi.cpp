@@ -28,6 +28,9 @@ static cl::opt<bool> IgnoreParamAttrsOnIntrinsic(
     "ignore-param-attrs-intrinsic",
     cl::desc("Ignore parameter attributes of intrinsic calls"), cl::init(false),
     cl::cat(Category));
+static cl::opt<bool> ReduceMode("reduce-mode",
+                                cl::desc("Reduce mode (allow invalid IR)"),
+                                cl::init(false), cl::cat(Category));
 static cl::opt<bool> Verbose("verbose", cl::desc("Print step-by-step log"),
                              cl::init(false), cl::cat(Category));
 static cl::opt<std::string> EMIMutate("emi",
@@ -54,6 +57,7 @@ int main(int argc, char **argv) {
 
   InterpreterOption Option;
 
+  Option.ReduceMode = ReduceMode;
   Option.VScale = VScaleValue;
   Option.MaxSteps = MaxSteps;
   Option.Verbose = Verbose;
