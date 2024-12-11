@@ -1799,6 +1799,8 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
   auto IID = Func->getIntrinsicID();
   Type *RetTy = Func->getReturnType();
   switch (IID) {
+  case Intrinsic::donothing:
+    return none();
   case Intrinsic::vscale:
     return SingleValue{APInt(RetTy->getScalarSizeInBits(), Option.VScale)};
   case Intrinsic::lifetime_start:
