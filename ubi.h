@@ -67,21 +67,10 @@
 #include <limits>
 #include <map>
 #include <random>
+#include <unordered_set>
 #include <variant>
 
 using namespace llvm;
-
-class ImmUBReporter final {
-  raw_ostream &Out;
-
-public:
-  ImmUBReporter();
-  [[noreturn]] ~ImmUBReporter();
-  template <typename Arg> ImmUBReporter &operator<<(Arg &&arg) {
-    Out << std::forward<Arg>(arg);
-    return *this;
-  }
-};
 
 class MemoryManager;
 class MemObject final : public std::enable_shared_from_this<MemObject> {
@@ -137,8 +126,11 @@ inline bool isPoison(const APFloat &AFP, FastMathFlags FMF) {
 inline SingleValue boolean(bool Val) { return SingleValue{APInt(1, Val)}; }
 inline SingleValue poison() { return std::monostate{}; }
 
+class UBAwareInterpreter;
+
 class MemoryManager final {
   // TODO: handle llvm.lifetime.start/end and llvm.invariant.start.end/TBAA
+  UBAwareInterpreter &Interpreter;
   uint32_t PtrBitWidth;
   size_t AllocatedMem = 0;
   static constexpr size_t Padding = 16U;
@@ -148,7 +140,8 @@ class MemoryManager final {
   void erase(const size_t Address) { AddressMap.erase(Address); }
 
 public:
-  explicit MemoryManager(const DataLayout &DL, PointerType *Ty);
+  explicit MemoryManager(UBAwareInterpreter &Interpreter, const DataLayout &DL,
+                         PointerType *Ty);
   std::shared_ptr<MemObject> create(std::string Name, bool IsLocal, size_t Size,
                                     size_t Alignment);
   SingleValue lookupPointer(const APInt &Addr) const;
@@ -195,6 +188,7 @@ struct Frame final {
   SmallVector<std::shared_ptr<MemObject>> Allocas;
   DenseMap<Value *, AnyValue> ValueMap;
   std::optional<AnyValue> RetVal;
+  Frame *LastFrame;
 };
 
 struct IntConstraintInfo final {
@@ -276,6 +270,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   std::shared_ptr<MemObject> NullPtrStorage;
   std::optional<Pointer> NullPtr;
   DenseMap<GlobalValue *, std::shared_ptr<MemObject>> GlobalValues;
+  std::unordered_set<std::shared_ptr<MemObject>> AllocatedMems;
   DenseMap<size_t, Function *> ValidCallees;
   DenseMap<size_t, BasicBlock *> ValidBlockTargets;
   DenseMap<BasicBlock *, std::shared_ptr<MemObject>> BlockTargets;
@@ -296,6 +291,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
                 bool IsVolatile);
   SingleValue offsetPointer(const Pointer &Ptr, const APInt &Offset,
                             GEPNoWrapFlags Flags) const;
+  SingleValue alloc(const APInt &AllocSize, bool ZeroInitialize);
 
 public:
   explicit UBAwareInterpreter(Module &M, InterpreterOption Option);
@@ -447,6 +443,7 @@ public:
                        SmallVectorImpl<AnyValue> &Args);
   AnyValue call(Function *Func, FastMathFlags FMF,
                 SmallVectorImpl<AnyValue> &Args);
+  void dumpStackTrace();
   int32_t runMain();
   void mutate();
   bool simplify();

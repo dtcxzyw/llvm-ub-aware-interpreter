@@ -7,23 +7,37 @@
 #include <cassert>
 #include <utility>
 
-ImmUBReporter::ImmUBReporter() : Out(errs()) { Out << "\nUB triggered: "; }
-[[noreturn]] ImmUBReporter::~ImmUBReporter() {
-  Out << "\nExited with immediate UB.\n";
-  Out.flush();
-  std::exit(EXIT_FAILURE);
-}
+class ImmUBReporter final {
+  raw_ostream &Out;
+  UBAwareInterpreter &Interpreter;
+
+public:
+  ImmUBReporter(UBAwareInterpreter &Interpreter)
+      : Out(errs()), Interpreter(Interpreter) {
+    Out << "\nUB triggered: ";
+  }
+  [[noreturn]] ~ImmUBReporter() {
+    Out << "\nExited with immediate UB.\n";
+    Interpreter.dumpStackTrace();
+    Out.flush();
+    std::exit(EXIT_FAILURE);
+  }
+  template <typename Arg> ImmUBReporter &operator<<(Arg &&arg) {
+    Out << std::forward<Arg>(arg);
+    return *this;
+  }
+};
 
 MemObject::~MemObject() { Manager.erase(Address.getZExtValue()); }
 void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                                 size_t Alignment) {
   auto NewAddr = Address + Offset;
   if (NewAddr.countr_zero() < Log2_64(Alignment))
-    ImmUBReporter() << "Unaligned mem op";
+    ImmUBReporter(Manager.Interpreter) << "Unaligned mem op";
   if ((Offset + AccessSize).ugt(Data.size()))
-    ImmUBReporter() << "Out of bound mem op, bound = " << Data.size()
-                    << ", access range = [" << Offset << ", "
-                    << Offset + AccessSize << ')';
+    ImmUBReporter(Manager.Interpreter)
+        << "Out of bound mem op, bound = " << Data.size()
+        << ", access range = [" << Offset << ", " << Offset + AccessSize << ')';
 }
 void MemObject::store(size_t Offset, const APInt &C) {
   constexpr uint32_t Scale = sizeof(APInt::WordType);
@@ -80,8 +94,9 @@ void MemObject::dumpRef(raw_ostream &Out) {
       << "Size = " << Data.size() << ']';
 }
 
-MemoryManager::MemoryManager(const DataLayout &DL, PointerType *Ty)
-    : PtrBitWidth(DL.getTypeSizeInBits(Ty)) {
+MemoryManager::MemoryManager(UBAwareInterpreter &Interpreter,
+                             const DataLayout &DL, PointerType *Ty)
+    : Interpreter(Interpreter), PtrBitWidth(DL.getTypeSizeInBits(Ty)) {
   assert(DL.getTypeSizeInBits(Ty) ==
          DL.getIndexSizeInBits(Ty->getAddressSpace()));
 }
@@ -187,9 +202,9 @@ raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val) {
   return Out << "None";
 }
 
-void handleNoUndef(const SingleValue &V) {
+void handleNoUndef(UBAwareInterpreter &Interpreter, const SingleValue &V) {
   if (isPoison(V))
-    ImmUBReporter() << "noundef on a poison value";
+    ImmUBReporter(Interpreter) << "noundef on a poison value";
 }
 APFloat handleDenormal(APFloat V, DenormalMode::DenormalModeKind Denormal) {
   if (V.isDenormal()) {
@@ -251,22 +266,25 @@ void handleNoFPClass(SingleValue &V, FPClassTest Mask) {
   if (AFP.classify() & Mask)
     V = poison();
 }
-void handleDereferenceable(SingleValue &V, uint64_t Size, bool OrNull) {
+void handleDereferenceable(UBAwareInterpreter &Interpreter, SingleValue &V,
+                           uint64_t Size, bool OrNull) {
   if (isPoison(V))
-    ImmUBReporter() << "dereferenceable on a poison value";
+    ImmUBReporter(Interpreter) << "dereferenceable on a poison value";
   auto &Ptr = std::get<Pointer>(V);
   if (Ptr.Address == 0) {
     if (OrNull)
       return;
-    ImmUBReporter() << "dereferenceable on a null pointer";
+    ImmUBReporter(Interpreter) << "dereferenceable on a null pointer";
   }
   if (Ptr.Offset.getSExtValue() + Size > Ptr.Bound) {
-    ImmUBReporter() << "dereferenceable" << (OrNull ? "_or_null" : "") << "("
-                    << Size << ") out of bound :" << V;
+    ImmUBReporter(Interpreter)
+        << "dereferenceable" << (OrNull ? "_or_null" : "") << "(" << Size
+        << ") out of bound :" << V;
   }
   if (Ptr.Obj.expired())
-    ImmUBReporter() << "dereferenceable" << (OrNull ? "_or_null" : "")
-                    << " on a dangling pointer";
+    ImmUBReporter(Interpreter)
+        << "dereferenceable" << (OrNull ? "_or_null" : "")
+        << " on a dangling pointer";
 }
 void postProcess(AnyValue &V, const function_ref<void(SingleValue &)> &Fn) {
   if (V.isSingleValue()) {
@@ -285,7 +303,8 @@ AnyValue postProcessFPVal(AnyValue V, Instruction &FMFSource) {
   }
   return std::move(V);
 }
-void postProcessAttr(AnyValue &V, const AttributeSet &AS) {
+void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
+                     const AttributeSet &AS) {
   if (AS.hasAttribute(Attribute::Range)) {
     auto CR = AS.getAttribute(Attribute::Range).getRange();
     postProcess(V, [CR](SingleValue &SV) { handleRange(SV, CR); });
@@ -296,13 +315,15 @@ void postProcessAttr(AnyValue &V, const AttributeSet &AS) {
   }
   if (AS.hasAttribute(Attribute::Dereferenceable)) {
     auto Size = AS.getDereferenceableBytes();
-    postProcess(
-        V, [Size](SingleValue &SV) { handleDereferenceable(SV, Size, false); });
+    postProcess(V, [&](SingleValue &SV) {
+      handleDereferenceable(Interpreter, SV, Size, false);
+    });
   }
   if (AS.hasAttribute(Attribute::DereferenceableOrNull)) {
     auto Size = AS.getDereferenceableOrNullBytes();
-    postProcess(
-        V, [Size](SingleValue &SV) { handleDereferenceable(SV, Size, true); });
+    postProcess(V, [&](SingleValue &SV) {
+      handleDereferenceable(Interpreter, SV, Size, true);
+    });
   }
   if (AS.hasAttribute(Attribute::Alignment)) {
     auto Align = AS.getAlignment().valueOrOne().value();
@@ -311,7 +332,7 @@ void postProcessAttr(AnyValue &V, const AttributeSet &AS) {
   if (AS.hasAttribute(Attribute::NonNull))
     postProcess(V, handleNonNull);
   if (AS.hasAttribute(Attribute::NoUndef))
-    postProcess(V, handleNoUndef);
+    postProcess(V, [&](SingleValue &SV) { handleNoUndef(Interpreter, SV); });
 }
 
 uint32_t UBAwareInterpreter::getVectorLength(VectorType *Ty) const {
@@ -518,9 +539,9 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
       MO->verifyMemAccess(PV->Offset, Size, Alignment);
       return store(*MO, PV->Offset.getZExtValue(), V, Ty);
     }
-    ImmUBReporter() << "load from invalid pointer";
+    ImmUBReporter(*this) << "load from invalid pointer";
   }
-  ImmUBReporter() << "store to poison pointer";
+  ImmUBReporter(*this) << "store to poison pointer";
 }
 AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
                                   Type *Ty, bool IsVolatile) {
@@ -532,9 +553,9 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
       MO->verifyMemAccess(PV->Offset, Size, Alignment);
       return load(*MO, PV->Offset.getZExtValue(), Ty);
     }
-    ImmUBReporter() << "load from invalid pointer";
+    ImmUBReporter(*this) << "load from invalid pointer";
   }
-  ImmUBReporter() << "load from poison pointer";
+  ImmUBReporter(*this) << "load from poison pointer";
   llvm_unreachable("Unreachable code");
 }
 SingleValue UBAwareInterpreter::offsetPointer(const Pointer &Ptr,
@@ -562,7 +583,7 @@ SingleValue UBAwareInterpreter::offsetPointer(const Pointer &Ptr,
 UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
     : Ctx(M.getContext()), M(M), DL(M.getDataLayout()), Option(Option),
       TLI(Triple{M.getTargetTriple()}),
-      MemMgr(DL, PointerType::getUnqual(Ctx)) {
+      MemMgr(*this, DL, PointerType::getUnqual(Ctx)) {
   assert(DL.isLittleEndian());
   static_assert(sys::IsLittleEndianHost);
 
@@ -712,7 +733,7 @@ std::optional<APInt> UBAwareInterpreter::getInt(Value *V) {
 APInt UBAwareInterpreter::getIntNonPoison(Value *V) {
   if (auto Res = getInt(getValue(V).getSingleValue()))
     return *Res;
-  ImmUBReporter() << "Expect a non-poison integer";
+  ImmUBReporter(*this) << "Expect a non-poison integer";
   llvm_unreachable("Unreachable code");
 }
 UBAwareInterpreter::BooleanVal
@@ -725,7 +746,7 @@ UBAwareInterpreter::getBoolean(const SingleValue &SV) {
 bool UBAwareInterpreter::getBooleanNonPoison(const SingleValue &SV) {
   auto BV = getBoolean(SV);
   if (BV == BooleanVal::Poison)
-    ImmUBReporter() << "expect a poison value";
+    ImmUBReporter(*this) << "expect a poison value";
   return BV == BooleanVal::True;
 }
 UBAwareInterpreter::BooleanVal UBAwareInterpreter::getBoolean(Value *V) {
@@ -738,7 +759,7 @@ char *UBAwareInterpreter::getRawPtr(const SingleValue &SV) {
       return nullptr;
     return MO->rawPointer() + Ptr.Offset.getSExtValue();
   }
-  ImmUBReporter() << "dangling pointer";
+  ImmUBReporter(*this) << "dangling pointer";
   llvm_unreachable("Unreachable code");
 }
 char *UBAwareInterpreter::getRawPtr(const SingleValue &SV, size_t Size,
@@ -755,7 +776,7 @@ char *UBAwareInterpreter::getRawPtr(const SingleValue &SV, size_t Size,
     MO->verifyMemAccess(Ptr.Offset, Size, Alignment);
     return MO->rawPointer() + Ptr.Offset.getSExtValue();
   }
-  ImmUBReporter() << "dangling pointer";
+  ImmUBReporter(*this) << "dangling pointer";
   llvm_unreachable("Unreachable code");
 }
 DenormalMode UBAwareInterpreter::getCurrentDenormalMode(Type *Ty) {
@@ -1390,7 +1411,7 @@ bool UBAwareInterpreter::visitBranchInst(BranchInst &BI) {
     case BooleanVal::False:
       return jumpTo(BI.getSuccessor(1));
     case BooleanVal::Poison:
-      ImmUBReporter() << "Branch on poison";
+      ImmUBReporter(*this) << "Branch on poison";
     }
   }
   return jumpTo(BI.getSuccessor(0));
@@ -1398,18 +1419,18 @@ bool UBAwareInterpreter::visitBranchInst(BranchInst &BI) {
 bool UBAwareInterpreter::visitIndirectBrInst(IndirectBrInst &IBI) {
   auto Ptr = getValue(IBI.getAddress()).getSingleValue();
   if (isPoison(Ptr))
-    ImmUBReporter() << "Indirect branch on poison";
+    ImmUBReporter(*this) << "Indirect branch on poison";
   auto It =
       ValidBlockTargets.find(std::get<Pointer>(Ptr).Address.getZExtValue());
   if (It == ValidBlockTargets.end())
-    ImmUBReporter() << "Indirect branch on invalid target BB";
+    ImmUBReporter(*this) << "Indirect branch on invalid target BB";
   auto DestBB = It->second;
   for (uint32_t I = 0, E = IBI.getNumDestinations(); I != E; ++I) {
     if (IBI.getDestination(I) == DestBB)
       return jumpTo(DestBB);
   }
-  ImmUBReporter() << "Indirect branch on unlisted target BB "
-                  << *BlockAddress::get(DestBB);
+  ImmUBReporter(*this) << "Indirect branch on unlisted target BB "
+                       << *BlockAddress::get(DestBB);
   llvm_unreachable("Unreachable code");
 }
 SingleValue UBAwareInterpreter::computeGEP(const SingleValue &Base,
@@ -1562,15 +1583,15 @@ bool UBAwareInterpreter::visitLoadInst(LoadInst &LI) {
     if (auto *MD = LI.getMetadata(LLVMContext::MD_dereferenceable)) {
       size_t Deref =
           mdconst::extract<ConstantInt>(MD->getOperand(0))->getLimitedValue();
-      postProcess(RetVal, [Deref](SingleValue &SV) {
-        handleDereferenceable(SV, Deref, false);
+      postProcess(RetVal, [&](SingleValue &SV) {
+        handleDereferenceable(*this, SV, Deref, false);
       });
     }
     if (auto *MD = LI.getMetadata(LLVMContext::MD_dereferenceable_or_null)) {
       size_t Deref =
           mdconst::extract<ConstantInt>(MD->getOperand(0))->getLimitedValue();
-      postProcess(RetVal, [Deref](SingleValue &SV) {
-        handleDereferenceable(SV, Deref, true);
+      postProcess(RetVal, [&](SingleValue &SV) {
+        handleDereferenceable(*this, SV, Deref, true);
       });
     }
     if (auto *MD = LI.getMetadata(LLVMContext::MD_align)) {
@@ -1581,7 +1602,8 @@ bool UBAwareInterpreter::visitLoadInst(LoadInst &LI) {
   }
   handleRangeMetadata(RetVal, LI);
   if (LI.hasMetadata(LLVMContext::MD_noundef))
-    postProcess(RetVal, handleNoUndef);
+    postProcess(RetVal,
+                [&](SingleValue &SV) { return handleNoUndef(*this, SV); });
   else if (EMIInfo.EnablePGFTracking && RetVal.isSingleValue()) {
     EMIInfo.MayBeUndef[&LI] = isPoison(RetVal.getSingleValue());
     if (LI.getType()->isIntegerTy() && !isPoison(RetVal.getSingleValue()))
@@ -1707,7 +1729,7 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
     }
 
     if (HandleParamAttr)
-      postProcessAttr(ArgVal, CB.getParamAttributes(Idx));
+      postProcessAttr(*this, ArgVal, CB.getParamAttributes(Idx));
     Args.push_back(std::move(ArgVal));
   }
   FastMathFlags FMF;
@@ -1718,16 +1740,16 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
   if (!Callee) {
     auto Addr = getValue(CalledFunc).getSingleValue();
     if (isPoison(Addr))
-      ImmUBReporter() << "Call with poison callee";
+      ImmUBReporter(*this) << "Call with poison callee";
     auto FuncAddr = std::get<Pointer>(Addr).Address.getZExtValue();
     if (auto It = ValidCallees.find(FuncAddr); It != ValidCallees.end())
       Callee = It->second;
     else
-      ImmUBReporter() << "Call with invalid callee";
+      ImmUBReporter(*this) << "Call with invalid callee";
   }
   auto RetVal = call(Callee, FMF, Args);
   handleRangeMetadata(RetVal, CB);
-  postProcessAttr(RetVal, CB.getRetAttributes());
+  postProcessAttr(*this, RetVal, CB.getRetAttributes());
   return std::move(RetVal);
 }
 bool UBAwareInterpreter::visitCallInst(CallInst &CI) {
@@ -1747,13 +1769,13 @@ bool UBAwareInterpreter::visitReturnInst(ReturnInst &RI) {
   return false;
 }
 bool UBAwareInterpreter::visitUnreachableInst(UnreachableInst &) {
-  ImmUBReporter() << "Unreachable code";
+  ImmUBReporter(*this) << "Unreachable code";
   llvm_unreachable("Unreachable code");
 }
 bool UBAwareInterpreter::visitSwitchInst(SwitchInst &SI) {
   auto Cond = getInt(SI.getCondition());
   if (!Cond)
-    ImmUBReporter() << "Switch on poison condition";
+    ImmUBReporter(*this) << "Switch on poison condition";
   for (auto &Case : SI.cases()) {
     if (Case.getCaseValue()->getValue() == *Cond)
       return jumpTo(Case.getCaseSuccessor());
@@ -1836,7 +1858,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
   case Intrinsic::memmove: {
     auto Size = getInt(Args[2].getSingleValue());
     if (!Size)
-      ImmUBReporter() << "memcpy with poison size";
+      ImmUBReporter(*this) << "memcpy with poison size";
     if (Size->isZero())
       return none();
     auto CopySize = Size->getZExtValue();
@@ -1855,7 +1877,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
   case Intrinsic::memset_inline: {
     auto Size = getInt(Args[2].getSingleValue());
     if (!Size)
-      ImmUBReporter() << "memcpy with poison size";
+      ImmUBReporter(*this) << "memcpy with poison size";
     if (Size->isZero())
       return none();
     auto WriteSize = Size->getZExtValue();
@@ -1864,7 +1886,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
         getRawPtr(Args[0].getSingleValue(), WriteSize, 1U, true, IsVolatile);
     auto Val = getInt(Args[1].getSingleValue());
     if (!Val)
-      ImmUBReporter() << "memset with poison value";
+      ImmUBReporter(*this) << "memset with poison value";
     std::memset(Dst, Val->getZExtValue(), WriteSize);
     return none();
   }
@@ -1934,9 +1956,9 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
     // Assume bundles have not supported yet
     switch (getBoolean(Args[0].getSingleValue())) {
     case BooleanVal::Poison:
-      ImmUBReporter() << "assumption violation (poison)";
+      ImmUBReporter(*this) << "assumption violation (poison)";
     case BooleanVal::False:
-      ImmUBReporter() << "assumption violation (false)";
+      ImmUBReporter(*this) << "assumption violation (false)";
     case BooleanVal::True:
       return none();
     }
@@ -2186,6 +2208,15 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
   errs() << "Intrinsic: " << Func->getName() << '\n';
   llvm_unreachable("Unsupported intrinsic");
 }
+SingleValue UBAwareInterpreter::alloc(const APInt &AllocSize,
+                                      bool ZeroInitialize) {
+  auto MemObj = MemMgr.create("alloc", false, AllocSize.getZExtValue(), 8);
+  AllocatedMems.insert(MemObj);
+  if (ZeroInitialize)
+    std::memset(MemObj->rawPointer(), 0, MemObj->size());
+  return SingleValue{
+      Pointer{MemObj, APInt::getZero(DL.getPointerSizeInBits())}};
+}
 AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
                                          SmallVectorImpl<AnyValue> &Args) {
   switch (Func) {
@@ -2193,10 +2224,10 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
     if (Args.size() == 2) {
       auto Format = getRawPtr(Args[0].getSingleValue());
       if (!Format)
-        ImmUBReporter() << "invalid printf format";
+        ImmUBReporter(*this) << "invalid printf format";
       auto Val = getInt(Args[1].getSingleValue());
       if (!Val.has_value())
-        ImmUBReporter() << "print a poison value";
+        ImmUBReporter(*this) << "print a poison value";
       if (Option.Verbose)
         errs() << "\n    Printf: ";
       int Ret =
@@ -2206,6 +2237,34 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
       return SingleValue{APInt(32, Ret)};
     }
     break;
+  }
+  case LibFunc_malloc: {
+    auto Size = getInt(Args[0].getSingleValue());
+    if (!Size)
+      ImmUBReporter(*this) << "malloc with poison size";
+    return alloc(*Size, /*ZeroInitialize=*/false);
+  }
+  case LibFunc_calloc: {
+    auto Num = getInt(Args[0].getSingleValue());
+    if (!Num)
+      ImmUBReporter(*this) << "malloc with poison count";
+    auto Size = getInt(Args[1].getSingleValue());
+    if (!Size)
+      ImmUBReporter(*this) << "malloc with poison size";
+    return alloc(*Num * *Size, /*ZeroInitialize=*/true);
+  }
+  case LibFunc_free: {
+    auto &Ptr = Args[0].getSingleValue();
+    if (isPoison(Ptr))
+      ImmUBReporter(*this) << "free with poison ptr";
+    auto &PtrVal = std::get<Pointer>(Ptr);
+    if (!PtrVal.Offset.isZero())
+      ImmUBReporter(*this) << "free with invalid ptr";
+    if (auto MO = PtrVal.Obj.lock())
+      AllocatedMems.erase(MO);
+    else
+      ImmUBReporter(*this) << "free with invalid ptr";
+    return none();
   }
   default:
     break;
@@ -2217,7 +2276,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
                                   SmallVectorImpl<AnyValue> &Args) {
   auto FnAttrs = Func->getAttributes();
   for (const auto &[Idx, Param] : enumerate(Func->args()))
-    postProcessAttr(Args[Idx], FnAttrs.getParamAttrs(Idx));
+    postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
 
   if (Func->isIntrinsic()) {
     return callIntrinsic(Func, FMF, Args);
@@ -2235,6 +2294,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
   Frame CallFrame;
   auto Scope = llvm::make_scope_exit(
       [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
+  CallFrame.LastFrame = CurrentFrame;
   CurrentFrame = &CallFrame;
   for (auto &Param : Func->args())
     CallFrame.ValueMap[&Param] = std::move(Args[Param.getArgNo()]);
@@ -2273,7 +2333,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
 
   auto RetVal = std::move(*CallFrame.RetVal);
   if (!Func->getReturnType()->isVoidTy())
-    postProcessAttr(RetVal, Func->getAttributes().getRetAttrs());
+    postProcessAttr(*this, RetVal, Func->getAttributes().getRetAttrs());
 
   if (Option.Verbose) {
     errs() << "Exiting function " << Func->getName() << '\n';
@@ -2301,7 +2361,7 @@ int32_t UBAwareInterpreter::runMain() {
   if (Entry->getReturnType()->isVoidTy())
     return EXIT_SUCCESS;
   if (isPoison(RetVal.getSingleValue()))
-    ImmUBReporter() << "Return a poison value";
+    ImmUBReporter(*this) << "Return a poison value";
   return std::get<APInt>(RetVal.getSingleValue()).getSExtValue();
 }
 
@@ -2479,4 +2539,15 @@ bool UBAwareInterpreter::simplify() {
     }
   }
   return Changed;
+}
+void UBAwareInterpreter::dumpStackTrace() {
+  errs() << "Stacktrace:\n";
+  auto Frame = CurrentFrame;
+  while (Frame) {
+    auto &Inst = *Frame->PC;
+    errs() << "  " << Inst << " at ";
+    Inst.getFunction()->printAsOperand(errs(), /*PrintType=*/false);
+    errs() << '\n';
+    Frame = Frame->LastFrame;
+  }
 }
