@@ -249,6 +249,7 @@ struct InterpreterOption {
   uint32_t VScale = 4;
   uint32_t MaxSteps = std::numeric_limits<uint32_t>::max();
   bool Verbose = false;
+  bool DumpStackTrace = false;
 
   bool EnableEMITracking = false;
   bool EnablePGFTracking = true;

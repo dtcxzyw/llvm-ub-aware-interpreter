@@ -40,6 +40,10 @@ static cl::opt<std::string> EMIMutate("emi",
 static cl::opt<bool> DumpEMI("dump-emi",
                              cl::desc("Dump EMI-based mutation scheme"),
                              cl::init(false), cl::cat(Category));
+static cl::opt<bool>
+    DumpStackTrace("dump-stack-trace",
+                   cl::desc("Dump stack trace when immediate UB occurs"),
+                   cl::init(true), cl::cat(Category));
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -64,6 +68,7 @@ int main(int argc, char **argv) {
   Option.EnableEMITracking = !EMIMutate.empty();
   Option.EnableEMIDebugging = DumpEMI;
   Option.IgnoreParamAttrsOnIntrinsic = IgnoreParamAttrsOnIntrinsic;
+  Option.DumpStackTrace = DumpStackTrace;
 
   UBAwareInterpreter Executor(*M, Option);
   int32_t Ret = Executor.runMain();

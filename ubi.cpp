@@ -2547,6 +2547,8 @@ bool UBAwareInterpreter::simplify() {
   return Changed;
 }
 void UBAwareInterpreter::dumpStackTrace() {
+  if (!Option.DumpStackTrace)
+    return;
   errs() << "Stacktrace:\n";
   auto Frame = CurrentFrame;
   while (Frame) {
