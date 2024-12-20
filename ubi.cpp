@@ -5,6 +5,7 @@
 
 #include "ubi.h"
 #include <cassert>
+#include <cstdlib>
 #include <utility>
 
 class ImmUBReporter final {
@@ -202,11 +203,13 @@ raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val) {
   return Out << "None";
 }
 
-void handleNoUndef(UBAwareInterpreter &Interpreter, const SingleValue &V) {
+static void handleNoUndef(UBAwareInterpreter &Interpreter,
+                          const SingleValue &V) {
   if (isPoison(V))
     ImmUBReporter(Interpreter) << "noundef on a poison value";
 }
-APFloat handleDenormal(APFloat V, DenormalMode::DenormalModeKind Denormal) {
+static APFloat handleDenormal(APFloat V,
+                              DenormalMode::DenormalModeKind Denormal) {
   if (V.isDenormal()) {
     switch (Denormal) {
     case DenormalMode::PreserveSign:
@@ -222,8 +225,8 @@ APFloat handleDenormal(APFloat V, DenormalMode::DenormalModeKind Denormal) {
   }
   return std::move(V);
 }
-void handleFPVal(SingleValue &V, FastMathFlags FMF,
-                 DenormalMode::DenormalModeKind Denormal) {
+static void handleFPVal(SingleValue &V, FastMathFlags FMF,
+                        DenormalMode::DenormalModeKind Denormal) {
   if (isPoison(V))
     return;
   auto &AFP = std::get<APFloat>(V);
@@ -233,41 +236,41 @@ void handleFPVal(SingleValue &V, FastMathFlags FMF,
   }
   AFP = handleDenormal(AFP, Denormal);
 }
-SingleValue handleFPVal(APFloat V, FastMathFlags FMF,
-                        DenormalMode::DenormalModeKind Denormal) {
+static SingleValue handleFPVal(APFloat V, FastMathFlags FMF,
+                               DenormalMode::DenormalModeKind Denormal) {
   if (isPoison(V, FMF))
     return poison();
   return handleDenormal(std::move(V), Denormal);
 }
-void handleRange(SingleValue &V, const ConstantRange &CR) {
+static void handleRange(SingleValue &V, const ConstantRange &CR) {
   if (auto *CI = std::get_if<APInt>(&V)) {
     if (!CR.contains(*CI))
       V = poison();
   }
 }
-void handleAlign(SingleValue &V, size_t Align) {
+static void handleAlign(SingleValue &V, size_t Align) {
   if (isPoison(V))
     return;
   auto &Ptr = std::get<Pointer>(V);
   if (Ptr.Address.countr_zero() < Log2_64(Align))
     V = poison();
 }
-void handleNonNull(SingleValue &V) {
+static void handleNonNull(SingleValue &V) {
   if (isPoison(V))
     return;
   auto &Ptr = std::get<Pointer>(V);
   if (Ptr.Address == 0)
     V = poison();
 }
-void handleNoFPClass(SingleValue &V, FPClassTest Mask) {
+static void handleNoFPClass(SingleValue &V, FPClassTest Mask) {
   if (isPoison(V))
     return;
   auto &AFP = std::get<APFloat>(V);
   if (AFP.classify() & Mask)
     V = poison();
 }
-void handleDereferenceable(UBAwareInterpreter &Interpreter, SingleValue &V,
-                           uint64_t Size, bool OrNull) {
+static void handleDereferenceable(UBAwareInterpreter &Interpreter,
+                                  SingleValue &V, uint64_t Size, bool OrNull) {
   if (isPoison(V))
     ImmUBReporter(Interpreter) << "dereferenceable on a poison value";
   auto &Ptr = std::get<Pointer>(V);
@@ -286,7 +289,8 @@ void handleDereferenceable(UBAwareInterpreter &Interpreter, SingleValue &V,
         << "dereferenceable" << (OrNull ? "_or_null" : "")
         << " on a dangling pointer";
 }
-void postProcess(AnyValue &V, const function_ref<void(SingleValue &)> &Fn) {
+static void postProcess(AnyValue &V,
+                        const function_ref<void(SingleValue &)> &Fn) {
   if (V.isSingleValue()) {
     Fn(V.getSingleValue());
   } else {
@@ -294,7 +298,7 @@ void postProcess(AnyValue &V, const function_ref<void(SingleValue &)> &Fn) {
       postProcess(Sub, Fn);
   }
 }
-AnyValue postProcessFPVal(AnyValue V, Instruction &FMFSource) {
+static AnyValue postProcessFPVal(AnyValue V, Instruction &FMFSource) {
   if (FMFSource.getType()->isFPOrFPVectorTy()) {
     FastMathFlags FMF = FMFSource.getFastMathFlags();
     postProcess(V, [FMF](SingleValue &SV) {
@@ -303,8 +307,8 @@ AnyValue postProcessFPVal(AnyValue V, Instruction &FMFSource) {
   }
   return std::move(V);
 }
-void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
-                     const AttributeSet &AS) {
+static void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
+                            const AttributeSet &AS) {
   if (AS.hasAttribute(Attribute::Range)) {
     auto CR = AS.getAttribute(Attribute::Range).getRange();
     postProcess(V, [CR](SingleValue &SV) { handleRange(SV, CR); });
@@ -356,8 +360,8 @@ AnyValue UBAwareInterpreter::getPoison(Type *Ty) const {
       Elts.push_back(getPoison(StructTy->getStructElementType(I)));
     return std::move(Elts);
   }
-  errs() << *Ty << '\n';
-  llvm_unreachable("Unsupported type");
+  errs() << "Unsupported type " << *Ty << '\n';
+  std::abort();
 }
 AnyValue UBAwareInterpreter::getZero(Type *Ty) const {
   if (Ty->isIntegerTy())
@@ -379,8 +383,8 @@ AnyValue UBAwareInterpreter::getZero(Type *Ty) const {
       Elts.push_back(getZero(StructTy->getStructElementType(I)));
     return std::move(Elts);
   }
-  errs() << *Ty << '\n';
-  llvm_unreachable("Unsupported type");
+  errs() << "Unsupported type " << *Ty << '\n';
+  std::abort();
 }
 AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
   if (isa<PoisonValue>(V))
@@ -440,8 +444,8 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
     return SingleValue{
         Pointer{BlockTargets.at(BA->getBasicBlock()),
                 APInt::getZero(DL.getTypeSizeInBits(V->getType()))}};
-  errs() << *V << '\n';
-  llvm_unreachable("Unexpected constant");
+  errs() << "Unexpected constant " << *V << '\n';
+  std::abort();
 }
 void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
                                const AnyValue &V, Type *Ty) {
@@ -487,7 +491,7 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
     }
   } else {
     errs() << "Unsupproted type: " << *Ty << '\n';
-    llvm_unreachable("Unsupported mem store");
+    std::abort();
   }
 }
 AnyValue UBAwareInterpreter::load(const MemObject &MO, uint32_t Offset,
@@ -525,7 +529,7 @@ AnyValue UBAwareInterpreter::load(const MemObject &MO, uint32_t Offset,
     return std::move(Res);
   } else {
     errs() << "Unsupproted type: " << *Ty << '\n';
-    llvm_unreachable("Unsupported mem store");
+    std::abort();
   }
 }
 void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
@@ -1446,8 +1450,10 @@ bool UBAwareInterpreter::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   uint32_t BitWidth = DL.getIndexSizeInBits(0);
   APInt Offset = APInt::getZero(BitWidth);
   SmallMapVector<Value *, APInt, 4> VarOffsets;
-  if (!GEP.collectOffset(DL, BitWidth, VarOffsets, Offset))
-    llvm_unreachable("Unsupported GEP");
+  if (!GEP.collectOffset(DL, BitWidth, VarOffsets, Offset)) {
+    errs() << "Unsupported GEP " << GEP << '\n';
+    std::abort();
+  }
   auto Flags = GEP.getNoWrapFlags();
   auto CanonicalizeBitWidth = [&](APInt &Idx) {
     if (Idx.getBitWidth() == BitWidth)
@@ -1637,7 +1643,7 @@ void UBAwareInterpreter::toBits(APInt &Bits, APInt &PoisonBits,
       toBits(Bits, PoisonBits, Offset, Sub, EltTy);
   } else {
     errs() << "Unrecognized type " << *Ty << '\n';
-    llvm_unreachable("Not implemented");
+    std::abort();
   }
 }
 bool UBAwareInterpreter::visitIntToPtr(IntToPtrInst &I) {
@@ -1689,7 +1695,7 @@ AnyValue UBAwareInterpreter::fromBits(const APInt &Bits,
     return std::move(Elts);
   } else {
     errs() << "Unrecognized type " << *Ty << '\n';
-    llvm_unreachable("Not implemented");
+    std::abort();
   }
 }
 bool UBAwareInterpreter::visitBitCastInst(BitCastInst &BCI) {
@@ -1783,8 +1789,8 @@ bool UBAwareInterpreter::visitSwitchInst(SwitchInst &SI) {
   return jumpTo(SI.getDefaultDest());
 }
 bool UBAwareInterpreter::visitInstruction(Instruction &I) {
-  errs() << I << '\n';
-  llvm_unreachable("Unsupported inst");
+  errs() << "Unsupported inst " << I << '\n';
+  std::abort();
 }
 
 AnyValue UBAwareInterpreter::handleWithOverflow(
@@ -2205,8 +2211,8 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
   default:
     break;
   }
-  errs() << "Intrinsic: " << Func->getName() << '\n';
-  llvm_unreachable("Unsupported intrinsic");
+  errs() << "Unsupported intrinsic: " << Func->getName() << '\n';
+  std::abort();
 }
 SingleValue UBAwareInterpreter::alloc(const APInt &AllocSize,
                                       bool ZeroInitialize) {
@@ -2269,8 +2275,8 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
   default:
     break;
   }
-  errs() << "Libcall: " << FuncDecl->getName() << '\n';
-  llvm_unreachable("Unsupported libcall");
+  errs() << "Unsupported libcall: " << FuncDecl->getName() << '\n';
+  std::abort();
 }
 AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
                                   SmallVectorImpl<AnyValue> &Args) {
