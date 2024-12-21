@@ -4,7 +4,6 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
-#include "llvm/IR/Intrinsics.h"
 #include <cassert>
 #include <cstdlib>
 #include <utility>
@@ -811,9 +810,23 @@ DenormalMode UBAwareInterpreter::getCurrentDenormalMode(Type *Ty) {
 }
 
 void UBAwareInterpreter::volatileLoad(const APInt &Addr, size_t Size,
-                                      size_t Alignment) {}
+                                      size_t Alignment) {
+  if (Option.TrackVolatileMem) {
+    std::array<uint64_t, 3> Arr{VolatileMemHash, 0, Size};
+    VolatileMemHash = std::hash<std::string_view>{}(
+        std::string_view{reinterpret_cast<const char *>(Arr.data()),
+                         Arr.size() * sizeof(uint64_t)});
+  }
+}
 void UBAwareInterpreter::volatileStore(const APInt &Addr, size_t Size,
-                                       size_t Alignment) {}
+                                       size_t Alignment) {
+  if (Option.TrackVolatileMem) {
+    std::array<uint64_t, 3> Arr{VolatileMemHash, 1, Size};
+    VolatileMemHash = std::hash<std::string_view>{}(
+        std::string_view{reinterpret_cast<const char *>(Arr.data()),
+                         Arr.size() * sizeof(uint64_t)});
+  }
+}
 
 bool UBAwareInterpreter::visitAllocaInst(AllocaInst &AI) {
   assert(!AI.isArrayAllocation() && "VLA is not implemented yet.");
@@ -2407,6 +2420,8 @@ int32_t UBAwareInterpreter::runMain() {
     return EXIT_SUCCESS;
   if (isPoison(RetVal.getSingleValue()))
     ImmUBReporter(*this) << "Return a poison value";
+  if (Option.TrackVolatileMem)
+    outs() << "[llubi] Volatile mem hash: " << VolatileMemHash << '\n';
   return std::get<APInt>(RetVal.getSingleValue()).getSExtValue();
 }
 

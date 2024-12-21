@@ -257,6 +257,7 @@ struct InterpreterOption {
   double EMIProb = 0.1;
   double EMIUseProb = 0.001;
 
+  bool TrackVolatileMem = false;
   bool IgnoreParamAttrsOnIntrinsic = false;
   bool ReduceMode = false;
 };
@@ -279,6 +280,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   std::mt19937_64 Gen;
   Frame *CurrentFrame = nullptr;
   uint32_t Steps = 0;
+  uint64_t VolatileMemHash = 0;
 
   uint32_t getVectorLength(VectorType *Ty) const;
   AnyValue getPoison(Type *Ty) const;

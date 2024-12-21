@@ -44,6 +44,10 @@ static cl::opt<bool>
     DumpStackTrace("dump-stack-trace",
                    cl::desc("Dump stack trace when immediate UB occurs"),
                    cl::init(true), cl::cat(Category));
+static cl::opt<bool>
+    TrackVolatileMem("track-volatile-mem",
+                     cl::desc("Track volatile memory accesses"),
+                     cl::init(false), cl::cat(Category));
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -67,6 +71,7 @@ int main(int argc, char **argv) {
   Option.Verbose = Verbose;
   Option.EnableEMITracking = !EMIMutate.empty();
   Option.EnableEMIDebugging = DumpEMI;
+  Option.TrackVolatileMem = TrackVolatileMem;
   Option.IgnoreParamAttrsOnIntrinsic = IgnoreParamAttrsOnIntrinsic;
   Option.DumpStackTrace = DumpStackTrace;
 
