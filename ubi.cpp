@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/IR/Intrinsics.h"
 #include <cassert>
 #include <cstdlib>
 #include <utility>
@@ -435,6 +436,24 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
             Offset, Inst->isInBounds());
       }
       break;
+    }
+    case Instruction::PtrToInt: {
+      auto Ptr = std::get<Pointer>(
+          convertFromConstant(cast<Constant>(CE->getOperand(0)))
+              .getSingleValue());
+      return SingleValue{
+          Ptr.Address.zextOrTrunc(CE->getType()->getScalarSizeInBits())};
+    }
+    case Instruction::Sub: {
+      auto LHS = convertFromConstant(cast<Constant>(CE->getOperand(0)));
+      auto RHS = convertFromConstant(cast<Constant>(CE->getOperand(1)));
+      return SingleValue{std::get<APInt>(LHS.getSingleValue()) -
+                         std::get<APInt>(RHS.getSingleValue())};
+    }
+    case Instruction::Trunc: {
+      auto V = convertFromConstant(cast<Constant>(CE->getOperand(0)));
+      return SingleValue{std::get<APInt>(V.getSingleValue())
+                             .trunc(CE->getType()->getScalarSizeInBits())};
     }
     default:
       break;
@@ -2207,7 +2226,27 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
           }
         });
   }
-
+  case Intrinsic::load_relative: {
+    auto &Ptr = Args[0].getSingleValue();
+    if (isPoison(Ptr))
+      ImmUBReporter(*this) << "load_relative with poison ptr";
+    auto &PtrVal = std::get<Pointer>(Ptr);
+    auto Offset = getInt(Args[1].getSingleValue());
+    if (!Offset)
+      ImmUBReporter(*this) << "load_relative with poison offset";
+    auto Addr = offsetPointer(PtrVal, *Offset, GEPNoWrapFlags::inBounds());
+    if (isPoison(Addr))
+      ImmUBReporter(*this) << "load_relative with invalid address";
+    auto LoadedOffset =
+        load(Addr, 4, IntegerType::getInt32Ty(Ctx), /*IsVolatile=*/false)
+            .getSingleValue();
+    if (isPoison(LoadedOffset))
+      ImmUBReporter(*this) << "load_relative with poison loaded offset";
+    return offsetPointer(
+        PtrVal,
+        std::get<APInt>(LoadedOffset).zextOrTrunc(DL.getIndexSizeInBits(0)),
+        GEPNoWrapFlags::none());
+  }
   default:
     break;
   }
