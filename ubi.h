@@ -314,9 +314,8 @@ public:
                   bool IsStore, bool IsVolatile);
   DenormalMode getCurrentDenormalMode(Type *Ty);
 
-  // TODO: checksum for volatile ops
-  void volatileLoad(const APInt &Addr, size_t Size, size_t Alignment);
-  void volatileStore(const APInt &Addr, size_t Size, size_t Alignment);
+  void volatileMemOpTy(Type *Ty, bool IsStore);
+  void volatileMemOp(size_t Size, bool IsStore);
 
   bool visitAllocaInst(AllocaInst &AI);
   AnyValue visitBinOp(Type *RetTy, const AnyValue &LHS, const AnyValue &RHS,

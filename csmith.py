@@ -17,8 +17,11 @@ csmith_dir = sys.argv[2]
 llubi_bin = sys.argv[3]
 test_count = int(sys.argv[4])
 emi = len(sys.argv) >= 6 and sys.argv[5] == "emi"
+inconsistent = len(sys.argv) >= 6 and sys.argv[5] == "inconsistency"
 if emi:
     print("EMI-based mutation is enabled")
+if inconsistent:
+    print("Inconsistency check is enabled")
 csmith_command = csmith_dir +"/bin/csmith --max-funcs 3 --max-block-depth 5 --quiet --builtins --no-packed-struct --no-unions --no-bitfields --output "
 compile_command = llvm_dir + "/bin/clang -DNDEBUG -g0 -w -I" + csmith_dir + "/include "
 comp_timeout = 10.0
@@ -28,6 +31,8 @@ llubi_workarounds = [
 # https://github.com/llvm/llvm-project/issues/115976
 '--ignore-param-attrs-intrinsic'
 ]
+if not inconsistent:
+    llubi_workarounds.append('--track-volatile-mem')
 
 cwd = "csmith"+datetime.datetime.now().strftime("%Y-%m-%d@%H:%M")
 os.makedirs(cwd)
@@ -99,12 +104,33 @@ def csmith_test(i):
             return True
 
     else:
-        try:
-            ref_out = subprocess.check_output([llvm_dir+"/bin/lli", file_out], timeout=exec_timeout,stderr=subprocess.DEVNULL)
-        except Exception:
-            os.remove(file_c)
-            os.remove(file_out)
-            return None
+        if inconsistent:
+            try:
+                ref_out = subprocess.check_output([llvm_dir+"/bin/lli", file_out], timeout=exec_timeout,stderr=subprocess.DEVNULL)
+            except Exception:
+                os.remove(file_c)
+                os.remove(file_out)
+                return None
+        else:
+            file_o0_output = basename + ".O0.ll"
+            try:
+                comp_command = compile_command +" -o "+file_o0_output+" "+file_c+ " -O0 -emit-llvm -S"
+                subprocess.check_call(comp_command.split(' '), timeout=comp_timeout,stderr=subprocess.DEVNULL)
+            except Exception:
+                os.remove(file_out)
+                os.remove(file_c)
+                return None
+            
+            try:
+                ref_out = subprocess.check_output([llubi_bin, file_o0_output] + llubi_workarounds, timeout=exec_timeout * 2)
+            except subprocess.TimeoutExpired:
+                # Ignore timeout
+                os.remove(file_c)
+                os.remove(file_out)
+                os.remove(file_o0_output)
+                return True
+            except Exception:
+                return False
 
         try:
             out = subprocess.check_output([llubi_bin, file_out] + llubi_workarounds, timeout=exec_timeout * 2)
@@ -112,6 +138,8 @@ def csmith_test(i):
             # Ignore timeout
             os.remove(file_c)
             os.remove(file_out)
+            if not inconsistent:
+                os.remove(file_o0_output)
             return True
         except Exception:
             return False
@@ -119,6 +147,8 @@ def csmith_test(i):
         if out == ref_out:
             os.remove(file_c)
             os.remove(file_out)
+            if not inconsistent:
+                os.remove(file_o0_output)
             return True
     return False
 

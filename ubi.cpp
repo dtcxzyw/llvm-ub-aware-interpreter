@@ -557,7 +557,7 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (IsVolatile)
-        volatileStore(PV->Address, Size, Alignment);
+        volatileMemOpTy(Ty, /*IsStore=*/true);
       MO->verifyMemAccess(PV->Offset, Size, Alignment);
       return store(*MO, PV->Offset.getZExtValue(), V, Ty);
     }
@@ -571,7 +571,7 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (IsVolatile)
-        volatileLoad(PV->Address, Size, Alignment);
+        volatileMemOpTy(Ty, /*IsStore=*/false);
       MO->verifyMemAccess(PV->Offset, Size, Alignment);
       return load(*MO, PV->Offset.getZExtValue(), Ty);
     }
@@ -789,12 +789,8 @@ char *UBAwareInterpreter::getRawPtr(const SingleValue &SV, size_t Size,
                                     bool IsVolatile) {
   auto Ptr = std::get<Pointer>(SV);
   if (auto MO = Ptr.Obj.lock()) {
-    if (IsVolatile) {
-      if (IsStore)
-        volatileStore(Ptr.Address, Size, Alignment);
-      else
-        volatileLoad(Ptr.Address, Size, Alignment);
-    }
+    if (IsVolatile)
+      volatileMemOp(Size, IsStore);
     MO->verifyMemAccess(Ptr.Offset, Size, Alignment);
     return MO->rawPointer() + Ptr.Offset.getSExtValue();
   }
@@ -809,22 +805,33 @@ DenormalMode UBAwareInterpreter::getCurrentDenormalMode(Type *Ty) {
   return DenormalMode::getDefault();
 }
 
-void UBAwareInterpreter::volatileLoad(const APInt &Addr, size_t Size,
-                                      size_t Alignment) {
+void UBAwareInterpreter::volatileMemOp(size_t Size, bool IsStore) {
   if (Option.TrackVolatileMem) {
-    std::array<uint64_t, 3> Arr{VolatileMemHash, 0, Size};
-    VolatileMemHash = std::hash<std::string_view>{}(
-        std::string_view{reinterpret_cast<const char *>(Arr.data()),
-                         Arr.size() * sizeof(uint64_t)});
+    // std::array<uint64_t, 3> Arr{VolatileMemHash, IsStore, Size};
+    // VolatileMemHash = std::hash<std::string_view>{}(
+    //     std::string_view{reinterpret_cast<const char *>(Arr.data()),
+    //                      Arr.size() * sizeof(uint64_t)});
+    // FIXME: Handle memcpy -> struct load/store
+    if (IsStore)
+      VolatileMemHash += Size;
+    else
+      VolatileMemHash += Size << 32;
   }
 }
-void UBAwareInterpreter::volatileStore(const APInt &Addr, size_t Size,
-                                       size_t Alignment) {
+void UBAwareInterpreter::volatileMemOpTy(Type *Ty, bool IsStore) {
   if (Option.TrackVolatileMem) {
-    std::array<uint64_t, 3> Arr{VolatileMemHash, 1, Size};
-    VolatileMemHash = std::hash<std::string_view>{}(
-        std::string_view{reinterpret_cast<const char *>(Arr.data()),
-                         Arr.size() * sizeof(uint64_t)});
+    if (auto *ArrTy = dyn_cast<ArrayType>(Ty)) {
+      size_t Size =
+          DL.getTypeStoreSize(ArrTy->getArrayElementType()).getFixedValue();
+      for (uint32_t I = 0, E = ArrTy->getArrayNumElements(); I != E; ++I)
+        volatileMemOp(Size, IsStore);
+    } else if (auto *StructTy = dyn_cast<StructType>(Ty)) {
+      for (uint32_t I = 0, E = StructTy->getNumElements(); I != E; ++I)
+        volatileMemOpTy(StructTy->getElementType(I), IsStore);
+    } else {
+      size_t Size = DL.getTypeStoreSize(Ty).getFixedValue();
+      volatileMemOp(Size, IsStore);
+    }
   }
 }
 
