@@ -29,7 +29,7 @@ exec_timeout = 1.0
 llubi_workarounds = [
 # https://github.com/llvm/llvm-project/issues/115890
 # https://github.com/llvm/llvm-project/issues/115976
-'--ignore-param-attrs-intrinsic'
+'--ignore-param-attrs-intrinsic',
 ]
 if not inconsistent:
     llubi_workarounds.append('--track-volatile-mem')
@@ -133,7 +133,7 @@ def csmith_test(i):
                 return False
 
         try:
-            out = subprocess.check_output([llubi_bin, file_out] + llubi_workarounds, timeout=exec_timeout * 2)
+            out = subprocess.check_output([llubi_bin, file_out] + llubi_workarounds + ['--verify-value-tracking'], timeout=exec_timeout * 2)
         except subprocess.TimeoutExpired:
             # Ignore timeout
             os.remove(file_c)

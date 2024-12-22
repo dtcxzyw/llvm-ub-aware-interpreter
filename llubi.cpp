@@ -48,6 +48,10 @@ static cl::opt<bool>
     TrackVolatileMem("track-volatile-mem",
                      cl::desc("Track volatile memory accesses"),
                      cl::init(false), cl::cat(Category));
+static cl::opt<bool>
+    VerifyValueTracking("verify-value-tracking",
+                        cl::desc("Verify analysis results of value tracking"),
+                        cl::init(false), cl::cat(Category));
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -72,6 +76,7 @@ int main(int argc, char **argv) {
   Option.EnableEMITracking = !EMIMutate.empty();
   Option.EnableEMIDebugging = DumpEMI;
   Option.TrackVolatileMem = TrackVolatileMem;
+  Option.VerifyValueTracking = VerifyValueTracking;
   Option.IgnoreParamAttrsOnIntrinsic = IgnoreParamAttrsOnIntrinsic;
   Option.DumpStackTrace = DumpStackTrace;
 

@@ -19,6 +19,9 @@
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/DomConditionCache.h>
+#include <llvm/Analysis/SimplifyQuery.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/BasicBlock.h>
@@ -182,13 +185,31 @@ struct AnyValue final {
 inline AnyValue none() { return AnyValue{std::monostate{}}; }
 raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val);
 
+struct FunctionAnalysisCache final {
+  DominatorTree DT;
+  AssumptionCache AC;
+  DomConditionCache DC;
+  DenseMap<Value *, bool> NonZeroCache;
+  DenseMap<Value *, KnownBits> KnownBitsCache;
+
+  FunctionAnalysisCache(Function &F);
+  FunctionAnalysisCache(const FunctionAnalysisCache &) = delete;
+  KnownBits queryKnownBits(Value *V, const SimplifyQuery &SQ);
+  bool queryNonZero(Value *V, const SimplifyQuery &SQ);
+};
+
 struct Frame final {
   BasicBlock *BB;
   BasicBlock::iterator PC;
   SmallVector<std::shared_ptr<MemObject>> Allocas;
   DenseMap<Value *, AnyValue> ValueMap;
   std::optional<AnyValue> RetVal;
+  FunctionAnalysisCache *Cache;
+  TargetLibraryInfo TLI;
   Frame *LastFrame;
+
+  explicit Frame(Function *Func, FunctionAnalysisCache *Cache,
+                 TargetLibraryInfoImpl &TLI, Frame *LastFrame);
 };
 
 struct IntConstraintInfo final {
@@ -258,6 +279,7 @@ struct InterpreterOption {
   double EMIUseProb = 0.001;
 
   bool TrackVolatileMem = false;
+  bool VerifyValueTracking = false;
   bool IgnoreParamAttrsOnIntrinsic = false;
   bool ReduceMode = false;
 };
@@ -276,12 +298,15 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   DenseMap<size_t, Function *> ValidCallees;
   DenseMap<size_t, BasicBlock *> ValidBlockTargets;
   DenseMap<BasicBlock *, std::shared_ptr<MemObject>> BlockTargets;
+  std::unordered_map<Function *, FunctionAnalysisCache> AnalysisCache;
   EMITrackingInfo EMIInfo;
   std::mt19937_64 Gen;
   Frame *CurrentFrame = nullptr;
   uint32_t Steps = 0;
   uint64_t VolatileMemHash = 0;
 
+  SimplifyQuery getSQ(const Instruction *CxtI) const;
+  void verifyAnalysis(Value *V, const AnyValue &RV, const Instruction *CxtI);
   uint32_t getVectorLength(VectorType *Ty) const;
   AnyValue getPoison(Type *Ty) const;
   AnyValue getZero(Type *Ty) const;

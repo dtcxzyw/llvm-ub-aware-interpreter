@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include <llvm/Analysis/ValueTracking.h>
 #include <cassert>
 #include <cstdlib>
 #include <utility>
@@ -337,6 +338,39 @@ static void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
     postProcess(V, handleNonNull);
   if (AS.hasAttribute(Attribute::NoUndef))
     postProcess(V, [&](SingleValue &SV) { handleNoUndef(Interpreter, SV); });
+}
+static bool anyOfScalar(const AnyValue &V,
+                        function_ref<bool(const SingleValue &)> F) {
+  if (V.isSingleValue()) {
+    auto &SV = V.getSingleValue();
+    return !isPoison(SV) && F(SV);
+  }
+  uint32_t E = V.getValueArray().size();
+  for (uint32_t I = 0; I != E; ++I) {
+    auto &SV = V.getSingleValueAt(I);
+    if (isPoison(SV))
+      continue;
+    if (F(SV))
+      return true;
+  }
+  return false;
+}
+static void foreachScalar(const AnyValue &V,
+                          function_ref<void(const SingleValue &)> F) {
+  if (V.isSingleValue()) {
+    auto &SV = V.getSingleValue();
+    if (!isPoison(SV))
+      F(SV);
+    return;
+  }
+
+  uint32_t E = V.getValueArray().size();
+  for (uint32_t I = 0; I != E; ++I) {
+    auto &SV = V.getSingleValueAt(I);
+    if (isPoison(SV))
+      continue;
+    F(SV);
+  }
 }
 
 uint32_t UBAwareInterpreter::getVectorLength(VectorType *Ty) const {
@@ -2356,10 +2390,17 @@ AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
     std::exit(EXIT_FAILURE);
   }
 
-  Frame CallFrame;
+  FunctionAnalysisCache *FAC = nullptr;
+  if (Option.VerifyValueTracking) {
+    auto CacheIter = AnalysisCache.find(Func);
+    if (CacheIter == AnalysisCache.end())
+      CacheIter = AnalysisCache.emplace(Func, *Func).first;
+    FAC = &CacheIter->second;
+  }
+
+  Frame CallFrame{Func, FAC, TLI, CurrentFrame};
   auto Scope = llvm::make_scope_exit(
       [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
-  CallFrame.LastFrame = CurrentFrame;
   CurrentFrame = &CallFrame;
   for (auto &Param : Func->args())
     CallFrame.ValueMap[&Param] = std::move(Args[Param.getArgNo()]);
@@ -2390,8 +2431,15 @@ AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
       errs() << "Exceed maximum steps\n";
       std::exit(EXIT_FAILURE);
     }
-    if (visit(*CallFrame.PC))
+    // TODO: verify at-use analysis result
+    if (visit(*CallFrame.PC)) {
+      if (Option.VerifyValueTracking) {
+        auto Iter = CallFrame.ValueMap.find(&*CallFrame.PC);
+        if (Iter != CallFrame.ValueMap.end())
+          verifyAnalysis(Iter->first, Iter->second, &*CallFrame.PC);
+      }
       ++CallFrame.PC;
+    }
     if (Option.Verbose)
       errs() << '\n';
   }
@@ -2619,4 +2667,79 @@ void UBAwareInterpreter::dumpStackTrace() {
     errs() << '\n';
     Frame = Frame->LastFrame;
   }
+}
+FunctionAnalysisCache::FunctionAnalysisCache(Function &F) : DT(F), AC(F) {
+  for (auto &BB : F) {
+    if (auto *Branch = dyn_cast<BranchInst>(BB.getTerminator())) {
+      if (Branch->isUnconditional())
+        continue;
+      DC.registerBranch(Branch);
+    }
+  }
+}
+KnownBits FunctionAnalysisCache::queryKnownBits(Value *V,
+                                                const SimplifyQuery &SQ) {
+  auto Iter = KnownBitsCache.find(V);
+  if (Iter != KnownBitsCache.end())
+    return Iter->second;
+  return KnownBitsCache[V] = computeKnownBits(V, /*Depth=*/0, SQ);
+}
+bool FunctionAnalysisCache::queryNonZero(Value *V, const SimplifyQuery &SQ) {
+  auto Iter = NonZeroCache.find(V);
+  if (Iter != NonZeroCache.end())
+    return Iter->second;
+  return NonZeroCache[V] = isKnownNonZero(V, SQ);
+}
+SimplifyQuery UBAwareInterpreter::getSQ(const Instruction *CxtI) const {
+  return SimplifyQuery{DL,
+                       &CurrentFrame->TLI,
+                       &CurrentFrame->Cache->DT,
+                       &CurrentFrame->Cache->AC,
+                       CxtI,
+                       /*UseInstrInfo=*/true,
+                       /*CanUseUndef=*/true,
+                       &CurrentFrame->Cache->DC};
+}
+Frame::Frame(Function *Func, FunctionAnalysisCache *Cache,
+             TargetLibraryInfoImpl &TLI, Frame *LastFrame)
+    : BB(&Func->getEntryBlock()), PC(BB->begin()), Cache(Cache), TLI(TLI, Func),
+      LastFrame(LastFrame) {}
+void UBAwareInterpreter::verifyAnalysis(Value *V, const AnyValue &RV,
+                                        const Instruction *CxtI) {
+  auto *Ty = V->getType();
+  SimplifyQuery SQ = getSQ(CxtI);
+
+  if (Ty->isIntOrIntVectorTy() && Ty->getScalarSizeInBits() > 1) {
+    KnownBits Known(Ty->getScalarSizeInBits());
+    Known.Zero.setAllBits();
+    Known.One.setAllBits();
+    foreachScalar(RV, [&](const SingleValue &SV) {
+      Known.intersectWith(KnownBits::makeConstant(std::get<APInt>(SV)));
+    });
+
+    auto KnownAnalysis = CurrentFrame->Cache->queryKnownBits(V, SQ);
+    if (!KnownAnalysis.Zero.isSubsetOf(Known.Zero) ||
+        !KnownAnalysis.One.isSubsetOf(Known.One))
+      ImmUBReporter(*this) << "knownbits of " << *V
+                           << " is incorrect: analysis result = "
+                           << KnownAnalysis << ", but sample result = " << Known
+                           << '\n';
+
+    if (!KnownAnalysis.isNonZero()) {
+      if (anyOfScalar(RV,
+                      [](const SingleValue &SV) {
+                        return std::get<APInt>(SV).isZero();
+                      }) &&
+          CurrentFrame->Cache->queryNonZero(V, SQ))
+        ImmUBReporter(*this) << *V << " may be zero\n";
+    }
+  } else if (Ty->isPtrOrPtrVectorTy()) {
+    if (anyOfScalar(RV,
+                    [](const SingleValue &SV) {
+                      return std::get<Pointer>(SV).Address.isZero();
+                    }) &&
+        CurrentFrame->Cache->queryNonZero(V, SQ))
+      ImmUBReporter(*this) << *V << " may be null\n";
+  }
+  // TODO: known fpclass
 }
