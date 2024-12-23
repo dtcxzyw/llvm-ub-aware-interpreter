@@ -98,6 +98,7 @@ public:
   char *rawPointer() { return reinterpret_cast<char *>(Data.data()); }
   void dumpName(raw_ostream &Out);
   void dumpRef(raw_ostream &Out);
+  bool isGlobal() const noexcept { return !IsLocal; }
 };
 
 struct Pointer final {

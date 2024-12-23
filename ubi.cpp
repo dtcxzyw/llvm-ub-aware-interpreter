@@ -590,7 +590,7 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
-      if (IsVolatile)
+      if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/true);
       MO->verifyMemAccess(PV->Offset, Size, Alignment);
       return store(*MO, PV->Offset.getZExtValue(), V, Ty);
@@ -604,7 +604,7 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
-      if (IsVolatile)
+      if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/false);
       MO->verifyMemAccess(PV->Offset, Size, Alignment);
       return load(*MO, PV->Offset.getZExtValue(), Ty);
@@ -823,7 +823,7 @@ char *UBAwareInterpreter::getRawPtr(const SingleValue &SV, size_t Size,
                                     bool IsVolatile) {
   auto Ptr = std::get<Pointer>(SV);
   if (auto MO = Ptr.Obj.lock()) {
-    if (IsVolatile)
+    if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
     MO->verifyMemAccess(Ptr.Offset, Size, Alignment);
     return MO->rawPointer() + Ptr.Offset.getSExtValue();
@@ -840,39 +840,36 @@ DenormalMode UBAwareInterpreter::getCurrentDenormalMode(Type *Ty) {
 }
 
 void UBAwareInterpreter::volatileMemOp(size_t Size, bool IsStore) {
-  if (Option.TrackVolatileMem) {
-    // std::array<uint64_t, 3> Arr{VolatileMemHash, IsStore, Size};
-    // VolatileMemHash = std::hash<std::string_view>{}(
-    //     std::string_view{reinterpret_cast<const char *>(Arr.data()),
-    //                      Arr.size() * sizeof(uint64_t)});
-    // FIXME: Handle memcpy -> struct load/store
-    if (IsStore)
-      VolatileMemHash += Size;
-    else
-      VolatileMemHash += Size << 32;
-  }
+  // std::array<uint64_t, 3> Arr{VolatileMemHash, IsStore, Size};
+  // VolatileMemHash = std::hash<std::string_view>{}(
+  //     std::string_view{reinterpret_cast<const char *>(Arr.data()),
+  //                      Arr.size() * sizeof(uint64_t)});
+  // FIXME: Handle memcpy -> struct load/store
+  if (IsStore)
+    VolatileMemHash += Size;
+  else
+    VolatileMemHash += Size << 32;
 }
 void UBAwareInterpreter::volatileMemOpTy(Type *Ty, bool IsStore) {
-  if (Option.TrackVolatileMem) {
-    if (auto *ArrTy = dyn_cast<ArrayType>(Ty)) {
-      size_t Size =
-          DL.getTypeStoreSize(ArrTy->getArrayElementType()).getFixedValue();
-      for (uint32_t I = 0, E = ArrTy->getArrayNumElements(); I != E; ++I)
-        volatileMemOp(Size, IsStore);
-    } else if (auto *StructTy = dyn_cast<StructType>(Ty)) {
-      for (uint32_t I = 0, E = StructTy->getNumElements(); I != E; ++I)
-        volatileMemOpTy(StructTy->getElementType(I), IsStore);
-    } else {
-      size_t Size = DL.getTypeStoreSize(Ty).getFixedValue();
+  if (auto *ArrTy = dyn_cast<ArrayType>(Ty)) {
+    size_t Size =
+        DL.getTypeStoreSize(ArrTy->getArrayElementType()).getFixedValue();
+    for (uint32_t I = 0, E = ArrTy->getArrayNumElements(); I != E; ++I)
       volatileMemOp(Size, IsStore);
-    }
+  } else if (auto *StructTy = dyn_cast<StructType>(Ty)) {
+    for (uint32_t I = 0, E = StructTy->getNumElements(); I != E; ++I)
+      volatileMemOpTy(StructTy->getElementType(I), IsStore);
+  } else {
+    size_t Size = DL.getTypeStoreSize(Ty).getFixedValue();
+    volatileMemOp(Size, IsStore);
   }
 }
 
 bool UBAwareInterpreter::visitAllocaInst(AllocaInst &AI) {
-  assert(!AI.isArrayAllocation() && "VLA is not implemented yet.");
-  auto Obj = MemMgr.create(getValueName(&AI), true,
-                           DL.getTypeAllocSize(AI.getAllocatedType()),
+  size_t AllocSize = DL.getTypeAllocSize(AI.getAllocatedType()).getFixedValue();
+  if (AI.isArrayAllocation())
+    AllocSize *= getIntNonPoison(AI.getArraySize()).getZExtValue();
+  auto Obj = MemMgr.create(getValueName(&AI), true, AllocSize,
                            AI.getPointerAlignment(DL).value());
   Pointer Ptr{Obj, APInt::getZero(DL.getPointerSizeInBits())};
   CurrentFrame->Allocas.push_back(std::move(Obj));

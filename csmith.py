@@ -32,7 +32,8 @@ llubi_workarounds = [
 '--ignore-param-attrs-intrinsic',
 ]
 if not inconsistent:
-    llubi_workarounds.append('--track-volatile-mem')
+    # llubi_workarounds.append('--track-volatile-mem')
+    pass
 
 cwd = "csmith"+datetime.datetime.now().strftime("%Y-%m-%d@%H:%M")
 os.makedirs(cwd)
