@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/IR/Intrinsics.h"
 #include <llvm/Analysis/ValueTracking.h>
 #include <cassert>
 #include <cstdlib>
@@ -2297,6 +2298,16 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
         PtrVal,
         std::get<APInt>(LoadedOffset).zextOrTrunc(DL.getIndexSizeInBits(0)),
         GEPNoWrapFlags::none());
+  }
+  case Intrinsic::objectsize: {
+    auto &Ptr = Args[0].getSingleValue();
+    if (!isPoison(Ptr)) {
+      if (auto Obj = std::get<Pointer>(Ptr).Obj.lock())
+        return SingleValue{APInt(RetTy->getScalarSizeInBits(), Obj->size())};
+    }
+    bool IsMin = getInt(Args[1].getSingleValue())->getBoolValue();
+    return SingleValue{IsMin ? APInt::getZero(RetTy->getScalarSizeInBits())
+                             : APInt::getAllOnes(RetTy->getScalarSizeInBits())};
   }
   default:
     break;
