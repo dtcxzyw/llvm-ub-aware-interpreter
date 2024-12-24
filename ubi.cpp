@@ -2710,8 +2710,10 @@ void UBAwareInterpreter::verifyAnalysis(Value *V, const AnyValue &RV,
     KnownBits Known(Ty->getScalarSizeInBits());
     Known.Zero.setAllBits();
     Known.One.setAllBits();
+    unsigned MinSignBits = Known.getBitWidth();
     foreachScalar(RV, [&](const SingleValue &SV) {
       Known.intersectWith(KnownBits::makeConstant(std::get<APInt>(SV)));
+      MinSignBits = std::min(MinSignBits, std::get<APInt>(SV).getNumSignBits());
     });
 
     auto KnownAnalysis = CurrentFrame->Cache->queryKnownBits(V, SQ);
@@ -2729,6 +2731,15 @@ void UBAwareInterpreter::verifyAnalysis(Value *V, const AnyValue &RV,
                       }) &&
           CurrentFrame->Cache->queryNonZero(V, SQ))
         ImmUBReporter(*this) << *V << " may be zero\n";
+    }
+    if (MinSignBits != 1) {
+      unsigned SignBits =
+          ComputeNumSignBits(V, SQ.DL, /*Depth=*/0, SQ.AC, SQ.CxtI, SQ.DT);
+      if (SignBits > MinSignBits)
+        ImmUBReporter(*this)
+            << "signbits of " << *V
+            << " is incorrect: ComputeNumSignBits gives " << SignBits
+            << ", but sample result = " << MinSignBits << '\n';
     }
   } else if (Ty->isPtrOrPtrVectorTy()) {
     if (anyOfScalar(RV,
