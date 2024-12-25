@@ -1699,6 +1699,7 @@ void UBAwareInterpreter::toBits(APInt &Bits, APInt &PoisonBits,
   if (Val.isSingleValue() && isPoison(Val.getSingleValue())) {
     unsigned BW = DL.getTypeSizeInBits(Ty).getFixedValue();
     PoisonBits.setBits(Offset, Offset + BW);
+    Offset += BW;
     return;
   }
   if (Ty->isIntegerTy()) {
@@ -1743,8 +1744,10 @@ AnyValue UBAwareInterpreter::fromBits(const APInt &Bits,
   if (Ty->isIntOrPtrTy() || Ty->isFloatingPointTy()) {
     if (APInt::getBitsSet(Bits.getBitWidth(), Offset,
                           Offset + Ty->getScalarSizeInBits())
-            .intersects(PoisonBits))
+            .intersects(PoisonBits)) {
+      Offset += Ty->getScalarSizeInBits();
       return getPoison(Ty);
+    }
   }
   if (Ty->isIntegerTy()) {
     return SingleValue{readBits(Bits, Offset, Ty->getIntegerBitWidth())};
