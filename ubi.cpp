@@ -4,7 +4,6 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
-#include "llvm/IR/Intrinsics.h"
 #include <llvm/Analysis/ValueTracking.h>
 #include <cassert>
 #include <cstdlib>
@@ -596,7 +595,7 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
       MO->verifyMemAccess(PV->Offset, Size, Alignment);
       return store(*MO, PV->Offset.getZExtValue(), V, Ty);
     }
-    ImmUBReporter(*this) << "load from invalid pointer";
+    ImmUBReporter(*this) << "store to invalid pointer";
   }
   ImmUBReporter(*this) << "store to poison pointer";
 }
@@ -2304,7 +2303,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
       ImmUBReporter(*this) << "load_relative with poison loaded offset";
     return offsetPointer(
         PtrVal,
-        std::get<APInt>(LoadedOffset).zextOrTrunc(DL.getIndexSizeInBits(0)),
+        std::get<APInt>(LoadedOffset).sextOrTrunc(DL.getIndexSizeInBits(0)),
         GEPNoWrapFlags::none());
   }
   case Intrinsic::objectsize: {
