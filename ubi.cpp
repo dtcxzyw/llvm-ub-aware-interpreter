@@ -1543,9 +1543,14 @@ bool UBAwareInterpreter::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   };
   if (auto *VTy = dyn_cast<VectorType>(GEP.getType())) {
     uint32_t Len = getVectorLength(VTy);
-    AnyValue Res = getValue(GEP.getPointerOperand());
+    auto GetSplat = [Len](AnyValue V) -> AnyValue {
+      if (V.isSingleValue())
+        return std::vector<AnyValue>{Len, std::move(V)};
+      return std::move(V);
+    };
+    AnyValue Res = GetSplat(getValue(GEP.getPointerOperand()));
     for (auto &[K, V] : VarOffsets) {
-      auto KV = getValue(K);
+      auto KV = GetSplat(getValue(K));
       for (uint32_t I = 0; I != Len; ++I) {
         if (auto Idx = getInt(KV.getSingleValueAt(I))) {
           auto &IdxVal = *Idx;
