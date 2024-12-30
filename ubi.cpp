@@ -1845,6 +1845,17 @@ bool UBAwareInterpreter::visitCallInst(CallInst &CI) {
   }
   return addValue(CI, std::move(RetVal));
 }
+bool UBAwareInterpreter::visitInvokeInst(InvokeInst &II) {
+  auto RetVal = handleCall(II);
+  if (EMIInfo.EnablePGFTracking && RetVal.isSingleValue()) {
+    EMIInfo.MayBeUndef[&II] |= isPoison(RetVal.getSingleValue());
+    if (II.getType()->isIntegerTy() && !isPoison(RetVal.getSingleValue()))
+      EMIInfo.trackRange(&II, std::get<APInt>(RetVal.getSingleValue()));
+  }
+  addValue(II, std::move(RetVal));
+  // TODO: handle exceptions
+  return jumpTo(II.getNormalDest());
+}
 bool UBAwareInterpreter::visitReturnInst(ReturnInst &RI) {
   if (auto *RV = RI.getReturnValue())
     CurrentFrame->RetVal = getValue(RV);
@@ -2334,6 +2345,13 @@ SingleValue UBAwareInterpreter::alloc(const APInt &AllocSize,
 AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
                                          SmallVectorImpl<AnyValue> &Args) {
   switch (Func) {
+  case LibFunc_puts: {
+    auto *Ptr = getRawPtr(Args[0].getSingleValue());
+    if (!Ptr)
+      ImmUBReporter(*this) << "puts with null ptr";
+    puts(Ptr);
+    return none();
+  }
   case LibFunc_printf: {
     if (Args.size() == 2) {
       auto Format = getRawPtr(Args[0].getSingleValue());
@@ -2352,7 +2370,9 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
     }
     break;
   }
-  case LibFunc_malloc: {
+  case LibFunc_malloc:
+  case LibFunc_Znam:
+  case LibFunc_Znwm: {
     auto Size = getInt(Args[0].getSingleValue());
     if (!Size)
       ImmUBReporter(*this) << "malloc with poison size";
@@ -2367,7 +2387,9 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
       ImmUBReporter(*this) << "malloc with poison size";
     return alloc(*Num * *Size, /*ZeroInitialize=*/true);
   }
-  case LibFunc_free: {
+  case LibFunc_free:
+  case LibFunc_ZdaPv:
+  case LibFunc_ZdlPv: {
     auto &Ptr = Args[0].getSingleValue();
     if (isPoison(Ptr))
       ImmUBReporter(*this) << "free with poison ptr";
@@ -2379,6 +2401,12 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
     else
       ImmUBReporter(*this) << "free with invalid ptr";
     return none();
+  }
+  case LibFunc_exit: {
+    auto Code = getInt(Args[0].getSingleValue());
+    if (!Code)
+      ImmUBReporter(*this) << "exit with poison code";
+    std::exit(Code->getSExtValue());
   }
   default:
     break;
