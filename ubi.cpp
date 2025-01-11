@@ -2327,6 +2327,25 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
     return SingleValue{IsMin ? APInt::getZero(RetTy->getScalarSizeInBits())
                              : APInt::getAllOnes(RetTy->getScalarSizeInBits())};
   }
+  case Intrinsic::vector_insert: {
+    auto &Vec = Args[0].getValueArray();
+    auto &SubVec = Args[1].getValueArray();
+    auto Idx = getInt(Args[2].getSingleValue());
+    if (!Idx)
+      ImmUBReporter(*this) << "vector_insert with poison index";
+    uint32_t Offset = Idx->getZExtValue();
+    if (Offset + SubVec.size() > Vec.size())
+      return getPoison(RetTy);
+    std::vector<AnyValue> Res;
+    Res.reserve(Vec.size());
+    for (uint32_t I = 0; I != Vec.size(); ++I) {
+      if (I >= Offset && I < Offset + SubVec.size())
+        Res.push_back(SubVec[I - Offset]);
+      else
+        Res.push_back(Vec[I]);
+    }
+    return std::move(Res);
+  }
   default:
     break;
   }
