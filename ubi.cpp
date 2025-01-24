@@ -5,6 +5,7 @@
 
 #include "ubi.h"
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/InlineAsm.h>
 #include <cassert>
 #include <cstdlib>
 #include <utility>
@@ -1822,6 +1823,14 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
   auto *CalledFunc = CB.getCalledOperand();
   Function *Callee = dyn_cast<Function>(CalledFunc);
   if (!Callee) {
+    if (auto *Asm = dyn_cast<InlineAsm>(CalledFunc)) {
+      // Handle empty asm string, which is used to implement black_box style
+      // optimization blockers.
+      if (Asm->getAsmString().empty() && CB.getType()->isVoidTy())
+        return {};
+      errs() << "Unsupported inline asm\n";
+      std::abort();
+    }
     auto Addr = getValue(CalledFunc).getSingleValue();
     if (isPoison(Addr))
       ImmUBReporter(*this) << "Call with poison callee";
