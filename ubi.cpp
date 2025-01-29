@@ -695,11 +695,12 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
                   Inst->deleteValue();
                   Inst = It->second;
                 } else {
-                  Inst->insertBefore(PHI->getIncomingBlock(U)->getTerminator());
+                  Inst->insertBefore(
+                      PHI->getIncomingBlock(U)->getTerminator()->getIterator());
                   Table.insert({PredBB, Inst});
                 }
               } else
-                Inst->insertBefore(&I);
+                Inst->insertBefore(I.getIterator());
               U.set(Inst);
               Changed = true;
             }
