@@ -63,6 +63,7 @@
 #include <llvm/Support/KnownBits.h>
 #include <llvm/Support/MathExtras.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/ModRef.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/SwapByteOrder.h>
 #include <llvm/Support/ToolOutputFile.h>
@@ -106,14 +107,17 @@ struct Pointer final {
   APInt Offset;
   APInt Address;
   size_t Bound;
+  CaptureInfo CI;
 
-  Pointer(const std::shared_ptr<MemObject> &Obj, const APInt &Offset)
+  Pointer(const std::shared_ptr<MemObject> &Obj, const APInt &Offset,
+          CaptureInfo CI = CaptureInfo::all())
       : Obj(Obj), Offset(Offset), Address(Obj->address() + Offset),
-        Bound(Obj->size()) {}
+        Bound(Obj->size()), CI(CI) {}
   explicit Pointer(const std::weak_ptr<MemObject> &Obj, APInt NewOffset,
-                   APInt NewAddress, size_t NewBound)
+                   APInt NewAddress, size_t NewBound,
+                   CaptureInfo CI = CaptureInfo::all())
       : Obj(Obj), Offset(std::move(NewOffset)), Address(std::move(NewAddress)),
-        Bound(NewBound) {}
+        Bound(NewBound), CI(CI) {}
 };
 
 using SingleValue = std::variant<APInt, APFloat, Pointer, std::monostate>;
@@ -336,8 +340,8 @@ public:
   bool getBooleanNonPoison(const SingleValue &SV);
   BooleanVal getBoolean(Value *V);
   char *getRawPtr(const SingleValue &SV);
-  char *getRawPtr(const SingleValue &SV, size_t Size, size_t Alignment,
-                  bool IsStore, bool IsVolatile);
+  char *getRawPtr(SingleValue SV, size_t Size, size_t Alignment, bool IsStore,
+                  bool IsVolatile);
   DenormalMode getCurrentDenormalMode(Type *Ty);
 
   void volatileMemOpTy(Type *Ty, bool IsStore);

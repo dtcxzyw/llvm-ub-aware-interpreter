@@ -182,7 +182,7 @@ raw_ostream &operator<<(raw_ostream &Out, const SingleValue &Val) {
       Out << "dangling";
     if (!Ptr->Offset.isZero())
       Out << " + " << Ptr->Offset;
-    return Out << ']';
+    return Out << "] " << Ptr->CI;
   }
   return Out << "poison";
 }
@@ -264,6 +264,16 @@ static void handleNonNull(SingleValue &V) {
   if (Ptr.Address == 0)
     V = poison();
 }
+static void handlePointerCapture(SingleValue &V, CaptureComponents Usage,
+                                 bool ForRet = false) {
+  if (isPoison(V))
+    return;
+  auto &Ptr = std::get<Pointer>(V);
+  CaptureComponents Allowed =
+      ForRet ? Ptr.CI.getRetComponents() : Ptr.CI.getOtherComponents();
+  if ((Usage & Allowed) != Usage)
+    V = poison();
+}
 static void handleNoFPClass(SingleValue &V, FPClassTest Mask) {
   if (isPoison(V))
     return;
@@ -339,6 +349,19 @@ static void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
     postProcess(V, handleNonNull);
   if (AS.hasAttribute(Attribute::NoUndef))
     postProcess(V, [&](SingleValue &SV) { handleNoUndef(Interpreter, SV); });
+  if (AS.hasAttribute(Attribute::Captures)) {
+    auto CI = AS.getCaptureInfo();
+    postProcess(V, [CI](SingleValue &SV) {
+      if (isPoison(SV))
+        return;
+      auto &Ptr = std::get<Pointer>(SV);
+      if ((CI & Ptr.CI.getOtherComponents()) != CI) {
+        SV = poison();
+        return;
+      }
+      Ptr.CI = CI;
+    });
+  }
 }
 static bool anyOfScalar(const AnyValue &V,
                         function_ref<bool(const SingleValue &)> F) {
@@ -820,7 +843,7 @@ char *UBAwareInterpreter::getRawPtr(const SingleValue &SV) {
   ImmUBReporter(*this) << "dangling pointer";
   llvm_unreachable("Unreachable code");
 }
-char *UBAwareInterpreter::getRawPtr(const SingleValue &SV, size_t Size,
+char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
                                     size_t Alignment, bool IsStore,
                                     bool IsVolatile) {
   auto Ptr = std::get<Pointer>(SV);
@@ -973,9 +996,21 @@ bool UBAwareInterpreter::visitICmpInst(ICmpInst &I) {
                      const SingleValue &RHS) -> SingleValue {
     if (std::holds_alternative<Pointer>(LHS)) {
       assert(std::holds_alternative<Pointer>(RHS));
-      uint32_t BitWidth = DL.getPointerSizeInBits();
-      return ICmp(std::get<Pointer>(LHS).Address,
-                  std::get<Pointer>(RHS).Address);
+
+      auto IsCaptureInfoCorrect = [](const Pointer &LHS,
+                                     const Pointer &RHS) -> bool {
+        CaptureComponents Usage = RHS.Address.isZero()
+                                      ? CaptureComponents::AddressIsNull
+                                      : CaptureComponents::Address;
+        return (LHS.CI.getOtherComponents() & Usage) == Usage;
+      };
+
+      if (IsCaptureInfoCorrect(std::get<Pointer>(LHS),
+                               std::get<Pointer>(RHS)) &&
+          IsCaptureInfoCorrect(std::get<Pointer>(RHS), std::get<Pointer>(LHS)))
+        return ICmp(std::get<Pointer>(LHS).Address,
+                    std::get<Pointer>(RHS).Address);
+      return poison();
     }
     return ICmp(LHS, RHS);
   };
@@ -1646,9 +1681,17 @@ bool UBAwareInterpreter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   return addValue(SVI, std::move(PickedValues));
 }
 bool UBAwareInterpreter::visitStoreInst(StoreInst &SI) {
+  AnyValue StoreVal = getValue(SI.getValueOperand());
+  if (SI.getAccessType()->isPtrOrPtrVectorTy()) {
+    postProcess(StoreVal, [&](SingleValue &SV) {
+      if (isPoison(SV))
+        return;
+      // FIXME: This is too strict.
+      handlePointerCapture(SV, CaptureComponents::All);
+    });
+  }
   store(getValue(SI.getPointerOperand()), SI.getAlign().value(),
-        getValue(SI.getValueOperand()), SI.getValueOperand()->getType(),
-        SI.isVolatile());
+        std::move(StoreVal), SI.getValueOperand()->getType(), SI.isVolatile());
   return true;
 }
 void UBAwareInterpreter::handleRangeMetadata(AnyValue &V, Instruction &I) {
@@ -1803,6 +1846,8 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
     auto ArgVal = getValue(Arg);
 
     if (CB.isByValArgument(Idx)) {
+      if (isPoison(ArgVal.getSingleValue()))
+        ImmUBReporter(*this) << "Pass poison to an pointer argument with byval";
       auto *Ty = CB.getParamByValType(Idx);
       auto TmpMO =
           MemMgr.create(getValueName(Arg.get()), true, DL.getTypeAllocSize(Ty),
@@ -1867,9 +1912,17 @@ bool UBAwareInterpreter::visitInvokeInst(InvokeInst &II) {
   return jumpTo(II.getNormalDest());
 }
 bool UBAwareInterpreter::visitReturnInst(ReturnInst &RI) {
-  if (auto *RV = RI.getReturnValue())
-    CurrentFrame->RetVal = getValue(RV);
-  else
+  if (auto *RV = RI.getReturnValue()) {
+    AnyValue RetVal = getValue(RV);
+    if (RV->getType()->isPtrOrPtrVectorTy())
+      postProcess(RetVal, [](SingleValue &SV) {
+        if (isPoison(SV))
+          return;
+        auto &CI = std::get<Pointer>(SV).CI;
+        CI = CaptureInfo(CI.getRetComponents());
+      });
+    CurrentFrame->RetVal = std::move(RetVal);
+  } else
     CurrentFrame->RetVal = none();
   return false;
 }
