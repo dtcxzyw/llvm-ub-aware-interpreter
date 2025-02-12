@@ -987,9 +987,9 @@ bool UBAwareInterpreter::visitICmpInst(ICmpInst &I) {
     if (std::holds_alternative<Pointer>(LHS)) {
       assert(std::holds_alternative<Pointer>(RHS));
 
-      auto IsCaptureInfoCorrect = [](const Pointer &LHS,
-                                     const Pointer &RHS) -> bool {
-        CaptureComponents Usage = RHS.Address.isZero()
+      auto IsCaptureInfoCorrect = [&I](const Pointer &LHS,
+                                       const Pointer &RHS) -> bool {
+        CaptureComponents Usage = I.isEquality() && RHS.Address.isZero()
                                       ? CaptureComponents::AddressIsNull
                                       : CaptureComponents::Address;
         return (LHS.CI.getOtherComponents() & Usage) == Usage;
