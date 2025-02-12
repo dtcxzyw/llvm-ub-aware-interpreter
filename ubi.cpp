@@ -264,16 +264,6 @@ static void handleNonNull(SingleValue &V) {
   if (Ptr.Address == 0)
     V = poison();
 }
-static void handlePointerCapture(SingleValue &V, CaptureComponents Usage,
-                                 bool ForRet = false) {
-  if (isPoison(V))
-    return;
-  auto &Ptr = std::get<Pointer>(V);
-  CaptureComponents Allowed =
-      ForRet ? Ptr.CI.getRetComponents() : Ptr.CI.getOtherComponents();
-  if ((Usage & Allowed) != Usage)
-    V = poison();
-}
 static void handleNoFPClass(SingleValue &V, FPClassTest Mask) {
   if (isPoison(V))
     return;
@@ -1687,7 +1677,11 @@ bool UBAwareInterpreter::visitStoreInst(StoreInst &SI) {
       if (isPoison(SV))
         return;
       // FIXME: This is too strict.
-      handlePointerCapture(SV, CaptureComponents::All);
+      auto &Ptr = std::get<Pointer>(SV);
+      CaptureComponents Usage = CaptureComponents::All;
+      CaptureComponents Allowed = Ptr.CI.getOtherComponents();
+      if ((Usage & Allowed) != Usage)
+        SV = poison();
     });
   }
   store(getValue(SI.getPointerOperand()), SI.getAlign().value(),
