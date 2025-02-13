@@ -2429,10 +2429,18 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
     return none();
   }
   case LibFunc_printf: {
+    auto Format = getRawPtr(Args[0].getSingleValue());
+    if (!Format)
+      ImmUBReporter(*this) << "invalid printf format";
+    if (Args.size() == 1) {
+      if (Option.Verbose)
+        errs() << "\n    Printf: ";
+      int Ret = puts(getRawPtr(Args[0].getSingleValue()));
+      if (Option.Verbose)
+        errs() << "  ";
+      return SingleValue{APInt(32, Ret)};
+    }
     if (Args.size() == 2) {
-      auto Format = getRawPtr(Args[0].getSingleValue());
-      if (!Format)
-        ImmUBReporter(*this) << "invalid printf format";
       auto Val = getInt(Args[1].getSingleValue());
       if (!Val.has_value())
         ImmUBReporter(*this) << "print a poison value";
