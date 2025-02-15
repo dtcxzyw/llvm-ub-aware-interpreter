@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/Support/ModRef.h"
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InlineAsm.h>
 #include <cassert>
@@ -666,6 +667,9 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
     if (!PV->Writable)
       ImmUBReporter(*this) << "store to a non-writable pointer";
+    // TODO: location-sensitive check
+    if (CurrentFrame->MemEffects.onlyReadsMemory())
+      ImmUBReporter(*this) << "store in a writenone context";
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -682,6 +686,9 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
     if (!PV->Readable)
       ImmUBReporter(*this) << "load from a non-readable pointer";
+    // TODO: location-sensitive check
+    if (CurrentFrame->MemEffects.onlyWritesMemory())
+      ImmUBReporter(*this) << "load in a readnone context";
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -908,6 +915,11 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
     ImmUBReporter(*this) << "store to a non-writable pointer";
   if (!IsStore && !Ptr.Readable)
     ImmUBReporter(*this) << "load from a non-readable pointer";
+  // TODO: location-sensitive check
+  if (IsStore && CurrentFrame->MemEffects.onlyReadsMemory())
+    ImmUBReporter(*this) << "store in a writenone context";
+  if (!IsStore && CurrentFrame->MemEffects.onlyWritesMemory())
+    ImmUBReporter(*this) << "load in a readnone context";
   if (auto MO = Ptr.Obj.lock()) {
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
@@ -1951,7 +1963,7 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
     else
       ImmUBReporter(*this) << "Call with invalid callee";
   }
-  auto RetVal = call(Callee, FMF, Args);
+  auto RetVal = call(Callee, FMF, CB.getMemoryEffects(), Args);
   handleRangeMetadata(RetVal, CB);
   postProcessAttr(*this, RetVal, CB.getRetAttributes());
   if (auto *Val = CB.getReturnedArgOperand()) {
@@ -2588,17 +2600,25 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
   std::abort();
 }
 AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
+                                  MemoryEffects ME,
                                   SmallVectorImpl<AnyValue> &Args) {
   auto FnAttrs = Func->getAttributes();
   for (const auto &[Idx, Param] : enumerate(Func->args()))
     postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
 
   if (Func->isIntrinsic()) {
+    if ((CurrentFrame->MemEffects.getModRef() & ME.getModRef()) !=
+        ME.getModRef())
+      ImmUBReporter(*this) << "Illegal call due to invalid memory effects";
     return callIntrinsic(Func, FMF, Args);
   } else {
     LibFunc F;
-    if (TLI.getLibFunc(*Func, F))
+    if (TLI.getLibFunc(*Func, F)) {
+      if ((CurrentFrame->MemEffects.getModRef() & ME.getModRef()) !=
+          ME.getModRef())
+        ImmUBReporter(*this) << "Illegal call due to invalid memory effects";
       return callLibFunc(F, Func, Args);
+    }
   }
 
   if (!Func->hasExactDefinition()) {
@@ -2614,7 +2634,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
     FAC = &CacheIter->second;
   }
 
-  Frame CallFrame{Func, FAC, TLI, CurrentFrame};
+  Frame CallFrame{Func, FAC, TLI, CurrentFrame, ME};
   auto Scope = llvm::make_scope_exit(
       [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
   CurrentFrame = &CallFrame;
@@ -2686,7 +2706,7 @@ int32_t UBAwareInterpreter::runMain() {
     Args.push_back(SingleValue{APInt::getZero(32)});
     Args.push_back(SingleValue{*NullPtr});
   }
-  auto RetVal = call(Entry, FastMathFlags{}, Args);
+  auto RetVal = call(Entry, FastMathFlags{}, Entry->getMemoryEffects(), Args);
   if (Entry->getReturnType()->isVoidTy())
     return EXIT_SUCCESS;
   if (isPoison(RetVal.getSingleValue()))
@@ -2917,9 +2937,10 @@ SimplifyQuery UBAwareInterpreter::getSQ(const Instruction *CxtI) const {
                        &CurrentFrame->Cache->DC};
 }
 Frame::Frame(Function *Func, FunctionAnalysisCache *Cache,
-             TargetLibraryInfoImpl &TLI, Frame *LastFrame)
+             TargetLibraryInfoImpl &TLI, Frame *LastFrame, MemoryEffects ME)
     : BB(&Func->getEntryBlock()), PC(BB->begin()), Cache(Cache), TLI(TLI, Func),
-      LastFrame(LastFrame) {}
+      LastFrame(LastFrame),
+      MemEffects(LastFrame ? LastFrame->MemEffects & ME : ME) {}
 void UBAwareInterpreter::verifyAnalysis(Value *V, const AnyValue &RV,
                                         const Instruction *CxtI) {
   auto *Ty = V->getType();

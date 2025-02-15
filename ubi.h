@@ -217,9 +217,11 @@ struct Frame final {
   FunctionAnalysisCache *Cache;
   TargetLibraryInfo TLI;
   Frame *LastFrame;
+  MemoryEffects MemEffects;
 
   explicit Frame(Function *Func, FunctionAnalysisCache *Cache,
-                 TargetLibraryInfoImpl &TLI, Frame *LastFrame);
+                 TargetLibraryInfoImpl &TLI, Frame *LastFrame,
+                 MemoryEffects ME);
 };
 
 struct IntConstraintInfo final {
@@ -479,7 +481,7 @@ public:
                          SmallVectorImpl<AnyValue> &Args);
   AnyValue callLibFunc(LibFunc Func, Function *FuncDecl,
                        SmallVectorImpl<AnyValue> &Args);
-  AnyValue call(Function *Func, FastMathFlags FMF,
+  AnyValue call(Function *Func, FastMathFlags FMF, MemoryEffects ME,
                 SmallVectorImpl<AnyValue> &Args);
   void dumpStackTrace();
   int32_t runMain();
