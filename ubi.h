@@ -107,17 +107,20 @@ struct Pointer final {
   APInt Offset;
   APInt Address;
   size_t Bound;
+  bool Readable;
+  bool Writable;
   CaptureInfo CI;
 
   Pointer(const std::shared_ptr<MemObject> &Obj, const APInt &Offset,
+          bool Readable = true, bool Writable = true,
           CaptureInfo CI = CaptureInfo::all())
       : Obj(Obj), Offset(Offset), Address(Obj->address() + Offset),
-        Bound(Obj->size()), CI(CI) {}
+        Bound(Obj->size()), Readable(Readable), Writable(Writable), CI(CI) {}
   explicit Pointer(const std::weak_ptr<MemObject> &Obj, APInt NewOffset,
-                   APInt NewAddress, size_t NewBound,
-                   CaptureInfo CI = CaptureInfo::all())
+                   APInt NewAddress, size_t NewBound, bool Readable = true,
+                   bool Writable = true, CaptureInfo CI = CaptureInfo::all())
       : Obj(Obj), Offset(std::move(NewOffset)), Address(std::move(NewAddress)),
-        Bound(NewBound), CI(CI) {}
+        Bound(NewBound), Readable(Readable), Writable(Writable), CI(CI) {}
 };
 
 using SingleValue = std::variant<APInt, APFloat, Pointer, std::monostate>;

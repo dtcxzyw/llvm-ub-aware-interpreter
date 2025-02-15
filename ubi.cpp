@@ -4,8 +4,6 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
-#include "llvm/IR/Argument.h"
-#include "llvm/Support/ErrorHandling.h"
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InlineAsm.h>
 #include <cassert>
@@ -379,6 +377,41 @@ static void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
       Ptr.CI = CI;
     });
   }
+  if (AS.hasAttribute(Attribute::ReadNone)) {
+    postProcess(V, [](SingleValue &SV) {
+      if (isPoison(SV))
+        return;
+      auto &Ptr = std::get<Pointer>(SV);
+      Ptr.Readable = false;
+      Ptr.Writable = false;
+    });
+  }
+  if (AS.hasAttribute(Attribute::ReadOnly)) {
+    postProcess(V, [](SingleValue &SV) {
+      if (isPoison(SV))
+        return;
+      auto &Ptr = std::get<Pointer>(SV);
+      if (!Ptr.Readable) {
+        SV = poison();
+        return;
+      }
+      Ptr.Readable = true;
+      Ptr.Writable = false;
+    });
+  }
+  if (AS.hasAttribute(Attribute::WriteOnly)) {
+    postProcess(V, [](SingleValue &SV) {
+      if (isPoison(SV))
+        return;
+      auto &Ptr = std::get<Pointer>(SV);
+      if (!Ptr.Writable) {
+        SV = poison();
+        return;
+      }
+      Ptr.Readable = false;
+      Ptr.Writable = true;
+    });
+  }
 }
 static bool anyOfScalar(const AnyValue &V,
                         function_ref<bool(const SingleValue &)> F) {
@@ -492,7 +525,9 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
       return AnyValue{*NullPtr};
 
     return AnyValue{Pointer{
-        Iter->second, APInt::getZero(DL.getTypeSizeInBits(GV->getType()))}};
+        Iter->second, APInt::getZero(DL.getTypeSizeInBits(GV->getType())),
+        /*Readable=*/true, /*Writable=*/isa<GlobalVariable>(GV) &&
+                               !cast<GlobalVariable>(GV)->isConstant()}};
   }
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     switch (CE->getOpcode()) {
@@ -629,6 +664,8 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
                                const AnyValue &V, Type *Ty, bool IsVolatile) {
   // errs() << "Store " << P << ' ' << V << '\n';
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
+    if (!PV->Writable)
+      ImmUBReporter(*this) << "store to a non-writable pointer";
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -643,6 +680,8 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
 AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
                                   Type *Ty, bool IsVolatile) {
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
+    if (!PV->Readable)
+      ImmUBReporter(*this) << "load from a non-readable pointer";
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -674,7 +713,8 @@ SingleValue UBAwareInterpreter::offsetPointer(const Pointer &Ptr,
     return MemMgr.lookupPointer(*NewAddr);
   }
 
-  return Pointer{Ptr.Obj, *NewOffset, *NewAddr, Ptr.Bound};
+  return Pointer{Ptr.Obj,      *NewOffset,   *NewAddr, Ptr.Bound,
+                 Ptr.Readable, Ptr.Writable, Ptr.CI};
 }
 
 UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
@@ -864,6 +904,10 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
                                     size_t Alignment, bool IsStore,
                                     bool IsVolatile) {
   auto Ptr = std::get<Pointer>(SV);
+  if (IsStore && !Ptr.Writable)
+    ImmUBReporter(*this) << "store to a non-writable pointer";
+  if (!IsStore && !Ptr.Readable)
+    ImmUBReporter(*this) << "load from a non-readable pointer";
   if (auto MO = Ptr.Obj.lock()) {
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
