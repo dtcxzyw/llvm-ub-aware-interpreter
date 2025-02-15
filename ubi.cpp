@@ -4,6 +4,8 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/IR/Argument.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InlineAsm.h>
 #include <cassert>
@@ -203,6 +205,31 @@ raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val) {
     return Out << " }";
   }
   return Out << "None";
+}
+bool refines(const SingleValue &LHS, const SingleValue &RHS) {
+  if (isPoison(RHS))
+    return true;
+  if (isPoison(LHS))
+    return false;
+  if (auto *LCI = std::get_if<APInt>(&LHS))
+    return *LCI == std::get<APInt>(RHS);
+  if (auto *LFP = std::get_if<APFloat>(&LHS))
+    return LFP->bitwiseIsEqual(std::get<APFloat>(RHS));
+  if (auto *LPtr = std::get_if<Pointer>(&LHS))
+    return LPtr->Address == std::get<Pointer>(RHS).Address;
+  llvm_unreachable("Unknown SingleValue type");
+}
+bool AnyValue::refines(const AnyValue &RHS) const {
+  if (isSingleValue())
+    return ::refines(getSingleValue(), RHS.getSingleValue());
+  auto &LHSArr = getValueArray();
+  auto &RHSArr = RHS.getValueArray();
+  assert(LHSArr.size() == RHSArr.size());
+  for (uint32_t I = 0, E = LHSArr.size(); I != E; ++I) {
+    if (!LHSArr[I].refines(RHSArr[I]))
+      return false;
+  }
+  return true;
 }
 
 static void handleNoUndef(UBAwareInterpreter &Interpreter,
@@ -1883,6 +1910,11 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
   auto RetVal = call(Callee, FMF, Args);
   handleRangeMetadata(RetVal, CB);
   postProcessAttr(*this, RetVal, CB.getRetAttributes());
+  if (auto *Val = CB.getReturnedArgOperand()) {
+    auto Expected = getValue(Val);
+    if (!RetVal.refines(Expected))
+      ImmUBReporter(*this) << "Return value mismatch";
+  }
   return std::move(RetVal);
 }
 bool UBAwareInterpreter::visitCallInst(CallInst &CI) {

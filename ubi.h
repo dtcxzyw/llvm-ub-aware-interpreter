@@ -133,6 +133,7 @@ inline bool isPoison(const APFloat &AFP, FastMathFlags FMF) {
 }
 inline SingleValue boolean(bool Val) { return SingleValue{APInt(1, Val)}; }
 inline SingleValue poison() { return std::monostate{}; }
+bool refines(const SingleValue &LHS, const SingleValue &RHS);
 
 class UBAwareInterpreter;
 
@@ -186,6 +187,7 @@ struct AnyValue final {
   SingleValue &getSingleValueAt(uint32_t Idx) {
     return getValueArray().at(Idx).getSingleValue();
   }
+  bool refines(const AnyValue &RHS) const;
 };
 inline AnyValue none() { return AnyValue{std::monostate{}}; }
 raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val);
