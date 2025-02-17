@@ -22,37 +22,56 @@ if emi:
     print("EMI-based mutation is enabled")
 if inconsistent:
     print("Inconsistency check is enabled")
-csmith_command = csmith_dir +"/bin/csmith --max-funcs 3 --max-block-depth 5 --quiet --builtins --no-packed-struct --no-unions --no-bitfields --output "
+csmith_command = (
+    csmith_dir
+    + "/bin/csmith --max-funcs 3 --max-block-depth 5 --quiet --builtins --no-packed-struct --no-unions --no-bitfields --output "
+)
 compile_command = llvm_dir + "/bin/clang -DNDEBUG -g0 -w -I" + csmith_dir + "/include "
 comp_timeout = 10.0
 exec_timeout = 1.0
 llubi_workarounds = [
-# https://github.com/llvm/llvm-project/issues/115890
-# https://github.com/llvm/llvm-project/issues/115976
-'--ignore-param-attrs-intrinsic',
+    # https://github.com/llvm/llvm-project/issues/115890
+    "--ignore-param-attrs-intrinsic",
 ]
 if not inconsistent:
     # llubi_workarounds.append('--track-volatile-mem')
     pass
 
-cwd = "csmith"+datetime.datetime.now().strftime("%Y-%m-%d@%H:%M")
+cwd = "csmith" + datetime.datetime.now().strftime("%Y-%m-%d@%H:%M")
 os.makedirs(cwd)
 
 
 def csmith_test(i):
-    basename = cwd+"/test"+str(i)
+    basename = cwd + "/test" + str(i)
     file_c = basename + ".c"
     try:
-        subprocess.check_call((csmith_command+file_c).split(' '))
+        subprocess.check_call((csmith_command + file_c).split(" "))
     except subprocess.SubprocessError:
         return None
-    
+
     file_out = basename + ".ll"
     try:
-        comp_command = compile_command +" -o "+file_out+" "+file_c
-        subprocess.check_call(comp_command.split(' '), timeout=comp_timeout)
-        subprocess.check_call([file_out], timeout=exec_timeout,stderr=subprocess.DEVNULL,stdout=subprocess.DEVNULL)
-        subprocess.check_call((comp_command + " -O3 -emit-llvm -S" + (" -mllvm -opt-bisect-limit=" + str(random.randint(0, 1000)) if emi else "")).split(' '), timeout=comp_timeout,stderr=subprocess.DEVNULL)
+        comp_command = compile_command + " -o " + file_out + " " + file_c
+        subprocess.check_call(comp_command.split(" "), timeout=comp_timeout)
+        subprocess.check_call(
+            [file_out],
+            timeout=exec_timeout,
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        )
+        subprocess.check_call(
+            (
+                comp_command
+                + " -O3 -emit-llvm -S"
+                + (
+                    " -mllvm -opt-bisect-limit=" + str(random.randint(0, 1000))
+                    if emi
+                    else ""
+                )
+            ).split(" "),
+            timeout=comp_timeout,
+            stderr=subprocess.DEVNULL,
+        )
     except Exception:
         if os.path.exists(file_out):
             os.remove(file_out)
@@ -62,7 +81,10 @@ def csmith_test(i):
     if emi:
         file_emi_out = basename + ".emi.ll"
         try:
-            ref_out = subprocess.check_output([llubi_bin, file_out, '--emi', file_emi_out] + llubi_workarounds, timeout=exec_timeout)
+            ref_out = subprocess.check_output(
+                [llubi_bin, file_out, "--emi", file_emi_out] + llubi_workarounds,
+                timeout=exec_timeout,
+            )
         except subprocess.TimeoutExpired:
             # Ignore timeout
             os.remove(file_c)
@@ -72,10 +94,21 @@ def csmith_test(i):
             return None
         except Exception:
             return False
-        
+
         file_emi_opt_out = basename + ".emiopt.ll"
         try:
-            subprocess.check_call([llvm_dir+"/bin/opt", '-O3', file_emi_out, '-S', '-o', file_emi_opt_out], timeout=comp_timeout,stderr=subprocess.DEVNULL)
+            subprocess.check_call(
+                [
+                    llvm_dir + "/bin/opt",
+                    "-O3",
+                    file_emi_out,
+                    "-S",
+                    "-o",
+                    file_emi_opt_out,
+                ],
+                timeout=comp_timeout,
+                stderr=subprocess.DEVNULL,
+            )
         except subprocess.TimeoutExpired:
             # Ignore timeout
             os.remove(file_c)
@@ -86,7 +119,10 @@ def csmith_test(i):
             return False
 
         try:
-            out = subprocess.check_output([llubi_bin, file_emi_opt_out] + llubi_workarounds, timeout=exec_timeout * 2)
+            out = subprocess.check_output(
+                [llubi_bin, file_emi_opt_out] + llubi_workarounds,
+                timeout=exec_timeout * 2,
+            )
         except subprocess.TimeoutExpired:
             # Ignore timeout
             os.remove(file_c)
@@ -107,7 +143,11 @@ def csmith_test(i):
     else:
         if inconsistent:
             try:
-                ref_out = subprocess.check_output([llvm_dir+"/bin/lli", file_out], timeout=exec_timeout,stderr=subprocess.DEVNULL)
+                ref_out = subprocess.check_output(
+                    [llvm_dir + "/bin/lli", file_out],
+                    timeout=exec_timeout,
+                    stderr=subprocess.DEVNULL,
+                )
             except Exception:
                 os.remove(file_c)
                 os.remove(file_out)
@@ -115,15 +155,29 @@ def csmith_test(i):
         else:
             file_o0_output = basename + ".O0.ll"
             try:
-                comp_command = compile_command +" -o "+file_o0_output+" "+file_c+ " -O0 -emit-llvm -S"
-                subprocess.check_call(comp_command.split(' '), timeout=comp_timeout,stderr=subprocess.DEVNULL)
+                comp_command = (
+                    compile_command
+                    + " -o "
+                    + file_o0_output
+                    + " "
+                    + file_c
+                    + " -O0 -emit-llvm -S"
+                )
+                subprocess.check_call(
+                    comp_command.split(" "),
+                    timeout=comp_timeout,
+                    stderr=subprocess.DEVNULL,
+                )
             except Exception:
                 os.remove(file_out)
                 os.remove(file_c)
                 return None
-            
+
             try:
-                ref_out = subprocess.check_output([llubi_bin, file_o0_output] + llubi_workarounds, timeout=exec_timeout * 2)
+                ref_out = subprocess.check_output(
+                    [llubi_bin, file_o0_output] + llubi_workarounds,
+                    timeout=exec_timeout * 2,
+                )
             except subprocess.TimeoutExpired:
                 # Ignore timeout
                 os.remove(file_c)
@@ -134,7 +188,10 @@ def csmith_test(i):
                 return False
 
         try:
-            out = subprocess.check_output([llubi_bin, file_out] + llubi_workarounds + ['--verify-value-tracking'], timeout=exec_timeout * 2)
+            out = subprocess.check_output(
+                [llubi_bin, file_out] + llubi_workarounds + ["--verify-value-tracking"],
+                timeout=exec_timeout * 2,
+            )
         except subprocess.TimeoutExpired:
             # Ignore timeout
             os.remove(file_c)
@@ -144,7 +201,7 @@ def csmith_test(i):
             return True
         except Exception:
             return False
-        
+
         if out == ref_out:
             os.remove(file_c)
             os.remove(file_out)
@@ -166,8 +223,9 @@ for res in pool.imap_unordered(csmith_test, L):
     else:
         skipped_count += 1
 
-    pbar.set_description("Failed: {} Skipped: {}".format(
-        error_count, skipped_count), refresh=False)
+    pbar.set_description(
+        "Failed: {} Skipped: {}".format(error_count, skipped_count), refresh=False
+    )
     pbar.update(1)
 pbar.close()
 

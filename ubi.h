@@ -477,12 +477,10 @@ public:
       const function_ref<std::pair<APInt, bool>(const APInt &, const APInt &)>
           &Fn);
 
-  AnyValue callIntrinsic(Function *Func, FastMathFlags FMF,
-                         SmallVectorImpl<AnyValue> &Args);
+  AnyValue callIntrinsic(IntrinsicInst &II, SmallVectorImpl<AnyValue> &Args);
   AnyValue callLibFunc(LibFunc Func, Function *FuncDecl,
                        SmallVectorImpl<AnyValue> &Args);
-  AnyValue call(Function *Func, FastMathFlags FMF, MemoryEffects ME,
-                SmallVectorImpl<AnyValue> &Args);
+  AnyValue call(Function *Func, CallBase *CB, SmallVectorImpl<AnyValue> &Args);
   void dumpStackTrace();
   int32_t runMain();
   void mutate();

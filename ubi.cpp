@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include <llvm/Analysis/AssumeBundleQueries.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InlineAsm.h>
 #include <cassert>
@@ -1962,7 +1963,7 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
     else
       ImmUBReporter(*this) << "Call with invalid callee";
   }
-  auto RetVal = call(Callee, FMF, CB.getMemoryEffects(), Args);
+  auto RetVal = call(Callee, &CB, Args);
   handleRangeMetadata(RetVal, CB);
   postProcessAttr(*this, RetVal, CB.getRetAttributes());
   if (auto *Val = CB.getReturnedArgOperand()) {
@@ -2055,10 +2056,12 @@ AnyValue UBAwareInterpreter::handleWithOverflow(
   return std::vector<AnyValue>{std::move(K), std::move(V)};
 }
 
-AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
+AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
                                            SmallVectorImpl<AnyValue> &Args) {
-  auto IID = Func->getIntrinsicID();
-  Type *RetTy = Func->getReturnType();
+  auto IID = II.getIntrinsicID();
+  Type *RetTy = II.getType();
+  FastMathFlags FMF =
+      isa<FPMathOperator>(II) ? II.getFastMathFlags() : FastMathFlags();
   switch (IID) {
   case Intrinsic::donothing:
     return none();
@@ -2192,14 +2195,45 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
         });
   }
   case Intrinsic::assume: {
-    // Assume bundles have not supported yet
     switch (getBoolean(Args[0].getSingleValue())) {
     case BooleanVal::Poison:
       ImmUBReporter(*this) << "assumption violation (poison)";
     case BooleanVal::False:
       ImmUBReporter(*this) << "assumption violation (false)";
-    case BooleanVal::True:
+    case BooleanVal::True: {
+      if (II.hasOperandBundles()) {
+        for (auto &BOI : II.bundle_op_infos()) {
+          RetainedKnowledge RK =
+              llvm::getKnowledgeFromBundle(cast<AssumeInst>(II), BOI);
+          if (RK.AttrKind == Attribute::Alignment ||
+              RK.AttrKind == Attribute::NonNull ||
+              RK.AttrKind == Attribute::Dereferenceable) {
+            auto Val = getValue(RK.WasOn);
+            postProcess(Val, [&](SingleValue &SV) {
+              if (isPoison(SV))
+                ImmUBReporter(*this) << "Assumption on poison pointer";
+              switch (RK.AttrKind) {
+              case Attribute::Alignment:
+                handleAlign(SV, RK.ArgValue);
+                break;
+              case Attribute::NonNull:
+                handleNonNull(SV);
+                break;
+              case Attribute::Dereferenceable:
+                handleDereferenceable(*this, SV, RK.ArgValue, /*OrNull=*/false);
+                break;
+              default:
+                llvm_unreachable("Unexpected attribute kind");
+              }
+              if (isPoison(SV))
+                ImmUBReporter(*this) << "Assumption violated";
+            });
+          }
+        }
+      }
+
       return none();
+    }
     }
   }
   case Intrinsic::sadd_with_overflow:
@@ -2209,7 +2243,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
   case Intrinsic::usub_with_overflow:
   case Intrinsic::umul_with_overflow:
     return handleWithOverflow(
-        Func->getArg(0)->getType(), Args[0], Args[1],
+        II.getArgOperand(0)->getType(), Args[0], Args[1],
         [IID](const APInt &LHS, const APInt &RHS) -> std::pair<APInt, bool> {
           APInt Res;
           bool Overflow = false;
@@ -2506,7 +2540,8 @@ AnyValue UBAwareInterpreter::callIntrinsic(Function *Func, FastMathFlags FMF,
   default:
     break;
   }
-  errs() << "Unsupported intrinsic: " << Func->getName() << '\n';
+  errs() << "Unsupported intrinsic: " << II.getCalledFunction()->getName()
+         << '\n';
   std::abort();
 }
 SingleValue UBAwareInterpreter::alloc(const APInt &AllocSize,
@@ -2598,18 +2633,20 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
   errs() << "Unsupported libcall: " << FuncDecl->getName() << '\n';
   std::abort();
 }
-AnyValue UBAwareInterpreter::call(Function *Func, FastMathFlags FMF,
-                                  MemoryEffects ME,
+AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
                                   SmallVectorImpl<AnyValue> &Args) {
   auto FnAttrs = Func->getAttributes();
   for (const auto &[Idx, Param] : enumerate(Func->args()))
     postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
 
+  auto FMF = isa_and_present<FPMathOperator>(CB) ? CB->getFastMathFlags()
+                                                 : FastMathFlags{};
+  auto ME = CB ? CB->getMemoryEffects() : MemoryEffects::unknown();
   if (Func->isIntrinsic()) {
     if ((CurrentFrame->MemEffects.getModRef() & ME.getModRef()) !=
         ME.getModRef())
       ImmUBReporter(*this) << "Illegal call due to invalid memory effects";
-    return callIntrinsic(Func, FMF, Args);
+    return callIntrinsic(*cast<IntrinsicInst>(CB), Args);
   } else {
     LibFunc F;
     if (TLI.getLibFunc(*Func, F)) {
@@ -2705,7 +2742,7 @@ int32_t UBAwareInterpreter::runMain() {
     Args.push_back(SingleValue{APInt::getZero(32)});
     Args.push_back(SingleValue{*NullPtr});
   }
-  auto RetVal = call(Entry, FastMathFlags{}, Entry->getMemoryEffects(), Args);
+  auto RetVal = call(Entry, nullptr, Args);
   if (Entry->getReturnType()->isVoidTy())
     return EXIT_SUCCESS;
   if (isPoison(RetVal.getSingleValue()))
