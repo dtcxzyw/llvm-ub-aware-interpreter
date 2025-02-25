@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/ADT/APFloat.h"
 #include <llvm/Analysis/AssumeBundleQueries.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InlineAsm.h>
@@ -1478,10 +1479,10 @@ bool UBAwareInterpreter::visitFPToIntInst(Instruction &I, bool IsSigned) {
     auto &CFP = std::get<APFloat>(C);
     APSInt V(BitWidth, !IsSigned);
     bool IsExact;
-    auto Status =
-        CFP.convertToInteger(V, APFloat::rmNearestTiesToEven, &IsExact);
-    if (Status == APFloat::opOK || Status == APFloat::opInexact)
+    auto Status = CFP.convertToInteger(V, APFloat::rmTowardZero, &IsExact);
+    if (Status != APFloat::opInvalidOp)
       return V;
+    (void)(IsExact);
     return poison();
   });
 }
