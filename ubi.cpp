@@ -4,7 +4,6 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
-#include "llvm/ADT/APFloat.h"
 #include <llvm/Analysis/AssumeBundleQueries.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InlineAsm.h>
