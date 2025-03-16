@@ -1319,8 +1319,10 @@ bool UBAwareInterpreter::visitMul(BinaryOperator &I) {
 bool UBAwareInterpreter::visitSDiv(BinaryOperator &I) {
   return visitIntBinOp(
       I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
-        if (RHS.isZero() || (LHS.isMinSignedValue() && RHS.isAllOnes()))
-          return std::nullopt;
+        if (RHS.isZero())
+          ImmUBReporter(*this) << "division by zero";
+        if (LHS.isMinSignedValue() && RHS.isAllOnes())
+          ImmUBReporter(*this) << "signed division overflow";
         APInt Q, R;
         APInt::sdivrem(LHS, RHS, Q, R);
         if (I.isExact() && !R.isZero())
@@ -1332,7 +1334,7 @@ bool UBAwareInterpreter::visitSRem(BinaryOperator &I) {
   return visitIntBinOp(
       I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
         if (RHS.isZero())
-          return std::nullopt;
+          ImmUBReporter(*this) << "division by zero";
         return LHS.srem(RHS);
       });
 }
@@ -1340,7 +1342,7 @@ bool UBAwareInterpreter::visitUDiv(BinaryOperator &I) {
   return visitIntBinOp(
       I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
         if (RHS.isZero())
-          return std::nullopt;
+          ImmUBReporter(*this) << "division by zero";
         APInt Q, R;
         APInt::udivrem(LHS, RHS, Q, R);
         if (I.isExact() && !R.isZero())
@@ -1352,7 +1354,7 @@ bool UBAwareInterpreter::visitURem(BinaryOperator &I) {
   return visitIntBinOp(
       I, [&](const APInt &LHS, const APInt &RHS) -> std::optional<APInt> {
         if (RHS.isZero())
-          return std::nullopt;
+          ImmUBReporter(*this) << "division by zero";
         return LHS.urem(RHS);
       });
 }
