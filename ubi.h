@@ -77,29 +77,43 @@
 using namespace llvm;
 
 class MemoryManager;
+
+struct MemByteMetadata {
+  bool IsPoison = false;
+};
+
 class MemObject final : public std::enable_shared_from_this<MemObject> {
   MemoryManager &Manager;
   std::string Name;
   bool IsLocal;
+  bool IsStackObject;
   APInt Address;
   SmallVector<std::byte, 16> Data;
+  SmallVector<MemByteMetadata, 16> Metadata;
+  bool IsAlive;
 
 public:
   explicit MemObject(MemoryManager &Manager, std::string Name, bool IsLocal,
                      APInt PtrAddress, size_t Size)
       : Manager(Manager), Name(std::move(Name)), IsLocal(IsLocal),
-        Address(std::move(PtrAddress)), Data(Size) {}
+        IsStackObject(false), Address(std::move(PtrAddress)), Data(Size),
+        Metadata(Size), IsAlive(true) {}
   ~MemObject();
+  void setIsStackObject(bool IsStack) { IsStackObject = IsStack; }
+  void setLiveness(bool Alive) { IsAlive = Alive; }
+  void markPoison(size_t Offset, size_t Size, bool IsPoison);
   void verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                        size_t Alignment);
   void store(size_t Offset, const APInt &C);
-  APInt load(size_t Offset, size_t Bits) const;
+  std::optional<APInt> load(size_t Offset, size_t Bits) const;
   APInt address() const { return Address; }
   size_t size() const { return Data.size(); }
   char *rawPointer() { return reinterpret_cast<char *>(Data.data()); }
   void dumpName(raw_ostream &Out);
   void dumpRef(raw_ostream &Out);
   bool isGlobal() const noexcept { return !IsLocal; }
+  bool isStackObject() const noexcept { return IsStackObject; }
+  bool isAlive() const noexcept { return IsAlive; }
 };
 
 struct Pointer final {

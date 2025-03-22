@@ -161,7 +161,7 @@ def csmith_test(i):
                     + file_o0_output
                     + " "
                     + file_c
-                    + " -O0 -emit-llvm -S"
+                    + " -O3 -Xclang -disable-llvm-passes -emit-llvm -S"
                 )
                 subprocess.check_call(
                     comp_command.split(" "),

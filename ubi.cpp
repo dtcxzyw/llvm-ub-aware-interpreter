@@ -33,8 +33,14 @@ public:
 };
 
 MemObject::~MemObject() { Manager.erase(Address.getZExtValue()); }
+void MemObject::markPoison(size_t Offset, size_t Size, bool IsPoison) {
+  for (size_t I = Offset; I != Offset + Size; ++I)
+    Metadata[I].IsPoison = IsPoison;
+}
 void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                                 size_t Alignment) {
+  if (!IsAlive)
+    ImmUBReporter(Manager.Interpreter) << "Accessing dead object";
   auto NewAddr = Address + Offset;
   if (NewAddr.countr_zero() < Log2_64(Alignment))
     ImmUBReporter(Manager.Interpreter) << "Unaligned mem op";
@@ -65,7 +71,7 @@ void MemObject::store(size_t Offset, const APInt &C) {
     }
   }
 }
-APInt MemObject::load(size_t Offset, size_t Bits) const {
+std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
   APInt Res = APInt::getZero(alignTo(Bits, 8));
   constexpr uint32_t Scale = sizeof(APInt::WordType);
   const size_t Size = Res.getBitWidth() / 8;
@@ -74,12 +80,18 @@ APInt MemObject::load(size_t Offset, size_t Bits) const {
   for (uint32_t I = 0; I != Res.getNumWords(); ++I) {
     auto &Word = const_cast<APInt::WordType &>(Res.getRawData()[I]);
     if (ReadCnt + Scale <= Size) {
+      for (uint32_t J = 0; J != Scale; ++J) {
+        if (Metadata[ReadPos + J - Data.data()].IsPoison)
+          return std::nullopt;
+      }
       memcpy(&Word, &ReadPos[ReadCnt], sizeof(Word));
       ReadPos += Scale;
       if (ReadCnt == Size)
         break;
     } else {
       for (auto J = 0; J != Scale; ++J) {
+        if (Metadata[ReadPos - Data.data()].IsPoison)
+          return std::nullopt;
         Word |= static_cast<APInt::WordType>(ReadPos[ReadCnt]) << (J * 8);
         if (++ReadCnt == Size)
           break;
@@ -580,19 +592,25 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
                                const AnyValue &V, Type *Ty) {
   if (Ty->isIntegerTy()) {
     auto &SV = V.getSingleValue();
-    if (isPoison(SV))
+    if (isPoison(SV)) {
+      MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
       return;
+    }
     MO.store(Offset, std::get<APInt>(SV));
   } else if (Ty->isFloatingPointTy()) {
     auto &SV = V.getSingleValue();
-    if (isPoison(SV))
+    if (isPoison(SV)) {
+      MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
       return;
+    }
     auto &C = std::get<APFloat>(SV);
     MO.store(Offset, C.bitcastToAPInt());
   } else if (Ty->isPointerTy()) {
     auto &SV = V.getSingleValue();
-    if (isPoison(SV))
+    if (isPoison(SV)) {
+      MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
       return;
+    }
     auto &Ptr = std::get<Pointer>(SV);
     MO.store(Offset, Ptr.Address);
   } else if (Ty->isVectorTy()) {
@@ -626,16 +644,20 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
 AnyValue UBAwareInterpreter::load(const MemObject &MO, uint32_t Offset,
                                   Type *Ty) {
   if (Ty->isIntegerTy()) {
-    return SingleValue{
-        MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue())
-            .trunc(Ty->getScalarSizeInBits())};
+    auto Val = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
+    if (!Val.has_value())
+      return poison();
+    return SingleValue{Val->trunc(Ty->getScalarSizeInBits())};
   } else if (Ty->isFloatingPointTy()) {
-    return SingleValue{APFloat(
-        Ty->getFltSemantics(),
-        MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue()))};
+    auto Val = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
+    if (!Val.has_value())
+      return poison();
+    return SingleValue{APFloat(Ty->getFltSemantics(), *Val)};
   } else if (Ty->isPointerTy()) {
     auto Addr = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
-    return SingleValue{MemMgr.lookupPointer(Addr)};
+    if (!Addr.has_value())
+      return poison();
+    return SingleValue{MemMgr.lookupPointer(*Addr)};
   } else if (auto *StructTy = dyn_cast<StructType>(Ty)) {
     auto *Layout = DL.getStructLayout(StructTy);
     std::vector<AnyValue> Res;
@@ -924,6 +946,9 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
     MO->verifyMemAccess(Ptr.Offset, Size, Alignment);
+    // FIXME: Approximation: assume all bytes to write are non-poison.
+    if (IsStore)
+      MO->markPoison(Ptr.Offset.getSExtValue(), Size, false);
     return MO->rawPointer() + Ptr.Offset.getSExtValue();
   }
   ImmUBReporter(*this) << "dangling pointer";
@@ -970,6 +995,16 @@ bool UBAwareInterpreter::visitAllocaInst(AllocaInst &AI) {
   auto Obj = MemMgr.create(getValueName(&AI), true, AllocSize,
                            AI.getPointerAlignment(DL).value());
   Pointer Ptr{Obj, APInt::getZero(DL.getPointerSizeInBits())};
+  Obj->setLiveness(true);
+  Obj->setIsStackObject(true);
+  for (auto *U : AI.users()) {
+    if (isa<LifetimeIntrinsic>(U)) {
+      // The returned object is initially dead if it is explicitly used by
+      // lifetime intrinsics.
+      Obj->setLiveness(false);
+      break;
+    }
+  }
   CurrentFrame->Allocas.push_back(std::move(Obj));
   return addValue(AI, SingleValue{std::move(Ptr)});
 }
@@ -2065,12 +2100,37 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
   FastMathFlags FMF =
       isa<FPMathOperator>(II) ? II.getFastMathFlags() : FastMathFlags();
   switch (IID) {
+  case Intrinsic::ssa_copy:
+    return Args[0];
   case Intrinsic::donothing:
     return none();
   case Intrinsic::vscale:
     return SingleValue{APInt(RetTy->getScalarSizeInBits(), Option.VScale)};
   case Intrinsic::lifetime_start:
-  case Intrinsic::lifetime_end:
+  case Intrinsic::lifetime_end: {
+    auto Size = getInt(Args[0].getSingleValue());
+    if (!Size)
+      ImmUBReporter(*this) << "call lifetime intrinsic with poison size";
+    auto &Ptr = Args[1].getSingleValue();
+    if (auto *P = std::get_if<Pointer>(&Ptr)) {
+      if (auto MO = P->Obj.lock()) {
+        if (Size->isAllOnes())
+          Size = APInt(Size->getBitWidth(), MO->size());
+        // FIXME: What is the meaning of size?
+        if (MO->isStackObject() && P->Offset.isZero()) {
+          if (MO->isAlive() || IID == Intrinsic::lifetime_start)
+            MO->markPoison(0, MO->size(), IID != Intrinsic::lifetime_start);
+          MO->setLiveness(IID == Intrinsic::lifetime_start);
+        } else {
+          MO->markPoison(0, MO->size(), true);
+        }
+      } else
+        ImmUBReporter(*this) << "call lifetime intrinsic with dangling pointer";
+    } else {
+      ImmUBReporter(*this) << "call lifetime intrinsic with poison pointer";
+    }
+    return none();
+  }
   case Intrinsic::experimental_noalias_scope_decl:
     return none();
   case Intrinsic::umin:

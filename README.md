@@ -88,5 +88,4 @@ If `emi` is set, it will enable the EMI-based mutation. For more details, please
 
 ## TODO
 - [ ] TBAA support
-- [ ] lifetime/invariant support
 - [ ] Fine-grained UB check control
