@@ -99,7 +99,7 @@ public:
                      APInt PtrAddress, size_t Size)
       : Manager(Manager), Name(std::move(Name)), IsLocal(IsLocal),
         StackObjectInfo(nullptr), Address(std::move(PtrAddress)), Data(Size),
-        Metadata(Size), IsAlive(true) {}
+        Metadata(Size), IsAlive(true), IsConstant(false) {}
   ~MemObject();
   void setStackObjectInfo(Frame *FrameCtx) { StackObjectInfo = FrameCtx; }
   void markConstant() { IsConstant = true; }
@@ -112,8 +112,8 @@ public:
   APInt address() const { return Address; }
   size_t size() const { return Data.size(); }
   char *rawPointer() { return reinterpret_cast<char *>(Data.data()); }
-  void dumpName(raw_ostream &Out);
-  void dumpRef(raw_ostream &Out);
+  void dumpName(raw_ostream &Out) const;
+  void dump(raw_ostream &Out) const;
   bool isGlobal() const noexcept { return !IsLocal; }
   bool isStackObject(Frame *Ctx) const noexcept {
     return StackObjectInfo == Ctx;
@@ -121,6 +121,11 @@ public:
   bool isAlive() const noexcept { return IsAlive; }
   bool isConstant() const noexcept { return IsConstant; }
 };
+
+inline raw_ostream &operator<<(raw_ostream &Out, const MemObject &MO) {
+  MO.dump(Out);
+  return Out;
+}
 
 struct Pointer final {
   std::weak_ptr<MemObject> Obj;

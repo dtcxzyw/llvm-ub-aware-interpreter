@@ -40,7 +40,7 @@ void MemObject::markPoison(size_t Offset, size_t Size, bool IsPoison) {
 void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                                 size_t Alignment) {
   if (!IsAlive)
-    ImmUBReporter(Manager.Interpreter) << "Accessing dead object";
+    ImmUBReporter(Manager.Interpreter) << "Accessing dead object " << *this;
   auto NewAddr = Address + Offset;
   if (NewAddr.countr_zero() < Log2_64(Alignment))
     ImmUBReporter(Manager.Interpreter) << "Unaligned mem op";
@@ -102,12 +102,14 @@ std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
   }
   return Res.trunc(Bits);
 }
-void MemObject::dumpName(raw_ostream &Out) {
+void MemObject::dumpName(raw_ostream &Out) const {
   Out << (IsLocal ? '%' : '@') << Name;
+  if (!IsAlive)
+    Out << " (dead)";
 }
-void MemObject::dumpRef(raw_ostream &Out) {
-  Out << '[' << (IsLocal ? '%' : '@') << Name << "(Addr = " << Address << ", "
-      << "Size = " << Data.size() << ']';
+void MemObject::dump(raw_ostream &Out) const {
+  Out << (IsLocal ? '%' : '@') << Name << " (Addr = " << Address << ", "
+      << "Size = " << Data.size() << (IsAlive ? "" : ", dead") << ')';
 }
 
 MemoryManager::MemoryManager(UBAwareInterpreter &Interpreter,
@@ -2136,7 +2138,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
         if (Size->isAllOnes())
           Size = APInt(Size->getBitWidth(), MO->size());
         // FIXME: What is the meaning of size?
-        if (MO->isStackObject(CurrentFrame) && P->Offset.isZero()) {
+        if (MO->isStackObject(CurrentFrame->LastFrame) && P->Offset.isZero()) {
           if (MO->isAlive() || IID == Intrinsic::lifetime_start)
             MO->markPoison(0, MO->size(), IID != Intrinsic::lifetime_start);
           MO->setLiveness(IID == Intrinsic::lifetime_start);
@@ -2726,16 +2728,18 @@ UBAwareInterpreter::call(Function *Func, CallBase *CB,
                                                  : FastMathFlags{};
   auto ME = CB ? CB->getMemoryEffects() : MemoryEffects::unknown();
   if (Func->isIntrinsic()) {
-    if ((CurrentFrame->MemEffects.getModRef() & ME.getModRef()) !=
-        ME.getModRef())
-      ImmUBReporter(*this) << "Illegal call due to invalid memory effects";
+    Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
+    auto Scope = llvm::make_scope_exit(
+        [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
+    CurrentFrame = &CallFrame;
     return callIntrinsic(*cast<IntrinsicInst>(CB), Args);
   } else {
     LibFunc F;
     if (TLI.getLibFunc(*Func, F)) {
-      if ((CurrentFrame->MemEffects.getModRef() & ME.getModRef()) !=
-          ME.getModRef())
-        ImmUBReporter(*this) << "Illegal call due to invalid memory effects";
+      Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
+      auto Scope = llvm::make_scope_exit(
+          [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
+      CurrentFrame = &CallFrame;
       return callLibFunc(F, Func, Args);
     }
   }
@@ -3018,10 +3022,12 @@ void UBAwareInterpreter::dumpStackTrace() {
   errs() << "Stacktrace:\n";
   auto Frame = CurrentFrame;
   while (Frame) {
-    auto &Inst = *Frame->PC;
-    errs() << "  " << Inst << " at ";
-    Inst.getFunction()->printAsOperand(errs(), /*PrintType=*/false);
-    errs() << '\n';
+    if (Frame->BB) {
+      auto &Inst = *Frame->PC;
+      errs() << "  " << Inst << " at ";
+      Inst.getFunction()->printAsOperand(errs(), /*PrintType=*/false);
+      errs() << '\n';
+    }
     Frame = Frame->LastFrame;
   }
 }
@@ -3059,9 +3065,8 @@ SimplifyQuery UBAwareInterpreter::getSQ(const Instruction *CxtI) const {
 }
 Frame::Frame(Function *Func, FunctionAnalysisCache *Cache,
              TargetLibraryInfoImpl &TLI, Frame *LastFrame, MemoryEffects ME)
-    : BB(&Func->getEntryBlock()), PC(BB->begin()), Cache(Cache), TLI(TLI, Func),
-      LastFrame(LastFrame),
-      MemEffects(LastFrame ? LastFrame->MemEffects & ME : ME) {}
+    : BB(nullptr), PC(), Cache(Cache), TLI(TLI, Func), LastFrame(LastFrame),
+      MemEffects(ME) {}
 void UBAwareInterpreter::verifyAnalysis(Value *V, const AnyValue &RV,
                                         const Instruction *CxtI) {
   auto *Ty = V->getType();
