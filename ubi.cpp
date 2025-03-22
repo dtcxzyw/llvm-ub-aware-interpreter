@@ -689,8 +689,8 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
     if (!PV->Writable)
       ImmUBReporter(*this) << "store to a non-writable pointer";
-    // TODO: location-sensitive check
-    if (CurrentFrame->MemEffects.onlyReadsMemory())
+    if ((CurrentFrame->MemEffects.getModRef(PV->Loc) & ModRefInfo::Mod) !=
+        ModRefInfo::Mod)
       ImmUBReporter(*this) << "store in a writenone context";
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
@@ -708,8 +708,8 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
     if (!PV->Readable)
       ImmUBReporter(*this) << "load from a non-readable pointer";
-    // TODO: location-sensitive check
-    if (CurrentFrame->MemEffects.onlyWritesMemory())
+    if ((CurrentFrame->MemEffects.getModRef(PV->Loc) & ModRefInfo::Ref) !=
+        ModRefInfo::Ref)
       ImmUBReporter(*this) << "load in a readnone context";
     if (auto MO = PV->Obj.lock()) {
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
@@ -743,7 +743,7 @@ SingleValue UBAwareInterpreter::offsetPointer(const Pointer &Ptr,
   }
 
   return Pointer{Ptr.Obj,      *NewOffset,   *NewAddr, Ptr.Bound,
-                 Ptr.Readable, Ptr.Writable, Ptr.CI};
+                 Ptr.Readable, Ptr.Writable, Ptr.Loc,  Ptr.CI};
 }
 
 UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
@@ -932,15 +932,16 @@ char *UBAwareInterpreter::getRawPtr(const SingleValue &SV) {
 char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
                                     size_t Alignment, bool IsStore,
                                     bool IsVolatile) {
-  auto Ptr = std::get<Pointer>(SV);
+  auto &Ptr = std::get<Pointer>(SV);
   if (IsStore && !Ptr.Writable)
     ImmUBReporter(*this) << "store to a non-writable pointer";
   if (!IsStore && !Ptr.Readable)
     ImmUBReporter(*this) << "load from a non-readable pointer";
-  // TODO: location-sensitive check
-  if (IsStore && CurrentFrame->MemEffects.onlyReadsMemory())
+  if (IsStore && (CurrentFrame->MemEffects.getModRef(Ptr.Loc) &
+                  ModRefInfo::Mod) != ModRefInfo::Mod)
     ImmUBReporter(*this) << "store in a writenone context";
-  if (!IsStore && CurrentFrame->MemEffects.onlyWritesMemory())
+  if (!IsStore && (CurrentFrame->MemEffects.getModRef(Ptr.Loc) &
+                   ModRefInfo::Ref) != ModRefInfo::Ref)
     ImmUBReporter(*this) << "load in a readnone context";
   if (auto MO = Ptr.Obj.lock()) {
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -1975,6 +1976,15 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
 
     if (HandleParamAttr)
       postProcessAttr(*this, ArgVal, CB.getParamAttributes(Idx));
+    // Convert pointer loc to argmem
+    if (CB.getArgOperand(Idx)->getType()->isPtrOrPtrVectorTy()) {
+      postProcess(ArgVal, [&](SingleValue &SV) {
+        if (isPoison(SV))
+          return;
+        auto &Ptr = std::get<Pointer>(SV);
+        Ptr.Loc = IRMemLocation::ArgMem;
+      });
+    }
     Args.push_back(std::move(ArgVal));
   }
   FastMathFlags FMF;

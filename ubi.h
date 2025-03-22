@@ -123,18 +123,24 @@ struct Pointer final {
   size_t Bound;
   bool Readable;
   bool Writable;
+  IRMemLocation Loc;
   CaptureInfo CI;
 
   Pointer(const std::shared_ptr<MemObject> &Obj, const APInt &Offset,
           bool Readable = true, bool Writable = true,
+          IRMemLocation MemLocation = IRMemLocation::Other,
           CaptureInfo CI = CaptureInfo::all())
       : Obj(Obj), Offset(Offset), Address(Obj->address() + Offset),
-        Bound(Obj->size()), Readable(Readable), Writable(Writable), CI(CI) {}
+        Bound(Obj->size()), Readable(Readable), Writable(Writable),
+        Loc(MemLocation), CI(CI) {}
   explicit Pointer(const std::weak_ptr<MemObject> &Obj, APInt NewOffset,
                    APInt NewAddress, size_t NewBound, bool Readable = true,
-                   bool Writable = true, CaptureInfo CI = CaptureInfo::all())
+                   bool Writable = true,
+                   IRMemLocation MemLocation = IRMemLocation::Other,
+                   CaptureInfo CI = CaptureInfo::all())
       : Obj(Obj), Offset(std::move(NewOffset)), Address(std::move(NewAddress)),
-        Bound(NewBound), Readable(Readable), Writable(Writable), CI(CI) {}
+        Bound(NewBound), Readable(Readable), Writable(Writable),
+        Loc(MemLocation), CI(CI) {}
 };
 
 using SingleValue = std::variant<APInt, APFloat, Pointer, std::monostate>;
