@@ -948,7 +948,7 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
         (CurrentFrame->MemEffects.getModRef(Ptr.Loc) & ModRefInfo::Mod) !=
             ModRefInfo::Mod)
       ImmUBReporter(*this) << "store in a writenone context";
-    if (!IsStore && (MO->isConstant() || !MO->isStackObject(CurrentFrame)) &&
+    if (!IsStore && (!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
         (CurrentFrame->MemEffects.getModRef(Ptr.Loc) & ModRefInfo::Ref) !=
             ModRefInfo::Ref)
       ImmUBReporter(*this) << "load in a readnone context";
