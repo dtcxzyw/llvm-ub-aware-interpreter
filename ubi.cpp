@@ -689,10 +689,11 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
     if (!PV->Writable)
       ImmUBReporter(*this) << "store to a non-writable pointer";
-    if ((CurrentFrame->MemEffects.getModRef(PV->Loc) & ModRefInfo::Mod) !=
-        ModRefInfo::Mod)
-      ImmUBReporter(*this) << "store in a writenone context";
     if (auto MO = PV->Obj.lock()) {
+      if (!MO->isStackObject(CurrentFrame) &&
+          (CurrentFrame->MemEffects.getModRef(PV->Loc) & ModRefInfo::Mod) !=
+              ModRefInfo::Mod)
+        ImmUBReporter(*this) << "store in a writenone context";
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/true);
@@ -708,10 +709,11 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
     if (!PV->Readable)
       ImmUBReporter(*this) << "load from a non-readable pointer";
-    if ((CurrentFrame->MemEffects.getModRef(PV->Loc) & ModRefInfo::Ref) !=
-        ModRefInfo::Ref)
-      ImmUBReporter(*this) << "load in a readnone context";
     if (auto MO = PV->Obj.lock()) {
+      if ((!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
+          (CurrentFrame->MemEffects.getModRef(PV->Loc) & ModRefInfo::Ref) !=
+              ModRefInfo::Ref)
+        ImmUBReporter(*this) << "load in a readnone context";
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/false);
@@ -769,9 +771,13 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
   for (auto &GV : M.globals()) {
     if (!GV.hasExactDefinition())
       continue;
-    if (GV.hasInitializer())
-      store(*GlobalValues.at(&GV), 0U, convertFromConstant(GV.getInitializer()),
+    if (GV.hasInitializer()) {
+      auto &MO = GlobalValues.at(&GV);
+      store(*MO, 0U, convertFromConstant(GV.getInitializer()),
             GV.getValueType());
+      if (GV.isConstant())
+        MO->markConstant();
+    }
   }
   for (auto &F : M) {
     GlobalValues.insert(
@@ -937,13 +943,15 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
     ImmUBReporter(*this) << "store to a non-writable pointer";
   if (!IsStore && !Ptr.Readable)
     ImmUBReporter(*this) << "load from a non-readable pointer";
-  if (IsStore && (CurrentFrame->MemEffects.getModRef(Ptr.Loc) &
-                  ModRefInfo::Mod) != ModRefInfo::Mod)
-    ImmUBReporter(*this) << "store in a writenone context";
-  if (!IsStore && (CurrentFrame->MemEffects.getModRef(Ptr.Loc) &
-                   ModRefInfo::Ref) != ModRefInfo::Ref)
-    ImmUBReporter(*this) << "load in a readnone context";
   if (auto MO = Ptr.Obj.lock()) {
+    if (IsStore && !MO->isStackObject(CurrentFrame) &&
+        (CurrentFrame->MemEffects.getModRef(Ptr.Loc) & ModRefInfo::Mod) !=
+            ModRefInfo::Mod)
+      ImmUBReporter(*this) << "store in a writenone context";
+    if (!IsStore && (MO->isConstant() || !MO->isStackObject(CurrentFrame)) &&
+        (CurrentFrame->MemEffects.getModRef(Ptr.Loc) & ModRefInfo::Ref) !=
+            ModRefInfo::Ref)
+      ImmUBReporter(*this) << "load in a readnone context";
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
     MO->verifyMemAccess(Ptr.Offset, Size, Alignment);
@@ -997,7 +1005,7 @@ bool UBAwareInterpreter::visitAllocaInst(AllocaInst &AI) {
                            AI.getPointerAlignment(DL).value());
   Pointer Ptr{Obj, APInt::getZero(DL.getPointerSizeInBits())};
   Obj->setLiveness(true);
-  Obj->setIsStackObject(true);
+  Obj->setStackObjectInfo(CurrentFrame);
   for (auto *U : AI.users()) {
     if (isa<LifetimeIntrinsic>(U)) {
       // The returned object is initially dead if it is explicitly used by
@@ -1967,6 +1975,7 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
       auto TmpMO =
           MemMgr.create(getValueName(Arg.get()), true, DL.getTypeAllocSize(Ty),
                         DL.getPrefTypeAlign(Ty).value());
+      TmpMO->setLiveness(true);
       memcpy(TmpMO->rawPointer(), getRawPtr(ArgVal.getSingleValue()),
              DL.getTypeStoreSize(Ty));
       ArgVal = SingleValue{
@@ -2010,7 +2019,7 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
     else
       ImmUBReporter(*this) << "Call with invalid callee";
   }
-  auto RetVal = call(Callee, &CB, Args);
+  auto RetVal = call(Callee, &CB, Args, ByValTempObjects);
   handleRangeMetadata(RetVal, CB);
   postProcessAttr(*this, RetVal, CB.getRetAttributes());
   if (auto *Val = CB.getReturnedArgOperand()) {
@@ -2127,7 +2136,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
         if (Size->isAllOnes())
           Size = APInt(Size->getBitWidth(), MO->size());
         // FIXME: What is the meaning of size?
-        if (MO->isStackObject() && P->Offset.isZero()) {
+        if (MO->isStackObject(CurrentFrame) && P->Offset.isZero()) {
           if (MO->isAlive() || IID == Intrinsic::lifetime_start)
             MO->markPoison(0, MO->size(), IID != Intrinsic::lifetime_start);
           MO->setLiveness(IID == Intrinsic::lifetime_start);
@@ -2705,8 +2714,10 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
   errs() << "Unsupported libcall: " << FuncDecl->getName() << '\n';
   std::abort();
 }
-AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
-                                  SmallVectorImpl<AnyValue> &Args) {
+AnyValue
+UBAwareInterpreter::call(Function *Func, CallBase *CB,
+                         SmallVectorImpl<AnyValue> &Args,
+                         ArrayRef<std::shared_ptr<MemObject>> ByValObjs) {
   auto FnAttrs = Func->getAttributes();
   for (const auto &[Idx, Param] : enumerate(Func->args()))
     postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
@@ -2743,6 +2754,8 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   }
 
   Frame CallFrame{Func, FAC, TLI, CurrentFrame, ME};
+  for (auto &Obj : ByValObjs)
+    Obj->setStackObjectInfo(&CallFrame);
   auto Scope = llvm::make_scope_exit(
       [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
   CurrentFrame = &CallFrame;

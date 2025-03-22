@@ -77,6 +77,7 @@
 using namespace llvm;
 
 class MemoryManager;
+class Frame;
 
 struct MemByteMetadata {
   bool IsPoison = false;
@@ -86,20 +87,22 @@ class MemObject final : public std::enable_shared_from_this<MemObject> {
   MemoryManager &Manager;
   std::string Name;
   bool IsLocal;
-  bool IsStackObject;
+  Frame *StackObjectInfo;
   APInt Address;
   SmallVector<std::byte, 16> Data;
   SmallVector<MemByteMetadata, 16> Metadata;
   bool IsAlive;
+  bool IsConstant;
 
 public:
   explicit MemObject(MemoryManager &Manager, std::string Name, bool IsLocal,
                      APInt PtrAddress, size_t Size)
       : Manager(Manager), Name(std::move(Name)), IsLocal(IsLocal),
-        IsStackObject(false), Address(std::move(PtrAddress)), Data(Size),
+        StackObjectInfo(nullptr), Address(std::move(PtrAddress)), Data(Size),
         Metadata(Size), IsAlive(true) {}
   ~MemObject();
-  void setIsStackObject(bool IsStack) { IsStackObject = IsStack; }
+  void setStackObjectInfo(Frame *FrameCtx) { StackObjectInfo = FrameCtx; }
+  void markConstant() { IsConstant = true; }
   void setLiveness(bool Alive) { IsAlive = Alive; }
   void markPoison(size_t Offset, size_t Size, bool IsPoison);
   void verifyMemAccess(const APInt &Offset, const size_t AccessSize,
@@ -112,8 +115,11 @@ public:
   void dumpName(raw_ostream &Out);
   void dumpRef(raw_ostream &Out);
   bool isGlobal() const noexcept { return !IsLocal; }
-  bool isStackObject() const noexcept { return IsStackObject; }
+  bool isStackObject(Frame *Ctx) const noexcept {
+    return StackObjectInfo == Ctx;
+  }
   bool isAlive() const noexcept { return IsAlive; }
+  bool isConstant() const noexcept { return IsConstant; }
 };
 
 struct Pointer final {
@@ -500,7 +506,8 @@ public:
   AnyValue callIntrinsic(IntrinsicInst &II, SmallVectorImpl<AnyValue> &Args);
   AnyValue callLibFunc(LibFunc Func, Function *FuncDecl,
                        SmallVectorImpl<AnyValue> &Args);
-  AnyValue call(Function *Func, CallBase *CB, SmallVectorImpl<AnyValue> &Args);
+  AnyValue call(Function *Func, CallBase *CB, SmallVectorImpl<AnyValue> &Args,
+                ArrayRef<std::shared_ptr<MemObject>> ByValObjs = {});
   void dumpStackTrace();
   int32_t runMain();
   void mutate();
