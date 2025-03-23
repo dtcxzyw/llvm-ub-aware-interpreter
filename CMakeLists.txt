@@ -18,6 +18,7 @@ include(AddLLVM)
 
 include_directories(${LLVM_INCLUDE_DIRS})
 set(LLVM_LINK_COMPONENTS core support irreader irprinter targetparser analysis transformutils)
+add_compile_options("-Wall")
 if (LLUBI_ENABLE_ASAN)
 add_compile_options("-ggdb")
 add_compile_options("-fsanitize=address")

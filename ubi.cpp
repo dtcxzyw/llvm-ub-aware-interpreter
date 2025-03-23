@@ -147,7 +147,7 @@ std::shared_ptr<MemObject> MemoryManager::create(std::string Name, bool IsLocal,
   auto Obj = std::make_shared<MemObject>(*this, std::move(Name), IsLocal,
                                          std::move(Address), Size);
   AddressMap.emplace(Address.getZExtValue(), Obj.get());
-  return std::move(Obj);
+  return Obj;
 }
 SingleValue MemoryManager::lookupPointer(const APInt &Addr) const {
   if (auto Iter = AddressMap.upper_bound(Addr.getZExtValue());
@@ -1344,7 +1344,7 @@ bool UBAwareInterpreter::visitAdd(BinaryOperator &I) {
           (void)LHS.uadd_ov(RHS, Overflow);
           AllNUW &= !Overflow;
         }
-        return std::move(Res);
+        return Res;
       });
 
   if (EMIInfo.EnablePGFTracking &&
@@ -1368,7 +1368,7 @@ bool UBAwareInterpreter::visitSub(BinaryOperator &I) {
           (void)LHS.usub_ov(RHS, Overflow);
           AllNUW &= !Overflow;
         }
-        return std::move(Res);
+        return Res;
       });
   if (EMIInfo.EnablePGFTracking &&
       !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
@@ -1391,7 +1391,7 @@ bool UBAwareInterpreter::visitMul(BinaryOperator &I) {
           (void)LHS.umul_ov(RHS, Overflow);
           AllNUW &= !Overflow;
         }
-        return std::move(Res);
+        return Res;
       });
   if (EMIInfo.EnablePGFTracking &&
       !(I.hasNoSignedWrap() && I.hasNoUnsignedWrap()))
@@ -1828,7 +1828,7 @@ bool UBAwareInterpreter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   for (auto Idx : SVI.getShuffleMask()) {
     if (Idx == PoisonMaskElem)
       PickedValues.push_back(poison());
-    else if (Idx < Size)
+    else if (Idx < static_cast<int32_t>(Size))
       PickedValues.push_back(LHS.getSingleValueAt(Idx));
     else if (RHSIsPoison)
       PickedValues.push_back(getPoison(SVI.getType()->getScalarType()));
@@ -2000,14 +2000,8 @@ std::string UBAwareInterpreter::getValueName(Value *V) {
 }
 AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
   SmallVector<AnyValue> Args;
-  SmallVector<std::shared_ptr<MemObject>> ByValTempObjects;
-  bool HandleParamAttr =
-      !isa<IntrinsicInst>(CB) || !Option.IgnoreParamAttrsOnIntrinsic;
   for (const auto &[Idx, Arg] : enumerate(CB.args()))
     Args.push_back(getValue(Arg));
-  FastMathFlags FMF;
-  if (auto *FPOp = dyn_cast<FPMathOperator>(&CB))
-    FMF = FPOp->getFastMathFlags();
   auto *CalledFunc = CB.getCalledOperand();
   Function *Callee = dyn_cast<Function>(CalledFunc);
   if (!Callee) {
@@ -2036,7 +2030,7 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
     if (!RetVal.refines(Expected))
       ImmUBReporter(*this) << "Return value mismatch";
   }
-  return std::move(RetVal);
+  return RetVal;
 }
 bool UBAwareInterpreter::visitCallInst(CallInst &CI) {
   auto RetVal = handleCall(CI);
@@ -2772,8 +2766,6 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
       postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
   };
 
-  auto FMF = isa_and_present<FPMathOperator>(CB) ? CB->getFastMathFlags()
-                                                 : FastMathFlags{};
   auto ME = CB ? CB->getMemoryEffects() : MemoryEffects::unknown();
   if (Func->isIntrinsic()) {
     Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};

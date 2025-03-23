@@ -195,7 +195,6 @@ bool refines(const SingleValue &LHS, const SingleValue &RHS);
 class UBAwareInterpreter;
 
 class MemoryManager final {
-  // TODO: handle llvm.lifetime.start/end and llvm.invariant.start.end/TBAA
   UBAwareInterpreter &Interpreter;
   uint32_t PtrBitWidth;
   size_t AllocatedMem = 0;
