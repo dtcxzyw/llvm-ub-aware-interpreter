@@ -111,6 +111,46 @@ void MemObject::dump(raw_ostream &Out) const {
   Out << (IsLocal ? '%' : '@') << Name << " (Addr = " << Address << ", "
       << "Size = " << Data.size() << (IsAlive ? "" : ", dead") << ')';
 }
+void PendingInitializeTask::write(uint64_t Offset, uint64_t Size) {
+  if (Ranges.empty())
+    return;
+
+  uint64_t WriteLo = Offset, WriteHi = Offset + Size;
+  SmallVector<std::pair<uint64_t, uint64_t>, 1> NewRanges;
+  for (auto &[Lo, Hi] : Ranges) {
+    uint64_t IntersectLo = std::max(Lo, WriteLo),
+             IntersectHi = std::min(Hi, WriteHi);
+    if (IntersectHi >= IntersectLo)
+      continue;
+    if (IntersectLo != Lo)
+      NewRanges.emplace_back(Lo, IntersectLo);
+    if (IntersectHi != Hi)
+      NewRanges.emplace_back(IntersectHi, Hi);
+  }
+
+  Ranges.swap(NewRanges);
+}
+void MemObject::markWrite(size_t Offset, size_t Size) {
+  for (auto &Task : PendingInitializeTasks)
+    Task.write(Offset, Size);
+}
+PendingInitializeTask &MemObject::pushPendingInitializeTask(Frame *Ctx) {
+  PendingInitializeTasks.push_back(PendingInitializeTask{Ctx});
+  return PendingInitializeTasks.back();
+}
+void MemObject::popPendingInitializeTask(Frame *Ctx) {
+  erase_if(PendingInitializeTasks,
+           [this, Ctx](const PendingInitializeTask &Task) {
+             if (Task.Context == Ctx) {
+               if (!Task.Ranges.empty())
+                 ImmUBReporter(Manager.Interpreter)
+                     << "Uninitialized memory region " << *this
+                     << " after function return.";
+               return true;
+             }
+             return false;
+           });
+}
 
 ContextSensitivePointerInfo
 ContextSensitivePointerInfo::getDefault(Frame *FrameCtx) {
@@ -735,6 +775,8 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/true);
       MO->verifyMemAccess(PV->Offset, Size, Alignment);
+      if (!IsVolatile)
+        MO->markWrite(PV->Offset.getZExtValue(), Size);
       return store(*MO, PV->Offset.getZExtValue(), V, Ty);
     }
     ImmUBReporter(*this) << "store to invalid pointer";
@@ -992,9 +1034,12 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
     MO->verifyMemAccess(Ptr.Offset, Size, Alignment);
-    // FIXME: Approximation: assume all bytes to write are non-poison.
-    if (IsStore)
+    if (IsStore) {
+      // FIXME: Approximation: assume all bytes to write are non-poison.
       MO->markPoison(Ptr.Offset.getSExtValue(), Size, false);
+      if (!IsVolatile)
+        MO->markWrite(Ptr.Offset.getSExtValue(), Size);
+    }
     return MO->rawPointer() + Ptr.Offset.getSExtValue();
   }
   ImmUBReporter(*this) << "dangling pointer";
@@ -2723,6 +2768,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   auto FnAttrs = Func->getAttributes();
 
   SmallVector<std::shared_ptr<MemObject>> ByValTempObjects;
+  SmallVector<MemObject *> InitializeMOs;
   auto PostProcessArgs = [&] {
     if (CB) {
       bool HandleParamAttr =
@@ -2730,6 +2776,8 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
       for (const auto &[Idx, Arg] : enumerate(CB->args())) {
         auto &ArgVal = Args[Idx];
 
+        MemObject *InitializeMO = nullptr;
+        uint64_t InitializeOffset = 0;
         if (CB->isByValArgument(Idx)) {
           if (isPoison(ArgVal.getSingleValue()))
             ImmUBReporter(*this)
@@ -2745,6 +2793,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
           ArgVal = SingleValue{
               Pointer{TmpMO, APInt::getZero(DL.getPointerSizeInBits()),
                       ContextSensitivePointerInfo::getDefault(CurrentFrame)}};
+          InitializeMO = TmpMO.get();
           ByValTempObjects.push_back(std::move(TmpMO));
         }
 
@@ -2758,6 +2807,37 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
             auto &Ptr = std::get<Pointer>(SV);
             Ptr.Info.pushLoc(CurrentFrame, IRMemLocation::ArgMem);
           });
+
+          if (HandleParamAttr &&
+              CB->paramHasAttr(Idx, Attribute::Initializes)) {
+            auto Initializes =
+                CB->getParamAttr(Idx, Attribute::Initializes).getInitializes();
+            if (!Initializes.empty()) {
+              if (!InitializeMO) {
+                if (isPoison(ArgVal.getSingleValue()))
+                  ImmUBReporter(*this)
+                      << "Pass poison to an pointer argument with initializes";
+                auto &Ptr = std::get<Pointer>(ArgVal.getSingleValue());
+                auto MO = Ptr.Obj.lock();
+                if (!MO)
+                  ImmUBReporter(*this)
+                      << "Pass dangling pointer to an pointer argument with "
+                         "initializes";
+                InitializeMO = MO.get();
+                InitializeOffset = Ptr.Offset.getZExtValue();
+              }
+
+              PendingInitializeTask &Task =
+                  InitializeMO->pushPendingInitializeTask(CurrentFrame);
+              for (auto &R : Initializes) {
+                uint64_t Lo = InitializeOffset + R.getLower().getZExtValue();
+                uint64_t Hi = InitializeOffset + R.getUpper().getZExtValue();
+                Task.Ranges.push_back({Lo, Hi});
+              }
+
+              InitializeMOs.push_back(InitializeMO);
+            }
+          }
         }
       }
     }
@@ -2766,11 +2846,17 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
       postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
   };
 
+  auto ExitFunc = [&](Frame *OldFrame) {
+    for (auto &MO : InitializeMOs)
+      MO->popPendingInitializeTask(CurrentFrame);
+    CurrentFrame = OldFrame;
+  };
+
   auto ME = CB ? CB->getMemoryEffects() : MemoryEffects::unknown();
   if (Func->isIntrinsic()) {
     Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
-    auto Scope = llvm::make_scope_exit(
-        [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
+    auto Scope =
+        llvm::make_scope_exit([&, Frame = CurrentFrame] { ExitFunc(Frame); });
     CurrentFrame = &CallFrame;
     PostProcessArgs();
     return callIntrinsic(*cast<IntrinsicInst>(CB), Args);
@@ -2778,8 +2864,8 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
     LibFunc F;
     if (TLI.getLibFunc(*Func, F)) {
       Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
-      auto Scope = llvm::make_scope_exit(
-          [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
+      auto Scope =
+          llvm::make_scope_exit([&, Frame = CurrentFrame] { ExitFunc(Frame); });
       CurrentFrame = &CallFrame;
       PostProcessArgs();
       return callLibFunc(F, Func, Args);
@@ -2800,8 +2886,8 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   }
 
   Frame CallFrame{Func, FAC, TLI, CurrentFrame, ME};
-  auto Scope = llvm::make_scope_exit(
-      [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
+  auto Scope =
+      llvm::make_scope_exit([&, Frame = CurrentFrame] { ExitFunc(Frame); });
   CurrentFrame = &CallFrame;
   PostProcessArgs();
   for (auto &Param : Func->args())
