@@ -127,31 +127,54 @@ inline raw_ostream &operator<<(raw_ostream &Out, const MemObject &MO) {
   return Out;
 }
 
-struct Pointer final {
-  std::weak_ptr<MemObject> Obj;
-  APInt Offset;
-  APInt Address;
-  size_t Bound;
+struct ContextSensitivePointerInfo {
+  std::shared_ptr<const ContextSensitivePointerInfo> Parent;
+  Frame *FrameCtx;
   bool Readable;
   bool Writable;
   IRMemLocation Loc;
   CaptureInfo CI;
 
-  Pointer(const std::shared_ptr<MemObject> &Obj, const APInt &Offset,
-          bool Readable = true, bool Writable = true,
-          IRMemLocation MemLocation = IRMemLocation::Other,
-          CaptureInfo CI = CaptureInfo::all())
+  explicit ContextSensitivePointerInfo(
+      std::shared_ptr<const ContextSensitivePointerInfo> Parent,
+      Frame *FrameCtx, bool Readable, bool Writable, IRMemLocation Loc,
+      CaptureInfo CI)
+      : Parent(std::move(Parent)), FrameCtx(FrameCtx), Readable(Readable),
+        Writable(Writable), Loc(std::move(Loc)), CI(std::move(CI)) {}
+  static ContextSensitivePointerInfo getDefault(Frame *FrameCtx);
+  void push(Frame *Ctx);
+  void pushReadWrite(Frame *Ctx, bool Readable, bool Writable) {
+    push(Ctx);
+    this->Readable = Readable;
+    this->Writable = Writable;
+  }
+  void pushLoc(Frame *Ctx, IRMemLocation Loc) {
+    push(Ctx);
+    this->Loc = Loc;
+  }
+  void pushCaptureInfo(Frame *Ctx, CaptureInfo CI) {
+    push(Ctx);
+    this->CI &= CI;
+  }
+  void pop(Frame *Ctx);
+};
+
+struct Pointer final {
+  std::weak_ptr<MemObject> Obj;
+  APInt Offset;
+  APInt Address;
+  size_t Bound;
+  ContextSensitivePointerInfo Info;
+
+  explicit Pointer(const std::shared_ptr<MemObject> &Obj, const APInt &Offset,
+                   ContextSensitivePointerInfo Info)
       : Obj(Obj), Offset(Offset), Address(Obj->address() + Offset),
-        Bound(Obj->size()), Readable(Readable), Writable(Writable),
-        Loc(MemLocation), CI(CI) {}
+        Bound(Obj->size()), Info(std::move(Info)) {}
   explicit Pointer(const std::weak_ptr<MemObject> &Obj, APInt NewOffset,
-                   APInt NewAddress, size_t NewBound, bool Readable = true,
-                   bool Writable = true,
-                   IRMemLocation MemLocation = IRMemLocation::Other,
-                   CaptureInfo CI = CaptureInfo::all())
+                   APInt NewAddress, size_t NewBound,
+                   ContextSensitivePointerInfo Info)
       : Obj(Obj), Offset(std::move(NewOffset)), Address(std::move(NewAddress)),
-        Bound(NewBound), Readable(Readable), Writable(Writable),
-        Loc(MemLocation), CI(CI) {}
+        Bound(NewBound), Info(std::move(Info)) {}
 };
 
 using SingleValue = std::variant<APInt, APFloat, Pointer, std::monostate>;
@@ -367,6 +390,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
 public:
   explicit UBAwareInterpreter(Module &M, InterpreterOption Option);
 
+  Frame *getCurrentFrame() const { return CurrentFrame; }
   bool addValue(Instruction &I, AnyValue Val);
   bool jumpTo(BasicBlock *To);
   AnyValue getValue(Value *V);
@@ -511,8 +535,7 @@ public:
   AnyValue callIntrinsic(IntrinsicInst &II, SmallVectorImpl<AnyValue> &Args);
   AnyValue callLibFunc(LibFunc Func, Function *FuncDecl,
                        SmallVectorImpl<AnyValue> &Args);
-  AnyValue call(Function *Func, CallBase *CB, SmallVectorImpl<AnyValue> &Args,
-                ArrayRef<std::shared_ptr<MemObject>> ByValObjs = {});
+  AnyValue call(Function *Func, CallBase *CB, SmallVectorImpl<AnyValue> &Args);
   void dumpStackTrace();
   int32_t runMain();
   void mutate();

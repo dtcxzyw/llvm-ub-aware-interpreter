@@ -112,6 +112,26 @@ void MemObject::dump(raw_ostream &Out) const {
       << "Size = " << Data.size() << (IsAlive ? "" : ", dead") << ')';
 }
 
+ContextSensitivePointerInfo
+ContextSensitivePointerInfo::getDefault(Frame *FrameCtx) {
+  return ContextSensitivePointerInfo{
+      nullptr, FrameCtx, true, true, IRMemLocation::Other, CaptureInfo::all()};
+}
+void ContextSensitivePointerInfo::push(Frame *Ctx) {
+  if (Ctx != FrameCtx) {
+    Parent = std::make_shared<ContextSensitivePointerInfo>(*this);
+    FrameCtx = Ctx;
+  }
+}
+void ContextSensitivePointerInfo::pop(Frame *Ctx) {
+  if (FrameCtx == Ctx) {
+    if (Parent)
+      *this = *Parent;
+    else
+      *this = getDefault(nullptr);
+  }
+}
+
 MemoryManager::MemoryManager(UBAwareInterpreter &Interpreter,
                              const DataLayout &DL, PointerType *Ty)
     : Interpreter(Interpreter), PtrBitWidth(DL.getTypeSizeInBits(Ty)) {
@@ -134,12 +154,15 @@ SingleValue MemoryManager::lookupPointer(const APInt &Addr) const {
       Iter != AddressMap.begin()) {
     auto *MO = std::prev(Iter)->second;
     if (MO->address().ule(Addr) && Addr.ule(MO->address() + MO->size())) {
-      return SingleValue{Pointer{MO->shared_from_this(), Addr - MO->address()}};
+      return SingleValue{
+          Pointer{MO->shared_from_this(), Addr - MO->address(),
+                  ContextSensitivePointerInfo::getDefault(nullptr)}};
     }
   }
 
   return SingleValue{Pointer{std::weak_ptr<MemObject>{},
-                             APInt::getZero(Addr.getBitWidth()), Addr, 0}};
+                             APInt::getZero(Addr.getBitWidth()), Addr, 0,
+                             ContextSensitivePointerInfo::getDefault(nullptr)}};
 }
 
 std::optional<APInt> addNoWrap(const APInt &LHS, const APInt &RHS, bool HasNSW,
@@ -197,7 +220,18 @@ raw_ostream &operator<<(raw_ostream &Out, const SingleValue &Val) {
       Out << "dangling";
     if (!Ptr->Offset.isZero())
       Out << " + " << Ptr->Offset;
-    return Out << "] " << Ptr->CI;
+    Out << "] " << Ptr->Info.CI;
+    if (Ptr->Info.Readable || Ptr->Info.Writable)
+      Out << ' ' << (Ptr->Info.Readable ? "R" : "")
+          << (Ptr->Info.Writable ? "W" : "");
+    switch (Ptr->Info.Loc) {
+    case IRMemLocation::ArgMem:
+      Out << " ArgMem";
+      break;
+    default:
+      break;
+    }
+    return Out;
   }
   return Out << "poison";
 }
@@ -379,52 +413,50 @@ static void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
     postProcess(V, handleNonNull);
   if (AS.hasAttribute(Attribute::NoUndef))
     postProcess(V, [&](SingleValue &SV) { handleNoUndef(Interpreter, SV); });
+  auto FrameCtx = Interpreter.getCurrentFrame();
   if (AS.hasAttribute(Attribute::Captures)) {
     auto CI = AS.getCaptureInfo();
-    postProcess(V, [CI](SingleValue &SV) {
+    postProcess(V, [CI, FrameCtx](SingleValue &SV) {
       if (isPoison(SV))
         return;
       auto &Ptr = std::get<Pointer>(SV);
-      if ((CI & Ptr.CI.getOtherComponents()) != CI) {
+      if ((CI & Ptr.Info.CI.getOtherComponents()) != CI) {
         SV = poison();
         return;
       }
-      Ptr.CI = CI;
+      Ptr.Info.pushCaptureInfo(FrameCtx, CI);
     });
   }
   if (AS.hasAttribute(Attribute::ReadNone)) {
-    postProcess(V, [](SingleValue &SV) {
+    postProcess(V, [FrameCtx](SingleValue &SV) {
       if (isPoison(SV))
         return;
       auto &Ptr = std::get<Pointer>(SV);
-      Ptr.Readable = false;
-      Ptr.Writable = false;
+      Ptr.Info.pushReadWrite(FrameCtx, false, false);
     });
   }
   if (AS.hasAttribute(Attribute::ReadOnly)) {
-    postProcess(V, [](SingleValue &SV) {
+    postProcess(V, [FrameCtx](SingleValue &SV) {
       if (isPoison(SV))
         return;
       auto &Ptr = std::get<Pointer>(SV);
-      if (!Ptr.Readable) {
+      if (!Ptr.Info.Readable) {
         SV = poison();
         return;
       }
-      Ptr.Readable = true;
-      Ptr.Writable = false;
+      Ptr.Info.pushReadWrite(FrameCtx, true, false);
     });
   }
   if (AS.hasAttribute(Attribute::WriteOnly)) {
-    postProcess(V, [](SingleValue &SV) {
+    postProcess(V, [FrameCtx](SingleValue &SV) {
       if (isPoison(SV))
         return;
       auto &Ptr = std::get<Pointer>(SV);
-      if (!Ptr.Writable) {
+      if (!Ptr.Info.Writable) {
         SV = poison();
         return;
       }
-      Ptr.Readable = false;
-      Ptr.Writable = true;
+      Ptr.Info.pushReadWrite(FrameCtx, false, true);
     });
   }
 }
@@ -538,11 +570,13 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
     auto Iter = GlobalValues.find(GV);
     if (Iter == GlobalValues.end())
       return AnyValue{*NullPtr};
-
-    return AnyValue{Pointer{
-        Iter->second, APInt::getZero(DL.getTypeSizeInBits(GV->getType())),
-        /*Readable=*/true, /*Writable=*/isa<GlobalVariable>(GV) &&
-                               !cast<GlobalVariable>(GV)->isConstant()}};
+    auto PointerInfo = ContextSensitivePointerInfo::getDefault(nullptr);
+    PointerInfo.pushReadWrite(nullptr, true,
+                              isa<GlobalVariable>(GV) &&
+                                  !cast<GlobalVariable>(GV)->isConstant());
+    return AnyValue{Pointer{Iter->second,
+                            APInt::getZero(DL.getTypeSizeInBits(GV->getType())),
+                            std::move(PointerInfo)}};
   }
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     switch (CE->getOpcode()) {
@@ -586,7 +620,8 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
   if (auto *BA = dyn_cast<BlockAddress>(V))
     return SingleValue{
         Pointer{BlockTargets.at(BA->getBasicBlock()),
-                APInt::getZero(DL.getTypeSizeInBits(V->getType()))}};
+                APInt::getZero(DL.getTypeSizeInBits(V->getType())),
+                ContextSensitivePointerInfo::getDefault(nullptr)}};
   errs() << "Unexpected constant " << *V << '\n';
   std::abort();
 }
@@ -689,12 +724,12 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
                                const AnyValue &V, Type *Ty, bool IsVolatile) {
   // errs() << "Store " << P << ' ' << V << '\n';
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
-    if (!PV->Writable)
-      ImmUBReporter(*this) << "store to a non-writable pointer";
+    if (!PV->Info.Writable)
+      ImmUBReporter(*this) << "store to a non-writable pointer " << *PV;
     if (auto MO = PV->Obj.lock()) {
       if (!MO->isStackObject(CurrentFrame) &&
-          (CurrentFrame->MemEffects.getModRef(PV->Loc) & ModRefInfo::Mod) !=
-              ModRefInfo::Mod)
+          (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
+           ModRefInfo::Mod) != ModRefInfo::Mod)
         ImmUBReporter(*this) << "store in a writenone context";
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -709,12 +744,12 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
 AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
                                   Type *Ty, bool IsVolatile) {
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
-    if (!PV->Readable)
-      ImmUBReporter(*this) << "load from a non-readable pointer";
+    if (!PV->Info.Readable)
+      ImmUBReporter(*this) << "load from a non-readable pointer " << *PV;
     if (auto MO = PV->Obj.lock()) {
       if ((!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
-          (CurrentFrame->MemEffects.getModRef(PV->Loc) & ModRefInfo::Ref) !=
-              ModRefInfo::Ref)
+          (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
+           ModRefInfo::Ref) != ModRefInfo::Ref)
         ImmUBReporter(*this) << "load in a readnone context";
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -746,8 +781,7 @@ SingleValue UBAwareInterpreter::offsetPointer(const Pointer &Ptr,
     return MemMgr.lookupPointer(*NewAddr);
   }
 
-  return Pointer{Ptr.Obj,      *NewOffset,   *NewAddr, Ptr.Bound,
-                 Ptr.Readable, Ptr.Writable, Ptr.Loc,  Ptr.CI};
+  return Pointer{Ptr.Obj, *NewOffset, *NewAddr, Ptr.Bound, Ptr.Info};
 }
 
 UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
@@ -760,7 +794,8 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
   EMIInfo.Enabled = Option.EnableEMITracking;
   EMIInfo.EnablePGFTracking = EMIInfo.Enabled && Option.EnablePGFTracking;
   NullPtrStorage = MemMgr.create("null", false, 0U, 1U);
-  NullPtr = Pointer{NullPtrStorage, APInt::getZero(DL.getPointerSizeInBits())};
+  NullPtr = Pointer{NullPtrStorage, APInt::getZero(DL.getPointerSizeInBits()),
+                    ContextSensitivePointerInfo::getDefault(nullptr)};
   assert(NullPtr->Address.isZero());
   for (auto &GV : M.globals()) {
     if (!GV.hasExactDefinition())
@@ -941,17 +976,17 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
                                     size_t Alignment, bool IsStore,
                                     bool IsVolatile) {
   auto &Ptr = std::get<Pointer>(SV);
-  if (IsStore && !Ptr.Writable)
-    ImmUBReporter(*this) << "store to a non-writable pointer";
-  if (!IsStore && !Ptr.Readable)
-    ImmUBReporter(*this) << "load from a non-readable pointer";
+  if (IsStore && !Ptr.Info.Writable)
+    ImmUBReporter(*this) << "store to a non-writable pointer " << Ptr;
+  if (!IsStore && !Ptr.Info.Readable)
+    ImmUBReporter(*this) << "load from a non-readable pointer " << Ptr;
   if (auto MO = Ptr.Obj.lock()) {
     if (IsStore && !MO->isStackObject(CurrentFrame) &&
-        (CurrentFrame->MemEffects.getModRef(Ptr.Loc) & ModRefInfo::Mod) !=
+        (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) & ModRefInfo::Mod) !=
             ModRefInfo::Mod)
       ImmUBReporter(*this) << "store in a writenone context";
     if (!IsStore && (!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
-        (CurrentFrame->MemEffects.getModRef(Ptr.Loc) & ModRefInfo::Ref) !=
+        (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) & ModRefInfo::Ref) !=
             ModRefInfo::Ref)
       ImmUBReporter(*this) << "load in a readnone context";
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -1005,7 +1040,8 @@ bool UBAwareInterpreter::visitAllocaInst(AllocaInst &AI) {
     AllocSize *= getIntNonPoison(AI.getArraySize()).getZExtValue();
   auto Obj = MemMgr.create(getValueName(&AI), true, AllocSize,
                            AI.getPointerAlignment(DL).value());
-  Pointer Ptr{Obj, APInt::getZero(DL.getPointerSizeInBits())};
+  Pointer Ptr{Obj, APInt::getZero(DL.getPointerSizeInBits()),
+              ContextSensitivePointerInfo::getDefault(CurrentFrame)};
   Obj->setLiveness(true);
   Obj->setStackObjectInfo(CurrentFrame);
   for (auto *U : AI.users()) {
@@ -1121,7 +1157,7 @@ bool UBAwareInterpreter::visitICmpInst(ICmpInst &I) {
         CaptureComponents Usage = I.isEquality() && RHS.Address.isZero()
                                       ? CaptureComponents::AddressIsNull
                                       : CaptureComponents::Address;
-        return (LHS.CI.getOtherComponents() & Usage) == Usage;
+        return (LHS.Info.CI.getOtherComponents() & Usage) == Usage;
       };
 
       if (IsCaptureInfoCorrect(std::get<Pointer>(LHS),
@@ -1810,7 +1846,7 @@ bool UBAwareInterpreter::visitStoreInst(StoreInst &SI) {
       // FIXME: This is too strict.
       auto &Ptr = std::get<Pointer>(SV);
       CaptureComponents Usage = CaptureComponents::All;
-      CaptureComponents Allowed = Ptr.CI.getOtherComponents();
+      CaptureComponents Allowed = Ptr.Info.CI.getOtherComponents();
       if ((Usage & Allowed) != Usage)
         SV = poison();
     });
@@ -1967,37 +2003,8 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
   SmallVector<std::shared_ptr<MemObject>> ByValTempObjects;
   bool HandleParamAttr =
       !isa<IntrinsicInst>(CB) || !Option.IgnoreParamAttrsOnIntrinsic;
-  for (const auto &[Idx, Arg] : enumerate(CB.args())) {
-    auto ArgVal = getValue(Arg);
-
-    if (CB.isByValArgument(Idx)) {
-      if (isPoison(ArgVal.getSingleValue()))
-        ImmUBReporter(*this) << "Pass poison to an pointer argument with byval";
-      auto *Ty = CB.getParamByValType(Idx);
-      auto TmpMO =
-          MemMgr.create(getValueName(Arg.get()), true, DL.getTypeAllocSize(Ty),
-                        DL.getPrefTypeAlign(Ty).value());
-      TmpMO->setLiveness(true);
-      memcpy(TmpMO->rawPointer(), getRawPtr(ArgVal.getSingleValue()),
-             DL.getTypeStoreSize(Ty));
-      ArgVal = SingleValue{
-          Pointer{TmpMO, APInt::getZero(DL.getPointerSizeInBits())}};
-      ByValTempObjects.push_back(std::move(TmpMO));
-    }
-
-    if (HandleParamAttr)
-      postProcessAttr(*this, ArgVal, CB.getParamAttributes(Idx));
-    // Convert pointer loc to argmem
-    if (CB.getArgOperand(Idx)->getType()->isPtrOrPtrVectorTy()) {
-      postProcess(ArgVal, [&](SingleValue &SV) {
-        if (isPoison(SV))
-          return;
-        auto &Ptr = std::get<Pointer>(SV);
-        Ptr.Loc = IRMemLocation::ArgMem;
-      });
-    }
-    Args.push_back(std::move(ArgVal));
-  }
+  for (const auto &[Idx, Arg] : enumerate(CB.args()))
+    Args.push_back(getValue(Arg));
   FastMathFlags FMF;
   if (auto *FPOp = dyn_cast<FPMathOperator>(&CB))
     FMF = FPOp->getFastMathFlags();
@@ -2021,7 +2028,7 @@ AnyValue UBAwareInterpreter::handleCall(CallBase &CB) {
     else
       ImmUBReporter(*this) << "Call with invalid callee";
   }
-  auto RetVal = call(Callee, &CB, Args, ByValTempObjects);
+  auto RetVal = call(Callee, &CB, Args);
   handleRangeMetadata(RetVal, CB);
   postProcessAttr(*this, RetVal, CB.getRetAttributes());
   if (auto *Val = CB.getReturnedArgOperand()) {
@@ -2055,11 +2062,11 @@ bool UBAwareInterpreter::visitReturnInst(ReturnInst &RI) {
   if (auto *RV = RI.getReturnValue()) {
     AnyValue RetVal = getValue(RV);
     if (RV->getType()->isPtrOrPtrVectorTy())
-      postProcess(RetVal, [](SingleValue &SV) {
+      postProcess(RetVal, [this](SingleValue &SV) {
         if (isPoison(SV))
           return;
-        auto &CI = std::get<Pointer>(SV).CI;
-        CI = CaptureInfo(CI.getRetComponents());
+        auto &Ptr = std::get<Pointer>(SV);
+        Ptr.Info.pop(CurrentFrame);
       });
     CurrentFrame->RetVal = std::move(RetVal);
   } else
@@ -2634,7 +2641,8 @@ SingleValue UBAwareInterpreter::alloc(const APInt &AllocSize,
   if (ZeroInitialize)
     std::memset(MemObj->rawPointer(), 0, MemObj->size());
   return SingleValue{
-      Pointer{MemObj, APInt::getZero(DL.getPointerSizeInBits())}};
+      Pointer{MemObj, APInt::getZero(DL.getPointerSizeInBits()),
+              ContextSensitivePointerInfo::getDefault(CurrentFrame)}};
 }
 AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
                                          SmallVectorImpl<AnyValue> &Args) {
@@ -2716,13 +2724,53 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
   errs() << "Unsupported libcall: " << FuncDecl->getName() << '\n';
   std::abort();
 }
-AnyValue
-UBAwareInterpreter::call(Function *Func, CallBase *CB,
-                         SmallVectorImpl<AnyValue> &Args,
-                         ArrayRef<std::shared_ptr<MemObject>> ByValObjs) {
+AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
+                                  SmallVectorImpl<AnyValue> &Args) {
   auto FnAttrs = Func->getAttributes();
-  for (const auto &[Idx, Param] : enumerate(Func->args()))
-    postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
+
+  SmallVector<std::shared_ptr<MemObject>> ByValTempObjects;
+  auto PostProcessArgs = [&] {
+    if (CB) {
+      bool HandleParamAttr =
+          !isa<IntrinsicInst>(CB) || !Option.IgnoreParamAttrsOnIntrinsic;
+      for (const auto &[Idx, Arg] : enumerate(CB->args())) {
+        auto &ArgVal = Args[Idx];
+
+        if (CB->isByValArgument(Idx)) {
+          if (isPoison(ArgVal.getSingleValue()))
+            ImmUBReporter(*this)
+                << "Pass poison to an pointer argument with byval";
+          auto *Ty = CB->getParamByValType(Idx);
+          auto TmpMO = MemMgr.create(getValueName(Arg.get()), true,
+                                     DL.getTypeAllocSize(Ty),
+                                     DL.getPrefTypeAlign(Ty).value());
+          TmpMO->setLiveness(true);
+          TmpMO->setStackObjectInfo(CurrentFrame);
+          memcpy(TmpMO->rawPointer(), getRawPtr(ArgVal.getSingleValue()),
+                 DL.getTypeStoreSize(Ty));
+          ArgVal = SingleValue{
+              Pointer{TmpMO, APInt::getZero(DL.getPointerSizeInBits()),
+                      ContextSensitivePointerInfo::getDefault(CurrentFrame)}};
+          ByValTempObjects.push_back(std::move(TmpMO));
+        }
+
+        if (HandleParamAttr)
+          postProcessAttr(*this, ArgVal, CB->getParamAttributes(Idx));
+        // Convert pointer loc to argmem
+        if (CB->getArgOperand(Idx)->getType()->isPtrOrPtrVectorTy()) {
+          postProcess(ArgVal, [&](SingleValue &SV) {
+            if (isPoison(SV))
+              return;
+            auto &Ptr = std::get<Pointer>(SV);
+            Ptr.Info.pushLoc(CurrentFrame, IRMemLocation::ArgMem);
+          });
+        }
+      }
+    }
+
+    for (const auto &[Idx, Param] : enumerate(Func->args()))
+      postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
+  };
 
   auto FMF = isa_and_present<FPMathOperator>(CB) ? CB->getFastMathFlags()
                                                  : FastMathFlags{};
@@ -2732,6 +2780,7 @@ UBAwareInterpreter::call(Function *Func, CallBase *CB,
     auto Scope = llvm::make_scope_exit(
         [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
     CurrentFrame = &CallFrame;
+    PostProcessArgs();
     return callIntrinsic(*cast<IntrinsicInst>(CB), Args);
   } else {
     LibFunc F;
@@ -2740,6 +2789,7 @@ UBAwareInterpreter::call(Function *Func, CallBase *CB,
       auto Scope = llvm::make_scope_exit(
           [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
       CurrentFrame = &CallFrame;
+      PostProcessArgs();
       return callLibFunc(F, Func, Args);
     }
   }
@@ -2758,11 +2808,10 @@ UBAwareInterpreter::call(Function *Func, CallBase *CB,
   }
 
   Frame CallFrame{Func, FAC, TLI, CurrentFrame, ME};
-  for (auto &Obj : ByValObjs)
-    Obj->setStackObjectInfo(&CallFrame);
   auto Scope = llvm::make_scope_exit(
       [this, Frame = CurrentFrame] { CurrentFrame = Frame; });
   CurrentFrame = &CallFrame;
+  PostProcessArgs();
   for (auto &Param : Func->args())
     CallFrame.ValueMap[&Param] = std::move(Args[Param.getArgNo()]);
 
