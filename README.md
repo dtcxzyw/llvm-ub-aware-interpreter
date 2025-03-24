@@ -82,6 +82,16 @@ python3 csmith.py <llvm install dir> <csmith install dir> <path to llubi> <test 
 ```
 If `emi` is set, it will enable the EMI-based mutation. For more details, please refer to [Compiler validation via equivalence modulo inputs, PLDI'21](https://dl.acm.org/doi/10.1145/2594291.2594334).
 
+## Fuzzing with Rustlantis
+[Rustlantis](https://github.com/dtcxzyw/rustlantis) has been adapted to support llubi.
+
+```
+git clone https://github.com/dtcxzyw/rustlantis.git
+cp rustlantis/config.toml.example ./config.toml
+echo "llubi_path=$(pwd)/build/llubi" >>config.toml
+python3 rustlantis.py ./rustlantis <test count>
+```
+
 ## Notes
 + Undef values are not supported as we will eventually remove undef from LLVM in the future. In llubi, they are treated as zero values.
 + FFI is not supported. Currently it only supports ```printf("%d", x)``` for csmith.

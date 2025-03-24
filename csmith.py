@@ -303,7 +303,7 @@ L = list(range(test_count))
 pbar = tqdm.tqdm(L)
 error_count = 0
 skipped_count = 0
-pool = Pool(16)
+pool = Pool(os.cpu_count())
 
 for res in pool.imap_unordered(csmith_test, L):
     if res is not None:

@@ -363,6 +363,7 @@ struct InterpreterOption {
   bool IgnoreParamAttrsOnIntrinsic = false;
   bool StorePoisonIsNoop = false;
   bool ReduceMode = false;
+  bool RustMode = false;
 };
 
 class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
@@ -550,6 +551,7 @@ public:
   AnyValue callIntrinsic(IntrinsicInst &II, SmallVectorImpl<AnyValue> &Args);
   AnyValue callLibFunc(LibFunc Func, Function *FuncDecl,
                        SmallVectorImpl<AnyValue> &Args);
+  void patchRustLibFunc();
   AnyValue call(Function *Func, CallBase *CB, SmallVectorImpl<AnyValue> &Args);
   void dumpStackTrace();
   int32_t runMain();

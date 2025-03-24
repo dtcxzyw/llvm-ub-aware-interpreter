@@ -839,13 +839,28 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
   NullPtr = Pointer{NullPtrStorage, APInt::getZero(DL.getPointerSizeInBits()),
                     ContextSensitivePointerInfo::getDefault(nullptr)};
   assert(NullPtr->Address.isZero());
+  if (Option.RustMode)
+    patchRustLibFunc();
   for (auto &GV : M.globals()) {
     if (!GV.hasExactDefinition())
       continue;
     GlobalValues.insert(
-        {&GV, std::move(MemMgr.create(GV.getName().str(), false,
-                                      DL.getTypeAllocSize(GV.getValueType()),
-                                      DL.getPreferredAlign(&GV).value()))});
+        {&GV, MemMgr.create(GV.getName().str(), false,
+                            DL.getTypeAllocSize(GV.getValueType()),
+                            DL.getPreferredAlign(&GV).value())});
+  }
+  for (auto &F : M) {
+    GlobalValues.insert({&F, MemMgr.create(F.getName().str(), false, 0, 16)});
+    ValidCallees.insert({GlobalValues.at(&F)->address().getZExtValue(), &F});
+    for (auto &BB : F) {
+      if (BB.isEntryBlock())
+        continue;
+      BlockTargets.insert(
+          {&BB, MemMgr.create(F.getName().str() + ":" + getValueName(&BB), true,
+                              0, 16)});
+      ValidBlockTargets.insert(
+          {GlobalValues.at(&F)->address().getZExtValue(), &BB});
+    }
   }
   for (auto &GV : M.globals()) {
     if (!GV.hasExactDefinition())
@@ -856,20 +871,6 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
             GV.getValueType());
       if (GV.isConstant())
         MO->markConstant();
-    }
-  }
-  for (auto &F : M) {
-    GlobalValues.insert(
-        {&F, std::move(MemMgr.create(F.getName().str(), false, 0, 16))});
-    ValidCallees.insert({GlobalValues.at(&F)->address().getZExtValue(), &F});
-    for (auto &BB : F) {
-      if (BB.isEntryBlock())
-        continue;
-      BlockTargets.insert({&BB, std::move(MemMgr.create(
-                                    F.getName().str() + ":" + getValueName(&BB),
-                                    true, 0, 16))});
-      ValidBlockTargets.insert(
-          {GlobalValues.at(&F)->address().getZExtValue(), &BB});
     }
   }
   // Expand constexprs
@@ -2682,6 +2683,20 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     return std::vector<AnyValue>{Vec.begin() + Offset,
                                  Vec.begin() + Offset + DstSize};
   }
+  case Intrinsic::fptosi_sat:
+  case Intrinsic::fptoui_sat: {
+    auto BitWidth = RetTy->getScalarSizeInBits();
+    return visitUnOp(RetTy, Args[0], [&](const SingleValue &C) -> SingleValue {
+      if (isPoison(C))
+        return poison();
+      auto &CFP = std::get<APFloat>(C);
+      APSInt V(BitWidth, IID == Intrinsic::fptoui_sat);
+      bool IsExact;
+      CFP.convertToInteger(V, APFloat::rmTowardZero, &IsExact);
+      (void)(IsExact);
+      return V;
+    });
+  }
   default:
     break;
   }
@@ -2689,6 +2704,30 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
          << '\n';
   std::abort();
 }
+
+void UBAwareInterpreter::patchRustLibFunc() {
+  for (auto &F : M) {
+    // std::io::stdio::_print
+    if (F.empty() && F.getName().starts_with("_ZN3std2io5stdio6_print")) {
+      // Only works for rustlantis
+      auto *Entry = BasicBlock::Create(M.getContext(), "entry", &F);
+      IRBuilder<> Builder{Entry};
+      auto *P1 =
+          Builder.CreateInBoundsPtrAdd(F.getArg(0), Builder.getInt64(16));
+      auto *P2 = Builder.CreateLoad(Builder.getPtrTy(), P1);
+      auto *P3 = Builder.CreateLoad(Builder.getPtrTy(), P2);
+      Value *Val = Builder.CreateLoad(Builder.getInt64Ty(), P3);
+      auto *FmtStr = Builder.CreateGlobalString("hash: %llu\n", "fmt");
+      auto Callee = M.getOrInsertFunction(
+          "printf",
+          FunctionType::get(Type::getInt32Ty(M.getContext()),
+                            {PointerType::getUnqual(M.getContext())}, true));
+      Builder.CreateCall(Callee, {FmtStr, Val});
+      Builder.CreateRetVoid();
+    }
+  }
+}
+
 SingleValue UBAwareInterpreter::alloc(const APInt &AllocSize,
                                       bool ZeroInitialize) {
   auto MemObj = MemMgr.create("alloc", false, AllocSize.getZExtValue(), 8);
@@ -2889,7 +2928,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   }
 
   if (!Func->hasExactDefinition()) {
-    errs() << "Do not how to handle " << *Func << '\n';
+    errs() << "Do not know how to handle " << *Func << '\n';
     std::exit(EXIT_FAILURE);
   }
 
@@ -2960,7 +2999,16 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
 }
 
 int32_t UBAwareInterpreter::runMain() {
-  auto *Entry = M.getFunction("main");
+  Function *Entry = nullptr;
+  if (Option.RustMode) {
+    for (auto &F : M) {
+      // xxx::main
+      if (F.getName().contains("4main"))
+        Entry = &F;
+    }
+  } else {
+    Entry = M.getFunction("main");
+  }
   if (!Entry) {
     errs() << "Cannot find entry function `main`\n";
     return EXIT_FAILURE;

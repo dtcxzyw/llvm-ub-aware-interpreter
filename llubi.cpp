@@ -56,6 +56,8 @@ static cl::opt<bool>
     StorePoisonIsNoop("store-poison-is-noop",
                       cl::desc("Treat store poison as a no-op"),
                       cl::init(false), cl::cat(Category));
+static cl::opt<bool> RustMode("rust", cl::desc("Run rust programs"),
+                              cl::init(false), cl::cat(Category));
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -84,6 +86,7 @@ int main(int argc, char **argv) {
   Option.IgnoreParamAttrsOnIntrinsic = IgnoreParamAttrsOnIntrinsic;
   Option.DumpStackTrace = DumpStackTrace;
   Option.StorePoisonIsNoop = StorePoisonIsNoop;
+  Option.RustMode = RustMode;
 
   UBAwareInterpreter Executor(*M, Option);
   int32_t Ret = Executor.runMain();
