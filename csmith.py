@@ -18,10 +18,13 @@ llubi_bin = sys.argv[3]
 test_count = int(sys.argv[4])
 emi = len(sys.argv) >= 6 and sys.argv[5] == "emi"
 inconsistent = len(sys.argv) >= 6 and sys.argv[5] == "inconsistency"
+stepbystep = len(sys.argv) >= 6 and sys.argv[5] == "stepbystep"
 if emi:
     print("EMI-based mutation is enabled")
 if inconsistent:
     print("Inconsistency check is enabled")
+if stepbystep:
+    print("Step-by-step check is enabled")
 csmith_command = (
     csmith_dir
     + "/bin/csmith --max-funcs 3 --max-block-depth 5 --quiet --builtins --no-packed-struct --no-unions --no-bitfields --output "
@@ -41,6 +44,88 @@ cwd = "csmith" + datetime.datetime.now().strftime("%Y-%m-%d@%H:%M")
 os.makedirs(cwd)
 
 
+def check_step_by_step(file_c, basename):
+    file_o0_output = basename + ".O0.ll"
+    try:
+        comp_command = (
+            compile_command
+            + " -o "
+            + file_o0_output
+            + " "
+            + file_c
+            + " -O3 -Xclang -disable-llvm-passes -emit-llvm -S"
+        )
+        subprocess.check_call(
+            comp_command.split(" "),
+            timeout=comp_timeout,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        os.remove(file_c)
+        return None
+
+    try:
+        ref_out = subprocess.check_output(
+            [llubi_bin, file_o0_output] + llubi_workarounds,
+            timeout=exec_timeout * 2,
+        )
+    except subprocess.TimeoutExpired:
+        # Ignore timeout
+        os.remove(file_c)
+        os.remove(file_o0_output)
+        return True
+    except Exception:
+        return False
+
+    idx = 1
+    while True:
+        file_i_output = basename + "." + str(idx) + ".ll"
+        try:
+            comp_command = (
+                compile_command
+                + " -o "
+                + file_i_output
+                + " "
+                + file_c
+                + " -O3 -emit-llvm -S"
+                + " -mllvm -opt-bisect-limit="
+                + str(idx)
+            )
+            ret = subprocess.run(
+                comp_command.split(" "),
+                timeout=comp_timeout,
+                check=True,
+                capture_output=True,
+            )
+            if f"({idx})" not in ret.stderr.decode():
+                os.remove(file_c)
+                os.remove(file_i_output)
+                os.remove(file_o0_output)
+                return True
+        except Exception:
+            os.remove(file_c)
+            os.remove(file_o0_output)
+            return None
+
+        try:
+            out = subprocess.check_output(
+                [llubi_bin, file_i_output] + llubi_workarounds,
+                timeout=exec_timeout * 2,
+            )
+        except subprocess.TimeoutExpired:
+            # Ignore timeout
+            os.remove(file_c)
+            os.remove(file_i_output)
+            return True
+        except Exception:
+            return False
+
+        if out != ref_out:
+            return False
+        os.remove(file_i_output)
+        idx += 1
+
+
 def csmith_test(i):
     basename = cwd + "/test" + str(i)
     file_c = basename + ".c"
@@ -48,6 +133,9 @@ def csmith_test(i):
         subprocess.check_call((csmith_command + file_c).split(" "))
     except subprocess.SubprocessError:
         return None
+
+    if stepbystep:
+        return check_step_by_step(file_c, basename)
 
     file_out = basename + ".ll"
     try:
