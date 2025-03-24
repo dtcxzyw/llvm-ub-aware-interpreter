@@ -155,7 +155,8 @@ void MemObject::popPendingInitializeTask(Frame *Ctx) {
 ContextSensitivePointerInfo
 ContextSensitivePointerInfo::getDefault(Frame *FrameCtx) {
   return ContextSensitivePointerInfo{
-      nullptr, FrameCtx, true, true, IRMemLocation::Other, CaptureInfo::all()};
+      nullptr,           FrameCtx, true, true, true, true, IRMemLocation::Other,
+      CaptureInfo::all()};
 }
 void ContextSensitivePointerInfo::push(Frame *Ctx) {
   if (Ctx != FrameCtx) {
@@ -460,10 +461,6 @@ static void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
       if (isPoison(SV))
         return;
       auto &Ptr = std::get<Pointer>(SV);
-      if ((CI & Ptr.Info.CI.getOtherComponents()) != CI) {
-        SV = poison();
-        return;
-      }
       Ptr.Info.pushCaptureInfo(FrameCtx, CI);
     });
   }
@@ -670,14 +667,16 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
   if (Ty->isIntegerTy()) {
     auto &SV = V.getSingleValue();
     if (isPoison(SV)) {
-      MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
+      if (!Option.StorePoisonIsNoop)
+        MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
       return;
     }
     MO.store(Offset, std::get<APInt>(SV));
   } else if (Ty->isFloatingPointTy()) {
     auto &SV = V.getSingleValue();
     if (isPoison(SV)) {
-      MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
+      if (!Option.StorePoisonIsNoop)
+        MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
       return;
     }
     auto &C = std::get<APFloat>(SV);
@@ -685,7 +684,8 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
   } else if (Ty->isPointerTy()) {
     auto &SV = V.getSingleValue();
     if (isPoison(SV)) {
-      MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
+      if (!Option.StorePoisonIsNoop)
+        MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
       return;
     }
     auto &Ptr = std::get<Pointer>(SV);
@@ -1197,12 +1197,13 @@ bool UBAwareInterpreter::visitICmpInst(ICmpInst &I) {
     if (std::holds_alternative<Pointer>(LHS)) {
       assert(std::holds_alternative<Pointer>(RHS));
 
+      // Unfortunatly, we cannot track if the result is leaked out of
+      // the function.
       auto IsCaptureInfoCorrect = [&I](const Pointer &LHS,
                                        const Pointer &RHS) -> bool {
-        CaptureComponents Usage = I.isEquality() && RHS.Address.isZero()
-                                      ? CaptureComponents::AddressIsNull
-                                      : CaptureComponents::Address;
-        return (LHS.Info.CI.getOtherComponents() & Usage) == Usage;
+        if (I.isEquality() && RHS.Address.isZero())
+          return LHS.Info.ComparableWithNull;
+        return LHS.Info.Comparable;
       };
 
       if (IsCaptureInfoCorrect(std::get<Pointer>(LHS),
@@ -1984,7 +1985,10 @@ bool UBAwareInterpreter::visitPtrToInt(PtrToIntInst &I) {
   return visitUnOp(I, [&](const SingleValue &V) -> SingleValue {
     if (isPoison(V))
       return poison();
-    return std::get<Pointer>(V).Address;
+    auto &Ptr = std::get<Pointer>(V);
+    if (Ptr.Info.Comparable)
+      return Ptr.Address;
+    return poison();
   });
 }
 APInt UBAwareInterpreter::readBits(const APInt &Src, uint32_t &Offset,
@@ -2105,7 +2109,19 @@ bool UBAwareInterpreter::visitReturnInst(ReturnInst &RI) {
         if (isPoison(SV))
           return;
         auto &Ptr = std::get<Pointer>(SV);
+        auto CC = Ptr.Info.CI.getRetComponents();
         Ptr.Info.pop(CurrentFrame);
+        if ((CC & CaptureComponents::Address) != CaptureComponents::Address)
+          Ptr.Info.Comparable = false;
+        if ((CC & CaptureComponents::AddressIsNull) !=
+            CaptureComponents::AddressIsNull)
+          Ptr.Info.ComparableWithNull = false;
+        if ((CC & CaptureComponents::ReadProvenance) !=
+            CaptureComponents::ReadProvenance)
+          Ptr.Info.Readable = false;
+        if ((CC & CaptureComponents::Provenance) !=
+            CaptureComponents::Provenance)
+          Ptr.Info.Writable = false;
       });
     CurrentFrame->RetVal = std::move(RetVal);
   } else

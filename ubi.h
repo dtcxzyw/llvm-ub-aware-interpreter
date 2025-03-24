@@ -77,7 +77,7 @@
 using namespace llvm;
 
 class MemoryManager;
-class Frame;
+struct Frame;
 
 struct MemByteMetadata {
   bool IsPoison = false;
@@ -141,17 +141,13 @@ inline raw_ostream &operator<<(raw_ostream &Out, const MemObject &MO) {
 struct ContextSensitivePointerInfo {
   std::shared_ptr<const ContextSensitivePointerInfo> Parent;
   Frame *FrameCtx;
-  bool Readable;
-  bool Writable;
+  bool Readable : 1;
+  bool Writable : 1;
+  bool Comparable : 1;
+  bool ComparableWithNull : 1;
   IRMemLocation Loc;
   CaptureInfo CI;
 
-  explicit ContextSensitivePointerInfo(
-      std::shared_ptr<const ContextSensitivePointerInfo> Parent,
-      Frame *FrameCtx, bool Readable, bool Writable, IRMemLocation Loc,
-      CaptureInfo CI)
-      : Parent(std::move(Parent)), FrameCtx(FrameCtx), Readable(Readable),
-        Writable(Writable), Loc(std::move(Loc)), CI(std::move(CI)) {}
   static ContextSensitivePointerInfo getDefault(Frame *FrameCtx);
   void push(Frame *Ctx);
   void pushReadWrite(Frame *Ctx, bool Readable, bool Writable) {
@@ -166,6 +162,14 @@ struct ContextSensitivePointerInfo {
   void pushCaptureInfo(Frame *Ctx, CaptureInfo CI) {
     push(Ctx);
     this->CI &= CI;
+  }
+  void pushComparable(Frame *Ctx, bool Comparable) {
+    push(Ctx);
+    this->Comparable = Comparable;
+  }
+  void pushComparableWithNull(Frame *Ctx, bool ComparableWithNull) {
+    push(Ctx);
+    this->ComparableWithNull = ComparableWithNull;
   }
   void pop(Frame *Ctx);
 };
@@ -357,6 +361,7 @@ struct InterpreterOption {
   bool TrackVolatileMem = false;
   bool VerifyValueTracking = false;
   bool IgnoreParamAttrsOnIntrinsic = false;
+  bool StorePoisonIsNoop = false;
   bool ReduceMode = false;
 };
 

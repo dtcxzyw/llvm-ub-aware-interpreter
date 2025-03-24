@@ -52,6 +52,10 @@ static cl::opt<bool>
     VerifyValueTracking("verify-value-tracking",
                         cl::desc("Verify analysis results of value tracking"),
                         cl::init(false), cl::cat(Category));
+static cl::opt<bool>
+    StorePoisonIsNoop("store-poison-is-noop",
+                      cl::desc("Treat store poison as a no-op"),
+                      cl::init(false), cl::cat(Category));
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -79,6 +83,7 @@ int main(int argc, char **argv) {
   Option.VerifyValueTracking = VerifyValueTracking;
   Option.IgnoreParamAttrsOnIntrinsic = IgnoreParamAttrsOnIntrinsic;
   Option.DumpStackTrace = DumpStackTrace;
+  Option.StorePoisonIsNoop = StorePoisonIsNoop;
 
   UBAwareInterpreter Executor(*M, Option);
   int32_t Ret = Executor.runMain();
