@@ -81,7 +81,7 @@ std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
     auto &Word = const_cast<APInt::WordType &>(Res.getRawData()[I]);
     if (ReadCnt + Scale <= Size) {
       for (uint32_t J = 0; J != Scale; ++J) {
-        if (Metadata[ReadPos + J - Data.data()].IsPoison)
+        if (Metadata[Offset + ReadCnt + J].IsPoison)
           return std::nullopt;
       }
       memcpy(&Word, &ReadPos[ReadCnt], sizeof(Word));
@@ -90,7 +90,7 @@ std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
         break;
     } else {
       for (auto J = 0; J != Scale; ++J) {
-        if (Metadata[ReadPos - Data.data()].IsPoison)
+        if (Metadata[Offset + ReadCnt].IsPoison)
           return std::nullopt;
         Word |= static_cast<APInt::WordType>(ReadPos[ReadCnt]) << (J * 8);
         if (++ReadCnt == Size)
@@ -340,7 +340,7 @@ static APFloat handleDenormal(APFloat V,
       break;
     }
   }
-  return std::move(V);
+  return V;
 }
 static void handleFPVal(SingleValue &V, FastMathFlags FMF,
                         DenormalMode::DenormalModeKind Denormal) {
@@ -422,7 +422,7 @@ static AnyValue postProcessFPVal(AnyValue V, Instruction &FMFSource) {
       handleFPVal(SV, FMF, DenormalMode::IEEE);
     });
   }
-  return std::move(V);
+  return V;
 }
 static void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
                             const AttributeSet &AS) {
@@ -1048,7 +1048,7 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
 }
 DenormalMode UBAwareInterpreter::getCurrentDenormalMode(Type *Ty) {
   if (Ty->isFPOrFPVectorTy() && CurrentFrame) {
-    return CurrentFrame->BB->getParent()->getDenormalMode(
+    return CurrentFrame->Func->getDenormalMode(
         Ty->getScalarType()->getFltSemantics());
   }
   return DenormalMode::getDefault();
@@ -1786,7 +1786,7 @@ bool UBAwareInterpreter::visitGetElementPtrInst(GetElementPtrInst &GEP) {
     auto GetSplat = [Len](AnyValue V) -> AnyValue {
       if (V.isSingleValue())
         return std::vector<AnyValue>{Len, std::move(V)};
-      return std::move(V);
+      return V;
     };
     AnyValue Res = GetSplat(getValue(GEP.getPointerOperand()));
     for (auto &[K, V] : VarOffsets) {
@@ -3256,8 +3256,8 @@ SimplifyQuery UBAwareInterpreter::getSQ(const Instruction *CxtI) const {
 }
 Frame::Frame(Function *Func, FunctionAnalysisCache *Cache,
              TargetLibraryInfoImpl &TLI, Frame *LastFrame, MemoryEffects ME)
-    : BB(nullptr), PC(), Cache(Cache), TLI(TLI, Func), LastFrame(LastFrame),
-      MemEffects(ME) {}
+    : Func(Func), BB(nullptr), PC(), Cache(Cache), TLI(TLI, Func),
+      LastFrame(LastFrame), MemEffects(ME) {}
 void UBAwareInterpreter::verifyAnalysis(Value *V, const AnyValue &RV,
                                         const Instruction *CxtI) {
   auto *Ty = V->getType();

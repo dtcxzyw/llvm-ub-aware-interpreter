@@ -277,6 +277,7 @@ struct FunctionAnalysisCache final {
 };
 
 struct Frame final {
+  Function *Func;
   BasicBlock *BB;
   BasicBlock::iterator PC;
   SmallVector<std::shared_ptr<MemObject>> Allocas;
