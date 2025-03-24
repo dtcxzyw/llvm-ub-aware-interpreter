@@ -399,7 +399,7 @@ static void handleDereferenceable(UBAwareInterpreter &Interpreter,
   if (Ptr.Offset.getSExtValue() + Size > Ptr.Bound) {
     ImmUBReporter(Interpreter)
         << "dereferenceable" << (OrNull ? "_or_null" : "") << "(" << Size
-        << ") out of bound :" << V;
+        << ") out of bound: " << V;
   }
   if (Ptr.Obj.expired())
     ImmUBReporter(Interpreter)
@@ -2185,6 +2185,8 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
       isa<FPMathOperator>(II) ? II.getFastMathFlags() : FastMathFlags();
   switch (IID) {
   case Intrinsic::ssa_copy:
+  case Intrinsic::expect:
+  case Intrinsic::expect_with_probability:
     return Args[0];
   case Intrinsic::donothing:
     return none();
