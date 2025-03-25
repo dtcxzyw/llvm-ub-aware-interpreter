@@ -106,3 +106,20 @@ We did some refinements on the LLVM LangRef to make the implementation practical
 + We do not maintain the precise poison semantics in memory when ```memcpy/memmove/memset``` is called.
 + We do not check ```externally observable sideeffects``` strictly as required by ```memory(read)/readonly```. The current implementation just works for these two fuzzers.
 + Volatile memory accesses are partially supported. We only record total number of bytes that are loaded/stored via volatile memory ops.
+
+## License
+
+This repository is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+
+## Citation
+
+Please cite this work with the following BibTex entry:
+
+```
+@misc{llubi,
+  title = {LLVM UB-Aware Interpreter},
+  url = {https://github.com/dtcxzyw/llvm-ub-aware-interpreter},
+  author = {Yingwei Zheng},
+  year = {2024},
+}
+```
