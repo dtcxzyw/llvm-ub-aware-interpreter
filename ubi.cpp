@@ -42,10 +42,16 @@ void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
   if (!IsAlive)
     ImmUBReporter(Manager.Interpreter) << "Accessing dead object " << *this;
   if (!IsStore) {
+    uint64_t Beg = Offset.getZExtValue();
+    uint64_t End = Beg + AccessSize;
     for (auto &Task : PendingInitializeTasks)
-      if (!Task.Ranges.empty())
-        ImmUBReporter(Manager.Interpreter)
-            << "Load during initialization of " << *this;
+      for (auto &R : Task.Ranges) {
+        uint64_t Lo = std::max(R.first, Beg);
+        uint64_t Hi = std::min(R.second, End);
+        if (Lo < Hi)
+          ImmUBReporter(Manager.Interpreter)
+              << "Load during initialization of " << *this;
+      }
   }
   auto NewAddr = Address + Offset;
   if (NewAddr.countr_zero() < Log2_64(Alignment))
@@ -489,8 +495,14 @@ static void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
       Ptr.Info.pushReadWrite(FrameCtx, Ptr.Info.Readable, false);
     });
   }
-  // For writeonly, read is also allowed if it is not observable outside the
-  // function. We do not model this for now.
+  if (AS.hasAttribute(Attribute::WriteOnly)) {
+    postProcess(V, [FrameCtx](SingleValue &SV) {
+      if (isPoison(SV))
+        return;
+      auto &Ptr = std::get<Pointer>(SV);
+      Ptr.Info.pushReadWrite(FrameCtx, false, Ptr.Info.Writable);
+    });
+  }
 }
 static bool anyOfScalar(const AnyValue &V,
                         function_ref<bool(const SingleValue &)> F) {
@@ -764,8 +776,11 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
     if (auto MO = PV->Obj.lock()) {
       if (!MO->isStackObject(CurrentFrame) &&
           (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
-           ModRefInfo::Mod) != ModRefInfo::Mod)
+           ModRefInfo::Mod) != ModRefInfo::Mod) {
+        // FIXME: If read is set, check  the case where the location is read
+        // from and then the same value is written back.
         ImmUBReporter(*this) << "store in a writenone context";
+      }
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/true);
@@ -781,12 +796,18 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
 AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
                                   Type *Ty, bool IsVolatile) {
   if (auto *PV = std::get_if<Pointer>(&P.getSingleValue())) {
-    if (!PV->Info.Readable)
-      ImmUBReporter(*this) << "load from a non-readable pointer " << *PV;
+    if (!PV->Info.Readable) {
+      // However, the function may still internally read the location after
+      // writing it, as this is not observable. Reading the location prior to
+      // writing it results in a poison value.
+      // We do not model the second behavior for now.
+      if (!PV->Info.Writable)
+        ImmUBReporter(*this) << "load from a non-readable pointer " << *PV;
+    }
     if (auto MO = PV->Obj.lock()) {
       if ((!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
           (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
-           ModRefInfo::Ref) != ModRefInfo::Ref)
+           ModRefInfo::ModRef) == ModRefInfo::NoModRef)
         ImmUBReporter(*this) << "load in a readnone context";
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -1016,16 +1037,22 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
   auto &Ptr = std::get<Pointer>(SV);
   if (IsStore && !Ptr.Info.Writable)
     ImmUBReporter(*this) << "store to a non-writable pointer " << Ptr;
-  if (!IsStore && !Ptr.Info.Readable)
-    ImmUBReporter(*this) << "load from a non-readable pointer " << Ptr;
+  if (!IsStore && !Ptr.Info.Readable) {
+    // However, the function may still internally read the location after
+    // writing it, as this is not observable. Reading the location prior to
+    // writing it results in a poison value.
+    // We do not model the second behavior for now.
+    if (!Ptr.Info.Writable)
+      ImmUBReporter(*this) << "load from a non-readable pointer " << Ptr;
+  }
   if (auto MO = Ptr.Obj.lock()) {
     if (IsStore && !MO->isStackObject(CurrentFrame) &&
         (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) & ModRefInfo::Mod) !=
             ModRefInfo::Mod)
       ImmUBReporter(*this) << "store in a writenone context";
     if (!IsStore && (!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
-        (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) & ModRefInfo::Ref) !=
-            ModRefInfo::Ref)
+        (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) &
+         ModRefInfo::ModRef) == ModRefInfo::NoModRef)
       ImmUBReporter(*this) << "load in a readnone context";
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
@@ -2861,7 +2888,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
         auto &ArgVal = Args[Idx];
 
         MemObject *InitializeMO = nullptr;
-        uint64_t InitializeOffset = 0;
+        int64_t InitializeOffset = 0;
         if (CB->isByValArgument(Idx)) {
           if (isPoison(ArgVal.getSingleValue()))
             ImmUBReporter(*this)
@@ -2908,14 +2935,16 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
                       << "Pass dangling pointer to an pointer argument with "
                          "initializes";
                 InitializeMO = MO.get();
-                InitializeOffset = Ptr.Offset.getZExtValue();
+                InitializeOffset = Ptr.Offset.getSExtValue();
               }
 
               PendingInitializeTask &Task =
                   InitializeMO->pushPendingInitializeTask(CurrentFrame);
               for (auto &R : Initializes) {
-                uint64_t Lo = InitializeOffset + R.getLower().getZExtValue();
-                uint64_t Hi = InitializeOffset + R.getUpper().getZExtValue();
+                uint64_t Lo = static_cast<uint64_t>(
+                    InitializeOffset + R.getLower().getSExtValue());
+                uint64_t Hi = static_cast<uint64_t>(
+                    InitializeOffset + R.getUpper().getSExtValue());
                 Task.Ranges.push_back({Lo, Hi});
               }
 
