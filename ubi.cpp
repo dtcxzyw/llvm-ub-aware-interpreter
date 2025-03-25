@@ -48,9 +48,12 @@ void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
       for (auto &R : Task.Ranges) {
         uint64_t Lo = std::max(R.first, Beg);
         uint64_t Hi = std::min(R.second, End);
-        if (Lo < Hi)
+        if (Lo < Hi) {
           ImmUBReporter(Manager.Interpreter)
-              << "Load during initialization of " << *this;
+              << "Load during initialization of " << *this << " Load [" << Beg
+              << ", " << End << ") PendingWrite [" << R.first << ", "
+              << R.second << ')';
+        }
       }
   }
   auto NewAddr = Address + Offset;
@@ -135,7 +138,7 @@ void PendingInitializeTask::write(uint64_t Offset, uint64_t Size) {
   for (auto &[Lo, Hi] : Ranges) {
     uint64_t IntersectLo = std::max(Lo, WriteLo),
              IntersectHi = std::min(Hi, WriteHi);
-    if (IntersectHi >= IntersectLo)
+    if (IntersectLo >= IntersectHi)
       continue;
     if (IntersectLo != Lo)
       NewRanges.emplace_back(Lo, IntersectLo);
