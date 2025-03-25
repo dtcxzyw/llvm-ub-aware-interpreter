@@ -2231,10 +2231,16 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     auto &Ptr = Args[1].getSingleValue();
     if (auto *P = std::get_if<Pointer>(&Ptr)) {
       if (auto MO = P->Obj.lock()) {
-        if (Size->isAllOnes())
+        // Do not reduce the pointer.
+        if (Option.ReduceMode && P->Address.isZero())
+          ImmUBReporter(*this) << "call lifetime intrinsic with null";
+        if (!Option.ReduceMode && Size->isAllOnes())
           Size = APInt(Size->getBitWidth(), MO->size());
         // FIXME: What is the meaning of size?
         if (MO->isStackObject(CurrentFrame->LastFrame) && P->Offset.isZero()) {
+          // Do not reduce the size.
+          if (Option.ReduceMode && MO->size() != Size)
+            ImmUBReporter(*this) << "call lifetime intrinsic with wrong size";
           if (MO->isAlive() || IID == Intrinsic::lifetime_start)
             MO->markPoison(0, MO->size(), IID != Intrinsic::lifetime_start);
           MO->setLiveness(IID == Intrinsic::lifetime_start);
