@@ -76,6 +76,9 @@ clang -O3 -Xclang -disable-llvm-passes -emit-llvm -S test.c -o test.ll
 llvm-reduce --test=test.sh --ir-passes="function(sroa,instcombine<no-verify-fixpoint>,gvn,simplifycfg,infer-address-spaces),inline" test.ll
 ```
 
+Please refer to [this example](https://github.com/llvm/llvm-project/issues/131465#issuecomment-2727536818) if you find it hard to get a valid reproducer.
+BTW, an automatic reproducer reduction pipeline will be available soon :)  
+
 ## Fuzzing with Csmith
 ```
 python3 csmith.py <llvm install dir> <csmith install dir> <path to llubi> <test count> [emi]
@@ -92,10 +95,14 @@ echo "llubi_path=$(pwd)/build/llubi" >>config.toml
 python3 rustlantis.py ./rustlantis <test count>
 ```
 
-## Notes
-+ Undef values are not supported as we will eventually remove undef from LLVM in the future. In llubi, they are treated as zero values.
-+ FFI is not supported. Currently it only supports ```printf("%d", x)``` for csmith.
+## Limitations
+We did some refinements on the LLVM LangRef to make the implementation practical and efficient:
 
-## TODO
-- [ ] TBAA support
-- [ ] Fine-grained UB check control
++ Undef values are not supported as we will eventually remove undef from LLVM in the future. In llubi, they are treated as zero values.
++ FFI is not supported. Currently it only supports ```printf("%d", x)``` for csmith. Some rust standard library functions are patched to support rustlantis.
++ Addresses of allocations are unique. That is, we cannot model the behavior of stack coloring in llubi.
++ Pointer aliasing has not been supported yet.
++ Pointer provenance and capture tracking support is limited. We do not track the capabilities of pointers if it is stored into memory or converted to an integer.
++ We do not maintain the precise poison semantics in memory when ```memcpy/memmove/memset``` is called.
++ We do not check ```externally observable sideeffects``` strictly as required by ```memory(read)/readonly```. The current implementation just works for these two fuzzers.
++ Volatile memory accesses are partially supported. We only record total number of bytes that are loaded/stored via volatile memory ops.

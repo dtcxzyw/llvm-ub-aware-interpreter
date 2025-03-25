@@ -804,14 +804,17 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
       // writing it, as this is not observable. Reading the location prior to
       // writing it results in a poison value.
       // We do not model the second behavior for now.
-      if (!PV->Info.Writable)
+      if (IsVolatile || !PV->Info.Writable)
         ImmUBReporter(*this) << "load from a non-readable pointer " << *PV;
     }
     if (auto MO = PV->Obj.lock()) {
       if ((!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
           (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
-           ModRefInfo::ModRef) == ModRefInfo::NoModRef)
-        ImmUBReporter(*this) << "load in a readnone context";
+           ModRefInfo::Ref) != ModRefInfo::Ref) {
+        if (!IsVolatile || (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
+                            ModRefInfo::Mod) != ModRefInfo::Mod)
+          ImmUBReporter(*this) << "load in a readnone context";
+      }
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/false);
@@ -1045,7 +1048,7 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
     // writing it, as this is not observable. Reading the location prior to
     // writing it results in a poison value.
     // We do not model the second behavior for now.
-    if (!Ptr.Info.Writable)
+    if (IsVolatile || !Ptr.Info.Writable)
       ImmUBReporter(*this) << "load from a non-readable pointer " << Ptr;
   }
   if (auto MO = Ptr.Obj.lock()) {
@@ -1054,9 +1057,12 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
             ModRefInfo::Mod)
       ImmUBReporter(*this) << "store in a writenone context";
     if (!IsStore && (!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
-        (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) &
-         ModRefInfo::ModRef) == ModRefInfo::NoModRef)
-      ImmUBReporter(*this) << "load in a readnone context";
+        (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) & ModRefInfo::Ref) !=
+            ModRefInfo::Ref) {
+      if (IsVolatile || (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) &
+                         ModRefInfo::Mod) != ModRefInfo::Mod)
+        ImmUBReporter(*this) << "load in a readnone context";
+    }
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
     MO->verifyMemAccess(Ptr.Offset, Size, Alignment, IsStore);
