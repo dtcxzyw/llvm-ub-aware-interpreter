@@ -2709,8 +2709,10 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
 
 void UBAwareInterpreter::patchRustLibFunc() {
   for (auto &F : M) {
+    if (!F.isDeclaration())
+      continue;
     // std::io::stdio::_print
-    if (F.empty() && F.getName().starts_with("_ZN3std2io5stdio6_print")) {
+    if (F.getName().starts_with("_ZN3std2io5stdio6_print")) {
       // Only works for rustlantis
       auto *Entry = BasicBlock::Create(M.getContext(), "entry", &F);
       IRBuilder<> Builder{Entry};
@@ -2725,6 +2727,36 @@ void UBAwareInterpreter::patchRustLibFunc() {
           FunctionType::get(Type::getInt32Ty(M.getContext()),
                             {PointerType::getUnqual(M.getContext())}, true));
       Builder.CreateCall(Callee, {FmtStr, Val});
+      Builder.CreateRetVoid();
+    }
+
+    // std::sys::sync::once::futex::Once::call
+    // if (state_and_queued == INCOMPLETE) {
+    //   f(OnceState{});
+    //   state_and_queued = COMPLETE;
+    // }
+    if (F.getName().starts_with("_ZN3std3sys4sync4once5futex4Once4call")) {
+      auto *Entry = BasicBlock::Create(M.getContext(), "entry", &F);
+      IRBuilder<> Builder{Entry};
+      auto *OnceState = Builder.CreateAlloca(Builder.getInt64Ty());
+      auto *Status = Builder.CreateLoad(Builder.getInt32Ty(), F.getArg(0));
+      auto *Test = Builder.CreateIsNull(Status);
+      auto *ThenBB = BasicBlock::Create(M.getContext(), "then", &F);
+      auto *EndBB = BasicBlock::Create(M.getContext(), "end", &F);
+      Builder.CreateCondBr(Test, ThenBB, EndBB);
+      Builder.SetInsertPoint(ThenBB);
+      Builder.CreateStore(Builder.getInt64(0), OnceState);
+      auto *VTable = F.getArg(3);
+      auto *FnPtr = Builder.CreatePtrAdd(VTable, Builder.getInt64(24));
+      // core::ops::function::FnOnce::call_once{{vtable.shim}}
+      auto *VTableShim = Builder.CreateLoad(Builder.getPtrTy(), FnPtr);
+      Builder.CreateCall(
+          FunctionType::get(Builder.getVoidTy(),
+                            {Builder.getPtrTy(), Builder.getPtrTy()}, false),
+          VTableShim, {F.getArg(2), OnceState});
+      Builder.CreateStore(Builder.getInt32(3), F.getArg(0));
+      Builder.CreateBr(EndBB);
+      Builder.SetInsertPoint(EndBB);
       Builder.CreateRetVoid();
     }
   }
