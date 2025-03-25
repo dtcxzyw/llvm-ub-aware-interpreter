@@ -58,6 +58,10 @@ static cl::opt<bool>
                       cl::init(false), cl::cat(Category));
 static cl::opt<bool> RustMode("rust", cl::desc("Run rust programs"),
                               cl::init(false), cl::cat(Category));
+static cl::opt<bool>
+    IgnoreExplicitLifetimeMarker("ignore-explicit-lifetime-marker",
+                                 cl::desc("Ignore explicit lifetime markers"),
+                                 cl::init(false), cl::cat(Category));
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -87,6 +91,7 @@ int main(int argc, char **argv) {
   Option.DumpStackTrace = DumpStackTrace;
   Option.StorePoisonIsNoop = StorePoisonIsNoop;
   Option.RustMode = RustMode;
+  Option.IgnoreExplicitLifetimeMarker = IgnoreExplicitLifetimeMarker;
 
   UBAwareInterpreter Executor(*M, Option);
   int32_t Ret = Executor.runMain();

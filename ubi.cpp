@@ -1121,12 +1121,14 @@ bool UBAwareInterpreter::visitAllocaInst(AllocaInst &AI) {
               ContextSensitivePointerInfo::getDefault(CurrentFrame)};
   Obj->setLiveness(true);
   Obj->setStackObjectInfo(CurrentFrame);
-  for (auto *U : AI.users()) {
-    if (isa<LifetimeIntrinsic>(U)) {
-      // The returned object is initially dead if it is explicitly used by
-      // lifetime intrinsics.
-      Obj->setLiveness(false);
-      break;
+  if (!Option.IgnoreExplicitLifetimeMarker) {
+    for (auto *U : AI.users()) {
+      if (isa<LifetimeIntrinsic>(U)) {
+        // The returned object is initially dead if it is explicitly used by
+        // lifetime intrinsics.
+        Obj->setLiveness(false);
+        break;
+      }
     }
   }
   CurrentFrame->Allocas.push_back(std::move(Obj));
@@ -2225,6 +2227,9 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     return SingleValue{APInt(RetTy->getScalarSizeInBits(), Option.VScale)};
   case Intrinsic::lifetime_start:
   case Intrinsic::lifetime_end: {
+    if (Option.IgnoreExplicitLifetimeMarker)
+      return none();
+
     auto Size = getInt(Args[0].getSingleValue());
     if (!Size)
       ImmUBReporter(*this) << "call lifetime intrinsic with poison size";

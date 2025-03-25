@@ -362,6 +362,7 @@ struct InterpreterOption {
   bool TrackVolatileMem = false;
   bool VerifyValueTracking = false;
   bool IgnoreParamAttrsOnIntrinsic = false;
+  bool IgnoreExplicitLifetimeMarker = false;
   bool StorePoisonIsNoop = false;
   bool ReduceMode = false;
   bool RustMode = false;
