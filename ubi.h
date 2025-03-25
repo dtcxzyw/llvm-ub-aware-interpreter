@@ -114,7 +114,7 @@ public:
   void setLiveness(bool Alive) { IsAlive = Alive; }
   void markPoison(size_t Offset, size_t Size, bool IsPoison);
   void verifyMemAccess(const APInt &Offset, const size_t AccessSize,
-                       size_t Alignment);
+                       size_t Alignment, bool IsStore);
   void store(size_t Offset, const APInt &C);
   void markWrite(size_t Offset, size_t Size);
   PendingInitializeTask &pushPendingInitializeTask(Frame *Ctx);

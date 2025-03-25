@@ -38,9 +38,15 @@ void MemObject::markPoison(size_t Offset, size_t Size, bool IsPoison) {
     Metadata[I].IsPoison = IsPoison;
 }
 void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
-                                size_t Alignment) {
+                                size_t Alignment, bool IsStore) {
   if (!IsAlive)
     ImmUBReporter(Manager.Interpreter) << "Accessing dead object " << *this;
+  if (!IsStore) {
+    for (auto &Task : PendingInitializeTasks)
+      if (!Task.Ranges.empty())
+        ImmUBReporter(Manager.Interpreter)
+            << "Load during initialization of " << *this;
+  }
   auto NewAddr = Address + Offset;
   if (NewAddr.countr_zero() < Log2_64(Alignment))
     ImmUBReporter(Manager.Interpreter) << "Unaligned mem op";
@@ -57,6 +63,8 @@ void MemObject::store(size_t Offset, const APInt &C) {
   for (uint32_t I = 0; I != C.getNumWords(); ++I) {
     auto Word = C.getRawData()[I];
     if (WriteCnt + Scale <= Size) {
+      for (uint32_t J = 0; J != Scale; ++J)
+        Metadata[Offset + WriteCnt + J].IsPoison = false;
       memcpy(&WritePos[WriteCnt], &Word, sizeof(Word));
       WriteCnt += Scale;
       if (WriteCnt == Size)
@@ -64,6 +72,7 @@ void MemObject::store(size_t Offset, const APInt &C) {
     } else {
       for (auto J = 0; J != Scale; ++J) {
         WritePos[WriteCnt] = static_cast<std::byte>(Word & 255);
+        Metadata[Offset + WriteCnt].IsPoison = false;
         Word >>= 8;
         if (++WriteCnt == Size)
           return;
@@ -477,25 +486,11 @@ static void postProcessAttr(UBAwareInterpreter &Interpreter, AnyValue &V,
       if (isPoison(SV))
         return;
       auto &Ptr = std::get<Pointer>(SV);
-      if (!Ptr.Info.Readable) {
-        SV = poison();
-        return;
-      }
-      Ptr.Info.pushReadWrite(FrameCtx, true, false);
+      Ptr.Info.pushReadWrite(FrameCtx, Ptr.Info.Readable, false);
     });
   }
-  if (AS.hasAttribute(Attribute::WriteOnly)) {
-    postProcess(V, [FrameCtx](SingleValue &SV) {
-      if (isPoison(SV))
-        return;
-      auto &Ptr = std::get<Pointer>(SV);
-      if (!Ptr.Info.Writable) {
-        SV = poison();
-        return;
-      }
-      Ptr.Info.pushReadWrite(FrameCtx, false, true);
-    });
-  }
+  // For writeonly, read is also allowed if it is not observable outside the
+  // function. We do not model this for now.
 }
 static bool anyOfScalar(const AnyValue &V,
                         function_ref<bool(const SingleValue &)> F) {
@@ -774,7 +769,7 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/true);
-      MO->verifyMemAccess(PV->Offset, Size, Alignment);
+      MO->verifyMemAccess(PV->Offset, Size, Alignment, true);
       if (!IsVolatile)
         MO->markWrite(PV->Offset.getZExtValue(), Size);
       return store(*MO, PV->Offset.getZExtValue(), V, Ty);
@@ -796,7 +791,7 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/false);
-      MO->verifyMemAccess(PV->Offset, Size, Alignment);
+      MO->verifyMemAccess(PV->Offset, Size, Alignment, false);
       return load(*MO, PV->Offset.getZExtValue(), Ty);
     }
     ImmUBReporter(*this) << "load from invalid pointer";
@@ -1034,7 +1029,7 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
       ImmUBReporter(*this) << "load in a readnone context";
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
-    MO->verifyMemAccess(Ptr.Offset, Size, Alignment);
+    MO->verifyMemAccess(Ptr.Offset, Size, Alignment, IsStore);
     if (IsStore) {
       // FIXME: Approximation: assume all bytes to write are non-poison.
       MO->markPoison(Ptr.Offset.getSExtValue(), Size, false);
@@ -1891,11 +1886,11 @@ bool UBAwareInterpreter::visitStoreInst(StoreInst &SI) {
       if (isPoison(SV))
         return;
       // FIXME: This is too strict.
-      auto &Ptr = std::get<Pointer>(SV);
-      CaptureComponents Usage = CaptureComponents::All;
-      CaptureComponents Allowed = Ptr.Info.CI.getOtherComponents();
-      if ((Usage & Allowed) != Usage)
-        SV = poison();
+      // auto &Ptr = std::get<Pointer>(SV);
+      // CaptureComponents Usage = CaptureComponents::All;
+      // CaptureComponents Allowed = Ptr.Info.CI.getOtherComponents();
+      // if ((Usage & Allowed) != Usage)
+      //   SV = poison();
     });
   }
   store(getValue(SI.getPointerOperand()), SI.getAlign().value(),
@@ -2979,12 +2974,14 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
       llvm::make_scope_exit([&, Frame = CurrentFrame] { ExitFunc(Frame); });
   CurrentFrame = &CallFrame;
   PostProcessArgs();
+  if (Option.Verbose) {
+    errs() << "\n\nEntering function " << Func->getName() << '\n';
+    for (auto &&[Idx, Arg] : enumerate(Func->args()))
+      errs() << "  " << Arg << " = " << Args[Idx] << '\n';
+  }
   for (auto &Param : Func->args())
     CallFrame.ValueMap[&Param] = std::move(Args[Param.getArgNo()]);
 
-  if (Option.Verbose) {
-    errs() << "\n\nEntering function " << Func->getName() << '\n';
-  }
   CallFrame.BB = &Func->getEntryBlock();
   CallFrame.PC = CallFrame.BB->begin();
   while (!CallFrame.RetVal.has_value()) {
