@@ -2889,6 +2889,10 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
 
   SmallVector<std::shared_ptr<MemObject>> ByValTempObjects;
   SmallVector<MemObject *> InitializeMOs;
+  auto AddNoAlias = [&](Value *Locker, AnyValue &Ptr) {
+    // TODO: handle noalias
+  };
+
   auto PostProcessArgs = [&] {
     if (CB) {
       bool HandleParamAttr =
@@ -2919,8 +2923,11 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
 
         if (HandleParamAttr)
           postProcessAttr(*this, ArgVal, CB->getParamAttributes(Idx));
-        // Convert pointer loc to argmem
-        if (CB->getArgOperand(Idx)->getType()->isPtrOrPtrVectorTy()) {
+        if (CB->getArgOperand(Idx)->getType()->isPointerTy()) {
+          if (CB->paramHasAttr(Idx, Attribute::NoAlias))
+            AddNoAlias(Func->getArg(Idx), ArgVal);
+
+          // Convert pointer loc to argmem
           postProcess(ArgVal, [&](SingleValue &SV) {
             if (isPoison(SV))
               return;
@@ -2935,14 +2942,14 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
             if (!Initializes.empty()) {
               if (!InitializeMO) {
                 if (isPoison(ArgVal.getSingleValue()))
-                  ImmUBReporter(*this)
-                      << "Pass poison to an pointer argument with initializes";
+                  ImmUBReporter(*this) << "Pass poison to an pointer "
+                                          "argument with initializes";
                 auto &Ptr = std::get<Pointer>(ArgVal.getSingleValue());
                 auto MO = Ptr.Obj.lock();
                 if (!MO)
-                  ImmUBReporter(*this)
-                      << "Pass dangling pointer to an pointer argument with "
-                         "initializes";
+                  ImmUBReporter(*this) << "Pass dangling pointer to an "
+                                          "pointer argument with "
+                                          "initializes";
                 InitializeMO = MO.get();
                 InitializeOffset = Ptr.Offset.getSExtValue();
               }
@@ -2964,8 +2971,11 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
       }
     }
 
-    for (const auto &[Idx, Param] : enumerate(Func->args()))
-      postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
+    // Skip if the function attr is known via CB.
+    // FIXME: handle initializes
+    if (!CB || !CB->getCalledFunction())
+      for (const auto &[Idx, Param] : enumerate(Func->args()))
+        postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
   };
 
   auto ExitFunc = [&](Frame *OldFrame) {
@@ -3050,6 +3060,10 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
         if (Iter != CallFrame.ValueMap.end())
           verifyAnalysis(Iter->first, Iter->second, &*CallFrame.PC);
       }
+      auto *InnerCB = dyn_cast<CallBase>(CallFrame.PC);
+      if (InnerCB && InnerCB->getType()->isPointerTy() &&
+          InnerCB->returnDoesNotAlias())
+        AddNoAlias(InnerCB, CurrentFrame->ValueMap.find(InnerCB)->second);
       ++CallFrame.PC;
     }
     if (Option.Verbose)
