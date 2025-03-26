@@ -365,6 +365,7 @@ struct InterpreterOption {
   bool IgnoreExplicitLifetimeMarker = false;
   bool FillUninitializedMemWithPoison = false;
   bool CheckLoadBeforeInitialization = false;
+  bool CheckInitialization = false;
   bool StorePoisonIsNoop = false;
   bool ReduceMode = false;
   bool RustMode = false;

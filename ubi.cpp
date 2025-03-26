@@ -139,8 +139,10 @@ void PendingInitializeTask::write(uint64_t Offset, uint64_t Size) {
   for (auto &[Lo, Hi] : Ranges) {
     uint64_t IntersectLo = std::max(Lo, WriteLo),
              IntersectHi = std::min(Hi, WriteHi);
-    if (IntersectLo >= IntersectHi)
+    if (IntersectLo >= IntersectHi) {
+      NewRanges.emplace_back(Lo, Hi);
       continue;
+    }
     if (IntersectLo != Lo)
       NewRanges.emplace_back(Lo, IntersectLo);
     if (IntersectHi != Hi)
@@ -161,10 +163,15 @@ void MemObject::popPendingInitializeTask(Frame *Ctx) {
   erase_if(PendingInitializeTasks,
            [this, Ctx](const PendingInitializeTask &Task) {
              if (Task.Context == Ctx) {
-               if (!Task.Ranges.empty())
+               if (!Task.Ranges.empty()) {
+                 errs() << "Pending initialization tasks: ";
+                 for (auto &[Lo, Hi] : Task.Ranges)
+                   errs() << '[' << Lo << ", " << Hi << ") ";
+                 errs() << '\n';
                  ImmUBReporter(Manager.Interpreter)
                      << "Uninitialized memory region " << *this
                      << " after function return.";
+               }
                return true;
              }
              return false;
@@ -2974,7 +2981,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
             Ptr.Info.pushLoc(CurrentFrame, IRMemLocation::ArgMem);
           });
 
-          if (HandleParamAttr &&
+          if (Option.CheckInitialization && HandleParamAttr &&
               CB->paramHasAttr(Idx, Attribute::Initializes)) {
             auto Initializes =
                 CB->getParamAttr(Idx, Attribute::Initializes).getInitializes();
