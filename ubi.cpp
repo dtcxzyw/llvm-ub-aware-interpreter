@@ -2930,6 +2930,8 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
 }
 AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
                                   SmallVectorImpl<AnyValue> &Args) {
+  assert(!Func->isPresplitCoroutine() &&
+         "Do not support coroutine before it is split");
   auto FnAttrs = Func->getAttributes();
 
   SmallVector<std::shared_ptr<MemObject>> ByValTempObjects;
