@@ -103,7 +103,7 @@ We did some refinements on the LLVM LangRef to make the implementation practical
 + Addresses of allocations are unique. That is, we cannot model the behavior of stack coloring in llubi.
 + Pointer aliasing has not been supported yet.
 + Pointer provenance and capture tracking support is limited. We do not track the capabilities of pointers if it is stored into memory or converted to an integer.
-+ We do not maintain the precise poison semantics in memory when ```memcpy/memmove/memset``` is called.
++ We do not maintain the precise poison semantics in memory.
 + We do not check ```externally observable sideeffects``` strictly as required by ```memory(read)/readonly```. The current implementation just works for these two fuzzers.
 + Volatile memory accesses are partially supported. We only record total number of bytes that are loaded/stored via volatile memory ops.
 

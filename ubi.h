@@ -213,7 +213,7 @@ class MemoryManager final {
   UBAwareInterpreter &Interpreter;
   uint32_t PtrBitWidth;
   size_t AllocatedMem = 0;
-  static constexpr size_t Padding = 16U;
+  static constexpr size_t Padding = 1024U;
   std::map<size_t, MemObject *> AddressMap;
 
   friend class MemObject;
@@ -363,6 +363,7 @@ struct InterpreterOption {
   bool VerifyValueTracking = false;
   bool IgnoreParamAttrsOnIntrinsic = false;
   bool IgnoreExplicitLifetimeMarker = false;
+  bool FillUninitializedMemWithPoison = true;
   bool StorePoisonIsNoop = false;
   bool ReduceMode = false;
   bool RustMode = false;

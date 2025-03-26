@@ -68,7 +68,7 @@ void MemObject::store(size_t Offset, const APInt &C) {
   constexpr uint32_t Scale = sizeof(APInt::WordType);
   const size_t Size = alignTo(C.getBitWidth(), 8) / 8;
   uint32_t WriteCnt = 0;
-  std::byte *WritePos = Data.data() + Offset;
+  std::byte *const WritePos = Data.data() + Offset;
   for (uint32_t I = 0; I != C.getNumWords(); ++I) {
     auto Word = C.getRawData()[I];
     if (WriteCnt + Scale <= Size) {
@@ -94,7 +94,7 @@ std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
   constexpr uint32_t Scale = sizeof(APInt::WordType);
   const size_t Size = Res.getBitWidth() / 8;
   uint32_t ReadCnt = 0;
-  const std::byte *ReadPos = Data.data() + Offset;
+  const std::byte *const ReadPos = Data.data() + Offset;
   for (uint32_t I = 0; I != Res.getNumWords(); ++I) {
     auto &Word = const_cast<APInt::WordType &>(Res.getRawData()[I]);
     if (ReadCnt + Scale <= Size) {
@@ -103,7 +103,7 @@ std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
           return std::nullopt;
       }
       memcpy(&Word, &ReadPos[ReadCnt], sizeof(Word));
-      ReadPos += Scale;
+      ReadCnt += Scale;
       if (ReadCnt == Size)
         break;
     } else {
@@ -1131,6 +1131,8 @@ bool UBAwareInterpreter::visitAllocaInst(AllocaInst &AI) {
       }
     }
   }
+  if (Option.FillUninitializedMemWithPoison)
+    Obj->markPoison(0, AllocSize, true);
   CurrentFrame->Allocas.push_back(std::move(Obj));
   return addValue(AI, SingleValue{std::move(Ptr)});
 }
@@ -2247,7 +2249,9 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
           if (Option.ReduceMode && MO->size() != Size)
             ImmUBReporter(*this) << "call lifetime intrinsic with wrong size";
           if (MO->isAlive() || IID == Intrinsic::lifetime_start)
-            MO->markPoison(0, MO->size(), IID != Intrinsic::lifetime_start);
+            MO->markPoison(0, MO->size(),
+                           Option.FillUninitializedMemWithPoison ||
+                               IID != Intrinsic::lifetime_start);
           MO->setLiveness(IID == Intrinsic::lifetime_start);
         } else {
           MO->markPoison(0, MO->size(), true);
@@ -2295,14 +2299,36 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
       return none();
     auto CopySize = Size->getZExtValue();
     bool IsVolatile = getBooleanNonPoison(Args[3].getSingleValue());
-    auto Dst =
-        getRawPtr(Args[0].getSingleValue(), CopySize, 1U, true, IsVolatile);
-    auto Src =
-        getRawPtr(Args[1].getSingleValue(), CopySize, 1U, false, IsVolatile);
-    if (IID == Intrinsic::memmove)
-      std::memmove(Dst, Src, CopySize);
-    else
-      std::memcpy(Dst, Src, CopySize);
+    auto Dst = Args[0].getSingleValue();
+    auto Src = Args[1].getSingleValue();
+    uint32_t DstIndexWidth =
+        DL.getIndexTypeSizeInBits(II.getArgOperand(0)->getType());
+    uint32_t SrcIndexWidth =
+        DL.getIndexTypeSizeInBits(II.getArgOperand(1)->getType());
+    Type *ByteTy = Type::getInt8Ty(II.getContext());
+    auto ShouldCopyBackward = [](const SingleValue &A, const SingleValue &B) {
+      if (isPoison(A) || isPoison(B))
+        return false;
+      return std::get<Pointer>(A).Address.ult(std::get<Pointer>(B).Address);
+    };
+    if (IID == Intrinsic::memmove && ShouldCopyBackward(Src, Dst)) {
+      for (size_t I = 0; I != CopySize; ++I) {
+        size_t Offset = CopySize - 1 - I;
+        auto DstPtr =
+            computeGEP(Dst, APInt(DstIndexWidth, Offset, false, true), {});
+        auto SrcPtr =
+            computeGEP(Src, APInt(SrcIndexWidth, Offset, false, true), {});
+        auto Byte = load(SrcPtr, 1, ByteTy, IsVolatile);
+        store(DstPtr, 1, Byte, ByteTy, IsVolatile);
+      }
+    } else {
+      for (size_t I = 0; I != CopySize; ++I) {
+        auto DstPtr = computeGEP(Dst, APInt(DstIndexWidth, I, false, true), {});
+        auto SrcPtr = computeGEP(Src, APInt(SrcIndexWidth, I, false, true), {});
+        auto Byte = load(SrcPtr, 1, ByteTy, IsVolatile);
+        store(DstPtr, 1, Byte, ByteTy, IsVolatile);
+      }
+    }
     return none();
   }
   case Intrinsic::memset:
@@ -2923,6 +2949,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
                                      DL.getPrefTypeAlign(Ty).value());
           TmpMO->setLiveness(true);
           TmpMO->setStackObjectInfo(CurrentFrame);
+          // FIXME: propagate poison
           memcpy(TmpMO->rawPointer(), getRawPtr(ArgVal.getSingleValue()),
                  DL.getTypeStoreSize(Ty));
           ArgVal = SingleValue{
@@ -3112,7 +3139,7 @@ int32_t UBAwareInterpreter::runMain() {
   if (Option.ReduceMode) {
     for (auto &Arg : Entry->args())
       Args.push_back(getZero(Arg.getType()));
-  } else {
+  } else if (!Option.RustMode) {
     Args.push_back(SingleValue{APInt::getZero(32)});
     Args.push_back(SingleValue{*NullPtr});
   }
