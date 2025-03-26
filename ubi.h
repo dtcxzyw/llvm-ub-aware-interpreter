@@ -363,7 +363,8 @@ struct InterpreterOption {
   bool VerifyValueTracking = false;
   bool IgnoreParamAttrsOnIntrinsic = false;
   bool IgnoreExplicitLifetimeMarker = false;
-  bool FillUninitializedMemWithPoison = true;
+  bool FillUninitializedMemWithPoison = false;
+  bool CheckLoadBeforeInitialization = false;
   bool StorePoisonIsNoop = false;
   bool ReduceMode = false;
   bool RustMode = false;
@@ -410,6 +411,7 @@ public:
   explicit UBAwareInterpreter(Module &M, InterpreterOption Option);
 
   Frame *getCurrentFrame() const { return CurrentFrame; }
+  const InterpreterOption &getOption() const { return Option; }
   bool addValue(Instruction &I, AnyValue Val);
   bool jumpTo(BasicBlock *To);
   AnyValue getValue(Value *V);

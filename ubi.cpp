@@ -41,7 +41,8 @@ void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                                 size_t Alignment, bool IsStore) {
   if (!IsAlive)
     ImmUBReporter(Manager.Interpreter) << "Accessing dead object " << *this;
-  if (!IsStore) {
+  if (!IsStore &&
+      Manager.Interpreter.getOption().CheckLoadBeforeInitialization) {
     uint64_t Beg = Offset.getZExtValue();
     uint64_t End = Beg + AccessSize;
     for (auto &Task : PendingInitializeTasks)

@@ -66,6 +66,10 @@ static cl::opt<bool> FillUninitializedMemWithPoison(
     "fill-uninitialized-mem-with-poison",
     cl::desc("Fill uninitialized memory with poison to sync with alive2"),
     cl::init(false), cl::cat(Category));
+static cl::opt<bool> CheckLoadBeforeInitialization(
+    "check-load-before-initialization",
+    cl::desc("Check load before the initialization is complete"),
+    cl::init(false), cl::cat(Category));
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -97,6 +101,7 @@ int main(int argc, char **argv) {
   Option.RustMode = RustMode;
   Option.IgnoreExplicitLifetimeMarker = IgnoreExplicitLifetimeMarker;
   Option.FillUninitializedMemWithPoison = FillUninitializedMemWithPoison;
+  Option.CheckLoadBeforeInitialization = CheckLoadBeforeInitialization;
 
   UBAwareInterpreter Executor(*M, Option);
   int32_t Ret = Executor.runMain();
