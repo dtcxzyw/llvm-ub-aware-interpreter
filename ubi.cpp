@@ -668,6 +668,14 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
       return SingleValue{std::get<APInt>(V.getSingleValue())
                              .trunc(CE->getType()->getScalarSizeInBits())};
     }
+    case Instruction::IntToPtr: {
+      auto V = convertFromConstant(cast<Constant>(CE->getOperand(0)));
+      assert(V.isSingleValue());
+      if (isPoison(V.getSingleValue()))
+        return poison();
+      return SingleValue{
+          MemMgr.lookupPointer(std::get<APInt>(V.getSingleValue()))};
+    }
     default:
       break;
     }
