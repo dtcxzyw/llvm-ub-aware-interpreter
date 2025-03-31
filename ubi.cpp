@@ -829,7 +829,7 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
            ModRefInfo::Ref) != ModRefInfo::Ref) {
         if (!IsVolatile || (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
                             ModRefInfo::Mod) != ModRefInfo::Mod)
-          ImmUBReporter(*this) << "load in a readnone context";
+          ImmUBReporter(*this) << "load in a readnone context " << *MO;
       }
       auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
@@ -837,7 +837,7 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
       MO->verifyMemAccess(PV->Offset, Size, Alignment, false);
       return load(*MO, PV->Offset.getZExtValue(), Ty);
     }
-    ImmUBReporter(*this) << "load from invalid pointer";
+    ImmUBReporter(*this) << "load from invalid pointer " << *PV;
   }
   ImmUBReporter(*this) << "load from poison pointer";
   llvm_unreachable("Unreachable code");
@@ -880,8 +880,15 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
   if (Option.RustMode)
     patchRustLibFunc();
   for (auto &GV : M.globals()) {
-    if (!GV.hasExactDefinition())
+    if (!GV.hasExactDefinition()) {
+      if (Option.RustMode) {
+        if (GV.getName() == "__rust_no_alloc_shim_is_unstable") {
+          GlobalValues.insert(
+              {&GV, MemMgr.create(GV.getName().str(), false, 1, 1)});
+        }
+      }
       continue;
+    }
     GlobalValues.insert(
         {&GV, MemMgr.create(GV.getName().str(), false,
                             DL.getTypeAllocSize(GV.getValueType()),
@@ -2903,10 +2910,10 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
   case LibFunc_calloc: {
     auto Num = getInt(Args[0].getSingleValue());
     if (!Num)
-      ImmUBReporter(*this) << "malloc with poison count";
+      ImmUBReporter(*this) << "calloc with poison count";
     auto Size = getInt(Args[1].getSingleValue());
     if (!Size)
-      ImmUBReporter(*this) << "malloc with poison size";
+      ImmUBReporter(*this) << "calloc with poison size";
     return alloc(*Num * *Size, /*ZeroInitialize=*/true);
   }
   case LibFunc_free:
@@ -3061,6 +3068,39 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   }
 
   if (!Func->hasExactDefinition()) {
+    // Handle Rust allocator API
+    Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
+    auto Scope =
+        llvm::make_scope_exit([&, Frame = CurrentFrame] { ExitFunc(Frame); });
+    CurrentFrame = &CallFrame;
+    PostProcessArgs();
+    auto Kind = Func->getAttributes().getAllocKind();
+    if ((Kind & AllocFnKind::Alloc) == AllocFnKind::Alloc) {
+      Attribute Attr = CB->getFnAttr(Attribute::AllocSize);
+      if (Attr != Attribute()) {
+        auto AllocArgs = Attr.getAllocSizeArgs();
+        auto Size = getInt(Args[AllocArgs.first].getSingleValue());
+        if (!Size)
+          ImmUBReporter(*this) << "malloc with poison size";
+        // TODO: handle allocalign
+        bool ZeroInit =
+            (Kind & AllocFnKind::Uninitialized) != AllocFnKind::Uninitialized;
+        return alloc(*Size,
+                     /*ZeroInitialize=*/ZeroInit);
+      }
+    } else if ((Kind & AllocFnKind::Free) == AllocFnKind::Free) {
+      auto &Ptr = Args[0].getSingleValue();
+      if (isPoison(Ptr))
+        ImmUBReporter(*this) << "free with poison ptr";
+      auto &PtrVal = std::get<Pointer>(Ptr);
+      if (!PtrVal.Offset.isZero())
+        ImmUBReporter(*this) << "free with invalid ptr";
+      if (auto MO = PtrVal.Obj.lock())
+        AllocatedMems.erase(MO);
+      else
+        ImmUBReporter(*this) << "free with invalid ptr";
+      return none();
+    }
     errs() << "Do not know how to handle " << *Func << '\n';
     std::exit(EXIT_FAILURE);
   }
