@@ -780,16 +780,19 @@ AnyValue UBAwareInterpreter::load(const MemObject &MO, uint32_t Offset,
     auto Addr = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
     if (!Addr.has_value())
       return poison();
-    auto &Metadata = MO.getMetadata(Offset);
     auto Ptr = MemMgr.lookupPointer(*Addr);
     if (isPoison(Ptr))
       return poison();
-    auto &PtrRef = std::get<Pointer>(Ptr);
-    PtrRef.Info.push(CurrentFrame);
-    PtrRef.Info.Readable = Metadata.Readable;
-    PtrRef.Info.Writable = Metadata.Writable;
-    PtrRef.Info.Comparable = Metadata.Comparable;
-    PtrRef.Info.ComparableWithNull = Metadata.ComparableWithNull;
+    // FIXME: Capture info should not be applied before the current function
+    // returns.
+    //
+    // auto &Metadata = MO.getMetadata(Offset);
+    // auto &PtrRef = std::get<Pointer>(Ptr);
+    // PtrRef.Info.push(CurrentFrame);
+    // PtrRef.Info.Readable = Metadata.Readable;
+    // PtrRef.Info.Writable = Metadata.Writable;
+    // PtrRef.Info.Comparable = Metadata.Comparable;
+    // PtrRef.Info.ComparableWithNull = Metadata.ComparableWithNull;
     return std::move(Ptr);
   } else if (auto *StructTy = dyn_cast<StructType>(Ty)) {
     auto *Layout = DL.getStructLayout(StructTy);
