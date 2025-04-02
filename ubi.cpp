@@ -2670,8 +2670,16 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
   }
   case Intrinsic::fmuladd: {
     return visitFPTriOp(RetTy, FMF, Args[0], Args[1], Args[2],
-                        [](const APFloat &X, const APFloat &Y, const APFloat &Z)
-                            -> std::optional<APFloat> { return X * Y + Z; });
+                        [&](const APFloat &X, const APFloat &Y,
+                            const APFloat &Z) -> std::optional<APFloat> {
+                          if (Option.FuseFMulAdd) {
+                            auto Res = X;
+                            Res.fusedMultiplyAdd(
+                                Y, Z, RoundingMode::NearestTiesToEven);
+                            return Res;
+                          }
+                          return X * Y + Z;
+                        });
   }
   case Intrinsic::is_fpclass: {
     FPClassTest Mask = static_cast<FPClassTest>(

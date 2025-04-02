@@ -74,6 +74,9 @@ static cl::opt<bool> CheckInitialization(
     "check-initialization",
     cl::desc("Check initializes after the function returns"), cl::init(false),
     cl::cat(Category));
+static cl::opt<bool> FuseFMulAdd("fuse-fmuladd",
+                                 cl::desc("Treat fmuladd as fma"),
+                                 cl::init(false), cl::cat(Category));
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -107,6 +110,7 @@ int main(int argc, char **argv) {
   Option.FillUninitializedMemWithPoison = FillUninitializedMemWithPoison;
   Option.CheckLoadBeforeInitialization = CheckLoadBeforeInitialization;
   Option.CheckInitialization = CheckInitialization;
+  Option.FuseFMulAdd = FuseFMulAdd;
 
   UBAwareInterpreter Executor(*M, Option);
   int32_t Ret = Executor.runMain();

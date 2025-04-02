@@ -367,6 +367,7 @@ struct InterpreterOption {
   bool CheckLoadBeforeInitialization = false;
   bool CheckInitialization = false;
   bool StorePoisonIsNoop = false;
+  bool FuseFMulAdd = false;
   bool ReduceMode = false;
   bool RustMode = false;
 };
