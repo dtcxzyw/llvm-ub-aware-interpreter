@@ -34,8 +34,11 @@ public:
 
 MemObject::~MemObject() { Manager.erase(Address.getZExtValue()); }
 void MemObject::markPoison(size_t Offset, size_t Size, bool IsPoison) {
-  for (size_t I = Offset; I != Offset + Size; ++I)
+  for (size_t I = Offset; I != Offset + Size; ++I) {
     Metadata[I].IsPoison = IsPoison;
+    Metadata[I].Readable = Metadata[I].Writable = Metadata[I].Comparable =
+        Metadata[I].ComparableWithNull = IsPoison;
+  }
 }
 void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                                 size_t Alignment, bool IsStore) {
@@ -716,6 +719,23 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
     }
     auto &Ptr = std::get<Pointer>(SV);
     MO.store(Offset, Ptr.Address);
+    auto &PtrPermission = MO.getMetadata(Offset);
+    PtrPermission.Comparable =
+        Ptr.Info.Comparable &&
+        (Ptr.Info.CI.getOtherComponents() & CaptureComponents::Address) ==
+            CaptureComponents::Address;
+    PtrPermission.ComparableWithNull =
+        Ptr.Info.ComparableWithNull &&
+        (Ptr.Info.CI.getOtherComponents() & CaptureComponents::AddressIsNull) ==
+            CaptureComponents::AddressIsNull;
+    PtrPermission.Readable =
+        Ptr.Info.Readable && ((Ptr.Info.CI.getOtherComponents() &
+                               CaptureComponents::ReadProvenance) ==
+                              CaptureComponents::ReadProvenance);
+    PtrPermission.Writable =
+        Ptr.Info.Writable &&
+        ((Ptr.Info.CI.getOtherComponents() & CaptureComponents::Provenance) ==
+         CaptureComponents::Provenance);
   } else if (Ty->isVectorTy()) {
     Type *EltTy = Ty->getScalarType();
     auto Step = DL.getTypeStoreSize(EltTy);
@@ -760,7 +780,17 @@ AnyValue UBAwareInterpreter::load(const MemObject &MO, uint32_t Offset,
     auto Addr = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
     if (!Addr.has_value())
       return poison();
-    return SingleValue{MemMgr.lookupPointer(*Addr)};
+    auto &Metadata = MO.getMetadata(Offset);
+    auto Ptr = MemMgr.lookupPointer(*Addr);
+    if (isPoison(Ptr))
+      return poison();
+    auto &PtrRef = std::get<Pointer>(Ptr);
+    PtrRef.Info.push(CurrentFrame);
+    PtrRef.Info.Readable = Metadata.Readable;
+    PtrRef.Info.Writable = Metadata.Writable;
+    PtrRef.Info.Comparable = Metadata.Comparable;
+    PtrRef.Info.ComparableWithNull = Metadata.ComparableWithNull;
+    return std::move(Ptr);
   } else if (auto *StructTy = dyn_cast<StructType>(Ty)) {
     auto *Layout = DL.getStructLayout(StructTy);
     std::vector<AnyValue> Res;
@@ -1943,21 +1973,9 @@ bool UBAwareInterpreter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   return addValue(SVI, std::move(PickedValues));
 }
 bool UBAwareInterpreter::visitStoreInst(StoreInst &SI) {
-  AnyValue StoreVal = getValue(SI.getValueOperand());
-  if (SI.getAccessType()->isPtrOrPtrVectorTy()) {
-    postProcess(StoreVal, [&](SingleValue &SV) {
-      if (isPoison(SV))
-        return;
-      // FIXME: This is too strict.
-      // auto &Ptr = std::get<Pointer>(SV);
-      // CaptureComponents Usage = CaptureComponents::All;
-      // CaptureComponents Allowed = Ptr.Info.CI.getOtherComponents();
-      // if ((Usage & Allowed) != Usage)
-      //   SV = poison();
-    });
-  }
   store(getValue(SI.getPointerOperand()), SI.getAlign().value(),
-        std::move(StoreVal), SI.getValueOperand()->getType(), SI.isVolatile());
+        getValue(SI.getValueOperand()), SI.getValueOperand()->getType(),
+        SI.isVolatile());
   return true;
 }
 void UBAwareInterpreter::handleRangeMetadata(AnyValue &V, Instruction &I) {
@@ -2045,9 +2063,7 @@ bool UBAwareInterpreter::visitPtrToInt(PtrToIntInst &I) {
     if (isPoison(V))
       return poison();
     auto &Ptr = std::get<Pointer>(V);
-    if (Ptr.Info.Comparable)
-      return Ptr.Address;
-    return poison();
+    return Ptr.Address;
   });
 }
 APInt UBAwareInterpreter::readBits(const APInt &Src, uint32_t &Offset,

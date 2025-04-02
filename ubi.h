@@ -80,8 +80,15 @@ class MemoryManager;
 struct Frame;
 
 struct MemByteMetadata {
-  bool IsPoison = false;
+  bool IsPoison : 1 = false;
+  // Pointer permission info
+  bool Readable : 1 = false;
+  bool Writable : 1 = false;
+  bool Comparable : 1 = false;
+  bool ComparableWithNull : 1 = false;
 };
+
+static_assert(sizeof(MemByteMetadata) == 1, "MemByteMetadata should be 1 byte");
 
 struct PendingInitializeTask {
   Frame *Context;
@@ -113,6 +120,10 @@ public:
   void markConstant() { IsConstant = true; }
   void setLiveness(bool Alive) { IsAlive = Alive; }
   void markPoison(size_t Offset, size_t Size, bool IsPoison);
+  MemByteMetadata &getMetadata(size_t Offset) { return Metadata[Offset]; }
+  const MemByteMetadata &getMetadata(size_t Offset) const {
+    return Metadata[Offset];
+  }
   void verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                        size_t Alignment, bool IsStore);
   void store(size_t Offset, const APInt &C);
