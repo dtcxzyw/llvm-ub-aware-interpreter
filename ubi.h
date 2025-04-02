@@ -371,7 +371,6 @@ struct InterpreterOption {
   double EMIUseProb = 0.001;
 
   bool TrackVolatileMem = false;
-  bool VerifyValueTracking = false;
   bool IgnoreParamAttrsOnIntrinsic = false;
   bool IgnoreExplicitLifetimeMarker = false;
   bool FillUninitializedMemWithPoison = false;
@@ -379,6 +378,8 @@ struct InterpreterOption {
   bool CheckInitialization = false;
   bool StorePoisonIsNoop = false;
   bool FuseFMulAdd = false;
+
+  bool VerifyValueTracking = false;
   bool ReduceMode = false;
   bool RustMode = false;
 };
