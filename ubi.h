@@ -90,13 +90,6 @@ struct MemByteMetadata {
 
 static_assert(sizeof(MemByteMetadata) == 1, "MemByteMetadata should be 1 byte");
 
-struct PendingInitializeTask {
-  Frame *Context;
-  SmallVector<std::pair<uint64_t, uint64_t>, 1> Ranges;
-
-  void write(uint64_t Offset, uint64_t Size);
-};
-
 class MemObject final : public std::enable_shared_from_this<MemObject> {
   MemoryManager &Manager;
   std::string Name;
@@ -105,7 +98,6 @@ class MemObject final : public std::enable_shared_from_this<MemObject> {
   APInt Address;
   SmallVector<std::byte, 16> Data;
   SmallVector<MemByteMetadata, 16> Metadata;
-  SmallVector<PendingInitializeTask, 1> PendingInitializeTasks;
   bool IsAlive;
   bool IsConstant;
 
@@ -127,9 +119,6 @@ public:
   void verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                        size_t Alignment, bool IsStore);
   void store(size_t Offset, const APInt &C);
-  void markWrite(size_t Offset, size_t Size);
-  PendingInitializeTask &pushPendingInitializeTask(Frame *Ctx);
-  void popPendingInitializeTask(Frame *Ctx);
   std::optional<APInt> load(size_t Offset, size_t Bits) const;
   APInt address() const { return Address; }
   size_t size() const { return Data.size(); }
@@ -374,8 +363,6 @@ struct InterpreterOption {
   bool IgnoreParamAttrsOnIntrinsic = false;
   bool IgnoreExplicitLifetimeMarker = false;
   bool FillUninitializedMemWithPoison = false;
-  bool CheckLoadBeforeInitialization = false;
-  bool CheckInitialization = false;
   bool StorePoisonIsNoop = false;
   bool FuseFMulAdd = false;
 
