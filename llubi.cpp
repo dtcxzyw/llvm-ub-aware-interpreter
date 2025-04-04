@@ -69,10 +69,10 @@ static cl::opt<bool> FillUninitializedMemWithPoison(
 static cl::opt<bool> CheckLoadBeforeInitialization(
     "check-load-before-initialization",
     cl::desc("Check load before the initialization is complete"),
-    cl::init(false), cl::cat(Category));
+    cl::init(true), cl::cat(Category));
 static cl::opt<bool> CheckInitialization(
     "check-initialization",
-    cl::desc("Check initializes after the function returns"), cl::init(false),
+    cl::desc("Check initializes after the function returns"), cl::init(true),
     cl::cat(Category));
 static cl::opt<bool> FuseFMulAdd("fuse-fmuladd",
                                  cl::desc("Treat fmuladd as fma"),

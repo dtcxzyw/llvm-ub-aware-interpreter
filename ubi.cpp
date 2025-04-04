@@ -44,22 +44,6 @@ void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                                 size_t Alignment, bool IsStore) {
   if (!IsAlive)
     ImmUBReporter(Manager.Interpreter) << "Accessing dead object " << *this;
-  if (!IsStore &&
-      Manager.Interpreter.getOption().CheckLoadBeforeInitialization) {
-    uint64_t Beg = Offset.getZExtValue();
-    uint64_t End = Beg + AccessSize;
-    for (auto &Task : PendingInitializeTasks)
-      for (auto &R : Task.Ranges) {
-        uint64_t Lo = std::max(R.first, Beg);
-        uint64_t Hi = std::min(R.second, End);
-        if (Lo < Hi) {
-          ImmUBReporter(Manager.Interpreter)
-              << "Load during initialization of " << *this << " Load [" << Beg
-              << ", " << End << ") PendingWrite [" << R.first << ", "
-              << R.second << ')';
-        }
-      }
-  }
   auto NewAddr = Address + Offset;
   if (NewAddr.countr_zero() < Log2_64(Alignment))
     ImmUBReporter(Manager.Interpreter) << "Unaligned mem op";
@@ -94,6 +78,21 @@ void MemObject::store(size_t Offset, const APInt &C) {
   }
 }
 std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
+  if (Manager.Interpreter.getOption().CheckLoadBeforeInitialization) {
+    uint64_t Beg = Offset;
+    uint64_t End = Beg + Bits / 8;
+    for (auto &Task : PendingInitializeTasks)
+      for (auto &R : Task.Ranges) {
+        uint64_t Lo = std::max(R.first, Beg);
+        uint64_t Hi = std::min(R.second, End);
+        if (Lo < Hi) {
+          // FIXME: This is incorrect for partial initialized ranges.
+          // Return undef if the range is not initialized
+          return APInt::getZero(Bits);
+        }
+      }
+  }
+
   APInt Res = APInt::getZero(alignTo(Bits, 8));
   constexpr uint32_t Scale = sizeof(APInt::WordType);
   const size_t Size = Res.getBitWidth() / 8;
@@ -165,19 +164,16 @@ PendingInitializeTask &MemObject::pushPendingInitializeTask(Frame *Ctx) {
 void MemObject::popPendingInitializeTask(Frame *Ctx) {
   erase_if(PendingInitializeTasks,
            [this, Ctx](const PendingInitializeTask &Task) {
-             if (Task.Context == Ctx) {
-               if (!Task.Ranges.empty()) {
-                 errs() << "Pending initialization tasks: ";
-                 for (auto &[Lo, Hi] : Task.Ranges)
-                   errs() << '[' << Lo << ", " << Hi << ") ";
-                 errs() << '\n';
-                 ImmUBReporter(Manager.Interpreter)
-                     << "Uninitialized memory region " << *this
-                     << " after function return.";
-               }
-               return true;
+             if (Task.Context != Ctx)
+               return false;
+
+             // Fill these bytes with undef
+             for (auto &[Lo, Hi] : Task.Ranges) {
+               markPoison(Lo, Hi - Lo, false);
+               memset(Data.data() + Lo, 0, Hi - Lo);
              }
-             return false;
+
+             return true;
            });
 }
 
