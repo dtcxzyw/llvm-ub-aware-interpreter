@@ -395,6 +395,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   SimplifyQuery getSQ(const Instruction *CxtI) const;
   void verifyAnalysis(Value *V, const AnyValue &RV, const Instruction *CxtI);
   uint32_t getVectorLength(VectorType *Ty) const;
+  uint32_t getFixedSize(TypeSize Size) const;
   AnyValue getPoison(Type *Ty) const;
   AnyValue getZero(Type *Ty) const;
   AnyValue convertFromConstant(Constant *V) const;

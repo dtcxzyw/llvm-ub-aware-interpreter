@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <utility>
+#include <vector>
 
 class ImmUBReporter final {
   raw_ostream &Out;
@@ -495,6 +496,11 @@ uint32_t UBAwareInterpreter::getVectorLength(VectorType *Ty) const {
     return EC.getFixedValue();
   return EC.getKnownMinValue() * Option.VScale;
 }
+uint32_t UBAwareInterpreter::getFixedSize(TypeSize Size) const {
+  if (Size.isScalable())
+    return Size.getKnownMinValue() * Option.VScale;
+  return Size.getFixedValue();
+}
 AnyValue UBAwareInterpreter::getPoison(Type *Ty) const {
   if (Ty->isIntegerTy() || Ty->isFloatingPointTy() || Ty->isPointerTy())
     return poison();
@@ -780,7 +786,7 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
         // from and then the same value is written back.
         ImmUBReporter(*this) << "store in a writenone context";
       }
-      auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
+      auto Size = getFixedSize(DL.getTypeStoreSize(Ty));
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/true);
       MO->verifyMemAccess(PV->Offset, Size, Alignment, true);
@@ -1706,6 +1712,15 @@ AnyValue UBAwareInterpreter::freezeValue(const AnyValue &Val, Type *Ty) {
     }
     return std::move(Res);
   }
+  if (auto *ArrTy = dyn_cast<ArrayType>(Ty)) {
+    uint32_t Len = ArrTy->getArrayNumElements();
+    auto *EltTy = ArrTy->getArrayElementType();
+    std::vector<AnyValue> Res;
+    Res.reserve(Len);
+    for (uint32_t I = 0; I != Len; ++I)
+      Res.push_back(freezeValue(Val.getValueArray().at(I), EltTy));
+    return std::move(Res);
+  }
   return visitUnOp(
       Ty, Val,
       [&](const SingleValue &C) -> SingleValue {
@@ -1888,7 +1903,11 @@ bool UBAwareInterpreter::visitInsertElementInst(InsertElementInst &IEI) {
   auto Idx = getInt(IEI.getOperand(2));
   if (!Idx.has_value() || Idx->uge(Res.getValueArray().size()))
     return addValue(IEI, getPoison(IEI.getType()));
-  Res.getValueArray().at(Idx->getZExtValue()) = std::move(Insert);
+  uint32_t DstLen = Res.getValueArray().size();
+  uint32_t Step =
+      cast<VectorType>(IEI.getType())->getElementCount().getKnownMinValue();
+  for (uint32_t Off = 0; Off != DstLen; Off += Step)
+    Res.getValueArray().at(Idx->getZExtValue() + Off) = Insert;
   return addValue(IEI, std::move(Res));
 }
 bool UBAwareInterpreter::visitExtractElementInst(ExtractElementInst &EEI) {
@@ -1899,22 +1918,27 @@ bool UBAwareInterpreter::visitExtractElementInst(ExtractElementInst &EEI) {
   return addValue(EEI, std::move(Src.getValueArray().at(Idx->getZExtValue())));
 }
 bool UBAwareInterpreter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
-  assert(!SVI.getType()->isScalableTy() && "Not implemented");
   auto LHS = getValue(SVI.getOperand(0));
-  uint32_t Size = LHS.getValueArray().size();
+  uint32_t Size = cast<VectorType>(SVI.getOperand(0)->getType())
+                      ->getElementCount()
+                      .getKnownMinValue();
   bool RHSIsPoison = isa<PoisonValue>(SVI.getOperand(1));
   auto RHS = RHSIsPoison ? AnyValue{} : getValue(SVI.getOperand(1));
   std::vector<AnyValue> PickedValues;
-  PickedValues.reserve(SVI.getShuffleMask().size());
-  for (auto Idx : SVI.getShuffleMask()) {
-    if (Idx == PoisonMaskElem)
-      PickedValues.push_back(poison());
-    else if (Idx < static_cast<int32_t>(Size))
-      PickedValues.push_back(LHS.getSingleValueAt(Idx));
-    else if (RHSIsPoison)
-      PickedValues.push_back(getPoison(SVI.getType()->getScalarType()));
-    else
-      PickedValues.push_back(RHS.getSingleValueAt(Idx - Size));
+  uint32_t DstLen = getVectorLength(SVI.getType());
+  PickedValues.reserve(DstLen);
+  uint32_t Stride = SVI.getShuffleMask().size();
+  for (uint32_t Off = 0; Off != DstLen; Off += Stride) {
+    for (auto Idx : SVI.getShuffleMask()) {
+      if (Idx == PoisonMaskElem)
+        PickedValues.push_back(poison());
+      else if (Idx < static_cast<int32_t>(Size))
+        PickedValues.push_back(LHS.getSingleValueAt(Idx + Off));
+      else if (RHSIsPoison)
+        PickedValues.push_back(getPoison(SVI.getType()->getScalarType()));
+      else
+        PickedValues.push_back(RHS.getSingleValueAt(Idx - Size + Off));
+    }
   }
   return addValue(SVI, std::move(PickedValues));
 }
@@ -2203,6 +2227,10 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
   Type *RetTy = II.getType();
   FastMathFlags FMF =
       isa<FPMathOperator>(II) ? II.getFastMathFlags() : FastMathFlags();
+  auto PadVPResult = [](std::vector<AnyValue> &Res, uint32_t Len) {
+    Res.resize(Len, poison());
+  };
+
   switch (IID) {
   case Intrinsic::ssa_copy:
   case Intrinsic::expect:
@@ -2211,6 +2239,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
   case Intrinsic::donothing:
     return none();
   case Intrinsic::vscale:
+    // TODO: check vscale_range
     return SingleValue{APInt(RetTy->getScalarSizeInBits(), Option.VScale)};
   case Intrinsic::lifetime_start:
   case Intrinsic::lifetime_end: {
@@ -2759,6 +2788,111 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
       (void)(IsExact);
       return V;
     });
+  }
+  case Intrinsic::stepvector: {
+    std::vector<AnyValue> Res;
+    uint32_t Len = getVectorLength(cast<VectorType>(RetTy));
+    uint32_t BitWidth = RetTy->getScalarSizeInBits();
+    Res.reserve(Len);
+    for (uint32_t I = 0; I != Len; ++I)
+      Res.push_back(SingleValue{APInt(BitWidth, I, false, true)});
+    return std::move(Res);
+  }
+  case Intrinsic::get_active_lane_mask: {
+    auto Base = getInt(Args[0].getSingleValue());
+    if (!Base)
+      return getPoison(RetTy);
+    auto N = getInt(Args[1].getSingleValue());
+    if (!N || N->isZero())
+      return getPoison(RetTy);
+    std::vector<AnyValue> Res;
+    uint32_t Len = getVectorLength(cast<VectorType>(RetTy));
+    Res.reserve(Len);
+    for (uint32_t I = 0; I != Len; ++I) {
+      bool Val = (*Base + I).ult(*N);
+      Res.push_back(SingleValue{APInt(1, Val, false, true)});
+    }
+    return std::move(Res);
+  }
+  case Intrinsic::masked_scatter: {
+    auto &Values = Args[0].getValueArray();
+    auto &Ptrs = Args[1].getValueArray();
+    auto Align = getInt(Args[2].getSingleValue())->getZExtValue();
+    auto &Mask = Args[3].getValueArray();
+    auto *ValTy = cast<VectorType>(II.getArgOperand(0)->getType());
+    auto *AccessTy = ValTy->getScalarType();
+    uint32_t Len = getVectorLength(ValTy);
+    for (uint32_t I = 0; I != Len; ++I) {
+      auto &Value = Values[I];
+      auto &Ptr = Ptrs[I];
+      auto MaskVal = getInt(Mask[I].getSingleValue());
+      if (getBooleanNonPoison(Mask[I].getSingleValue()))
+        store(Ptr, Align, Value, AccessTy, false);
+    }
+    return none();
+  }
+  case Intrinsic::masked_gather: {
+    auto &Ptrs = Args[0].getValueArray();
+    auto Align = getInt(Args[1].getSingleValue())->getZExtValue();
+    auto &Mask = Args[2].getValueArray();
+    auto &PassThru = Args[3].getValueArray();
+    auto *ValTy = cast<VectorType>(RetTy);
+    auto *AccessTy = ValTy->getScalarType();
+    uint32_t Len = getVectorLength(ValTy);
+    std::vector<AnyValue> Values;
+    Values.reserve(Len);
+    for (uint32_t I = 0; I != Len; ++I) {
+      auto &Ptr = Ptrs[I];
+      if (getBooleanNonPoison(Mask[I].getSingleValue()))
+        Values.push_back(load(Ptr, Align, AccessTy, false));
+      else
+        Values.push_back(PassThru[I]);
+    }
+    return std::move(Values);
+  }
+  case Intrinsic::experimental_vp_strided_load: {
+    auto Ptr = Args[0].getSingleValue();
+    auto Stride = getInt(Args[1].getSingleValue());
+    if (!Stride)
+      ImmUBReporter(*this) << "llvm.vp.strided.load with poison stride";
+    auto &Mask = Args[2].getValueArray();
+    auto Evl = getInt(Args[3].getSingleValue());
+    auto *EltTy = RetTy->getScalarType();
+    uint32_t Len = getVectorLength(cast<VectorType>(RetTy));
+    uint32_t Align = II.getParamAlign(0).valueOrOne().value();
+    if (!Evl || Evl->ugt(Len))
+      ImmUBReporter(*this) << "llvm.vp.strided.load with invalid evl " << Evl;
+    std::vector<AnyValue> Values;
+    Values.reserve(Len);
+    for (uint32_t I = 0; I != Evl->getZExtValue(); ++I) {
+      if (getBooleanNonPoison(Mask[I].getSingleValue()))
+        Values.push_back(load(Ptr, Align, EltTy, false));
+      else
+        Values.push_back(poison());
+      Ptr = computeGEP(Ptr, *Stride, GEPNoWrapFlags::none());
+    }
+    PadVPResult(Values, Len);
+    return std::move(Values);
+  }
+  case Intrinsic::experimental_vp_strided_store: {
+    auto &Val = Args[0].getValueArray();
+    auto Ptr = Args[1].getSingleValue();
+    auto Stride = getInt(Args[2].getSingleValue());
+    if (!Stride)
+      ImmUBReporter(*this) << "llvm.vp.strided.store with poison stride";
+    auto &Mask = Args[3].getValueArray();
+    auto Evl = getInt(Args[4].getSingleValue());
+    auto *EltTy = RetTy->getScalarType();
+    uint32_t Len = getVectorLength(cast<VectorType>(RetTy));
+    uint32_t Align = II.getParamAlign(1).valueOrOne().value();
+    if (!Evl || Evl->ugt(Len))
+      ImmUBReporter(*this) << "llvm.vp.strided.load with invalid evl " << Evl;
+    for (uint32_t I = 0; I != Evl->getZExtValue(); ++I) {
+      if (getBooleanNonPoison(Mask[I].getSingleValue()))
+        store(Ptr, Align, Val[I], EltTy, false);
+      Ptr = computeGEP(Ptr, *Stride, GEPNoWrapFlags::none());
+    }
+    return none();
   }
   default:
     break;
