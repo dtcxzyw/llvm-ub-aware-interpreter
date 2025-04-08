@@ -66,14 +66,6 @@ static cl::opt<bool> FillUninitializedMemWithPoison(
     "fill-uninitialized-mem-with-poison",
     cl::desc("Fill uninitialized memory with poison to sync with alive2"),
     cl::init(false), cl::cat(Category));
-static cl::opt<bool> CheckLoadBeforeInitialization(
-    "check-load-before-initialization",
-    cl::desc("Check load before the initialization is complete"),
-    cl::init(false), cl::cat(Category));
-static cl::opt<bool> CheckInitialization(
-    "check-initialization",
-    cl::desc("Check initializes after the function returns"), cl::init(false),
-    cl::cat(Category));
 static cl::opt<bool> FuseFMulAdd("fuse-fmuladd",
                                  cl::desc("Treat fmuladd as fma"),
                                  cl::init(false), cl::cat(Category));
@@ -108,8 +100,6 @@ int main(int argc, char **argv) {
   Option.RustMode = RustMode;
   Option.IgnoreExplicitLifetimeMarker = IgnoreExplicitLifetimeMarker;
   Option.FillUninitializedMemWithPoison = FillUninitializedMemWithPoison;
-  Option.CheckLoadBeforeInitialization = CheckLoadBeforeInitialization;
-  Option.CheckInitialization = CheckInitialization;
   Option.FuseFMulAdd = FuseFMulAdd;
 
   UBAwareInterpreter Executor(*M, Option);

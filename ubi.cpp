@@ -44,22 +44,6 @@ void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
                                 size_t Alignment, bool IsStore) {
   if (!IsAlive)
     ImmUBReporter(Manager.Interpreter) << "Accessing dead object " << *this;
-  if (!IsStore &&
-      Manager.Interpreter.getOption().CheckLoadBeforeInitialization) {
-    uint64_t Beg = Offset.getZExtValue();
-    uint64_t End = Beg + AccessSize;
-    for (auto &Task : PendingInitializeTasks)
-      for (auto &R : Task.Ranges) {
-        uint64_t Lo = std::max(R.first, Beg);
-        uint64_t Hi = std::min(R.second, End);
-        if (Lo < Hi) {
-          ImmUBReporter(Manager.Interpreter)
-              << "Load during initialization of " << *this << " Load [" << Beg
-              << ", " << End << ") PendingWrite [" << R.first << ", "
-              << R.second << ')';
-        }
-      }
-  }
   auto NewAddr = Address + Offset;
   if (NewAddr.countr_zero() < Log2_64(Alignment))
     ImmUBReporter(Manager.Interpreter) << "Unaligned mem op";
@@ -132,53 +116,6 @@ void MemObject::dumpName(raw_ostream &Out) const {
 void MemObject::dump(raw_ostream &Out) const {
   Out << (IsLocal ? '%' : '@') << Name << " (Addr = " << Address << ", "
       << "Size = " << Data.size() << (IsAlive ? "" : ", dead") << ')';
-}
-void PendingInitializeTask::write(uint64_t Offset, uint64_t Size) {
-  if (Ranges.empty())
-    return;
-
-  uint64_t WriteLo = Offset, WriteHi = Offset + Size;
-  SmallVector<std::pair<uint64_t, uint64_t>, 1> NewRanges;
-  for (auto &[Lo, Hi] : Ranges) {
-    uint64_t IntersectLo = std::max(Lo, WriteLo),
-             IntersectHi = std::min(Hi, WriteHi);
-    if (IntersectLo >= IntersectHi) {
-      NewRanges.emplace_back(Lo, Hi);
-      continue;
-    }
-    if (IntersectLo != Lo)
-      NewRanges.emplace_back(Lo, IntersectLo);
-    if (IntersectHi != Hi)
-      NewRanges.emplace_back(IntersectHi, Hi);
-  }
-
-  Ranges.swap(NewRanges);
-}
-void MemObject::markWrite(size_t Offset, size_t Size) {
-  for (auto &Task : PendingInitializeTasks)
-    Task.write(Offset, Size);
-}
-PendingInitializeTask &MemObject::pushPendingInitializeTask(Frame *Ctx) {
-  PendingInitializeTasks.push_back(PendingInitializeTask{Ctx});
-  return PendingInitializeTasks.back();
-}
-void MemObject::popPendingInitializeTask(Frame *Ctx) {
-  erase_if(PendingInitializeTasks,
-           [this, Ctx](const PendingInitializeTask &Task) {
-             if (Task.Context == Ctx) {
-               if (!Task.Ranges.empty()) {
-                 errs() << "Pending initialization tasks: ";
-                 for (auto &[Lo, Hi] : Task.Ranges)
-                   errs() << '[' << Lo << ", " << Hi << ") ";
-                 errs() << '\n';
-                 ImmUBReporter(Manager.Interpreter)
-                     << "Uninitialized memory region " << *this
-                     << " after function return.";
-               }
-               return true;
-             }
-             return false;
-           });
 }
 
 ContextSensitivePointerInfo
@@ -837,8 +774,6 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/true);
       MO->verifyMemAccess(PV->Offset, Size, Alignment, true);
-      if (!IsVolatile)
-        MO->markWrite(PV->Offset.getZExtValue(), Size);
       return store(*MO, PV->Offset.getZExtValue(), V, Ty);
     }
     ImmUBReporter(*this) << "store to invalid pointer";
@@ -1125,8 +1060,6 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
     if (IsStore) {
       // FIXME: Approximation: assume all bytes to write are non-poison.
       MO->markPoison(Ptr.Offset.getSExtValue(), Size, false);
-      if (!IsVolatile)
-        MO->markWrite(Ptr.Offset.getSExtValue(), Size);
     }
     return MO->rawPointer() + Ptr.Offset.getSExtValue();
   }
@@ -2977,7 +2910,6 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   auto FnAttrs = Func->getAttributes();
 
   SmallVector<std::shared_ptr<MemObject>> ByValTempObjects;
-  SmallVector<MemObject *> InitializeMOs;
   auto AddNoAlias = [&](Value *Locker, AnyValue &Ptr) {
     // TODO: handle noalias
   };
@@ -3025,7 +2957,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
             Ptr.Info.pushLoc(CurrentFrame, IRMemLocation::ArgMem);
           });
 
-          if (Option.CheckInitialization && HandleParamAttr &&
+          if (HandleParamAttr &&
               CB->paramHasAttr(Idx, Attribute::Initializes)) {
             auto Initializes =
                 CB->getParamAttr(Idx, Attribute::Initializes).getInitializes();
@@ -3044,17 +2976,14 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
                 InitializeOffset = Ptr.Offset.getSExtValue();
               }
 
-              PendingInitializeTask &Task =
-                  InitializeMO->pushPendingInitializeTask(CurrentFrame);
               for (auto &R : Initializes) {
                 uint64_t Lo = static_cast<uint64_t>(
                     InitializeOffset + R.getLower().getSExtValue());
                 uint64_t Hi = static_cast<uint64_t>(
                     InitializeOffset + R.getUpper().getSExtValue());
-                Task.Ranges.push_back({Lo, Hi});
+                // Approximation: initialize the region with undef
+                InitializeMO->markPoison(Lo, Hi - Lo, false);
               }
-
-              InitializeMOs.push_back(InitializeMO);
             }
           }
         }
@@ -3068,11 +2997,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
         postProcessAttr(*this, Args[Idx], FnAttrs.getParamAttrs(Idx));
   };
 
-  auto ExitFunc = [&](Frame *OldFrame) {
-    for (auto &MO : InitializeMOs)
-      MO->popPendingInitializeTask(CurrentFrame);
-    CurrentFrame = OldFrame;
-  };
+  auto ExitFunc = [&](Frame *OldFrame) { CurrentFrame = OldFrame; };
 
   auto ME = CB ? CB->getMemoryEffects() : MemoryEffects::unknown();
   if (Func->isIntrinsic()) {
