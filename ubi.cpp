@@ -740,6 +740,16 @@ AnyValue UBAwareInterpreter::load(const MemObject &MO, uint32_t Offset,
       Res.push_back(load(MO, NewOffset, StructTy->getStructElementType(I)));
     }
     return std::move(Res);
+  } else if (auto *ArrTy = dyn_cast<ArrayType>(Ty)) {
+    Type *EltTy = ArrTy->getArrayElementType();
+    std::vector<AnyValue> Res;
+    Res.reserve(ArrTy->getArrayNumElements());
+    auto Step = DL.getTypeStoreSize(EltTy);
+    for (uint32_t I = 0, E = ArrTy->getArrayNumElements(); I != E; ++I) {
+      Res.push_back(load(MO, Offset, EltTy));
+      Offset += Step;
+    }
+    return std::move(Res);
   } else if (auto *VTy = dyn_cast<VectorType>(Ty)) {
     uint32_t Len = getVectorLength(VTy);
     Type *EltTy = VTy->getElementType();
