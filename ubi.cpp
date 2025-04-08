@@ -815,7 +815,7 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
                             ModRefInfo::Mod) != ModRefInfo::Mod)
           ImmUBReporter(*this) << "load in a readnone context " << *MO;
       }
-      auto Size = DL.getTypeStoreSize(Ty).getFixedValue();
+      auto Size = getFixedSize(DL.getTypeStoreSize(Ty));
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/false);
       MO->verifyMemAccess(PV->Offset, Size, Alignment, false);
@@ -1903,11 +1903,7 @@ bool UBAwareInterpreter::visitInsertElementInst(InsertElementInst &IEI) {
   auto Idx = getInt(IEI.getOperand(2));
   if (!Idx.has_value() || Idx->uge(Res.getValueArray().size()))
     return addValue(IEI, getPoison(IEI.getType()));
-  uint32_t DstLen = Res.getValueArray().size();
-  uint32_t Step =
-      cast<VectorType>(IEI.getType())->getElementCount().getKnownMinValue();
-  for (uint32_t Off = 0; Off != DstLen; Off += Step)
-    Res.getValueArray().at(Idx->getZExtValue() + Off) = Insert;
+  Res.getValueArray().at(Idx->getZExtValue()) = std::move(Insert);
   return addValue(IEI, std::move(Res));
 }
 bool UBAwareInterpreter::visitExtractElementInst(ExtractElementInst &EEI) {
@@ -1933,11 +1929,11 @@ bool UBAwareInterpreter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
       if (Idx == PoisonMaskElem)
         PickedValues.push_back(poison());
       else if (Idx < static_cast<int32_t>(Size))
-        PickedValues.push_back(LHS.getSingleValueAt(Idx + Off));
+        PickedValues.push_back(LHS.getSingleValueAt(Idx));
       else if (RHSIsPoison)
         PickedValues.push_back(getPoison(SVI.getType()->getScalarType()));
       else
-        PickedValues.push_back(RHS.getSingleValueAt(Idx - Size + Off));
+        PickedValues.push_back(RHS.getSingleValueAt(Idx - Size));
     }
   }
   return addValue(SVI, std::move(PickedValues));
