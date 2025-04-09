@@ -116,8 +116,8 @@ public:
   const MemByteMetadata &getMetadata(size_t Offset) const {
     return Metadata[Offset];
   }
-  void verifyMemAccess(const APInt &Offset, const size_t AccessSize,
-                       size_t Alignment, bool IsStore);
+  void verifyMemAccess(size_t Offset, size_t AccessSize, size_t Alignment,
+                       bool IsStore);
   void store(size_t Offset, const APInt &C);
   std::optional<APInt> load(size_t Offset, size_t Bits) const;
   APInt address() const { return Address; }
@@ -176,19 +176,19 @@ struct ContextSensitivePointerInfo {
 
 struct Pointer final {
   std::weak_ptr<MemObject> Obj;
-  APInt Offset;
   APInt Address;
+  size_t Offset;
   size_t Bound;
   ContextSensitivePointerInfo Info;
 
-  explicit Pointer(const std::shared_ptr<MemObject> &Obj, const APInt &Offset,
+  explicit Pointer(const std::shared_ptr<MemObject> &Obj, size_t Offset,
                    ContextSensitivePointerInfo Info)
-      : Obj(Obj), Offset(Offset), Address(Obj->address() + Offset),
+      : Obj(Obj), Address(Obj->address() + Offset), Offset(Offset),
         Bound(Obj->size()), Info(std::move(Info)) {}
-  explicit Pointer(const std::weak_ptr<MemObject> &Obj, APInt NewOffset,
+  explicit Pointer(const std::weak_ptr<MemObject> &Obj, size_t NewOffset,
                    APInt NewAddress, size_t NewBound,
                    ContextSensitivePointerInfo Info)
-      : Obj(Obj), Offset(std::move(NewOffset)), Address(std::move(NewAddress)),
+      : Obj(Obj), Address(std::move(NewAddress)), Offset(NewOffset),
         Bound(NewBound), Info(std::move(Info)) {}
 };
 

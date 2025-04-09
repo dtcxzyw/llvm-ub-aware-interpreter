@@ -41,14 +41,14 @@ void MemObject::markPoison(size_t Offset, size_t Size, bool IsPoison) {
         Metadata[I].ComparableWithNull = IsPoison;
   }
 }
-void MemObject::verifyMemAccess(const APInt &Offset, const size_t AccessSize,
+void MemObject::verifyMemAccess(size_t Offset, size_t AccessSize,
                                 size_t Alignment, bool IsStore) {
   if (!IsAlive)
     ImmUBReporter(Manager.Interpreter) << "Accessing dead object " << *this;
   auto NewAddr = Address + Offset;
   if (NewAddr.countr_zero() < Log2_64(Alignment))
     ImmUBReporter(Manager.Interpreter) << "Unaligned mem op";
-  if ((Offset + AccessSize).ugt(Data.size()))
+  if (Offset + AccessSize > Data.size())
     ImmUBReporter(Manager.Interpreter)
         << "Out of bound mem op, bound = " << Data.size()
         << ", access range = [" << Offset << ", " << Offset + AccessSize << ')';
@@ -163,13 +163,12 @@ SingleValue MemoryManager::lookupPointer(const APInt &Addr) const {
     auto *MO = std::prev(Iter)->second;
     if (MO->address().ule(Addr) && Addr.ule(MO->address() + MO->size())) {
       return SingleValue{
-          Pointer{MO->shared_from_this(), Addr - MO->address(),
+          Pointer{MO->shared_from_this(), (Addr - MO->address()).getZExtValue(),
                   ContextSensitivePointerInfo::getDefault(nullptr)}};
     }
   }
 
-  return SingleValue{Pointer{std::weak_ptr<MemObject>{},
-                             APInt::getZero(Addr.getBitWidth()), Addr, 0,
+  return SingleValue{Pointer{std::weak_ptr<MemObject>{}, 0, Addr, 0,
                              ContextSensitivePointerInfo::getDefault(nullptr)}};
 }
 
@@ -226,7 +225,7 @@ raw_ostream &operator<<(raw_ostream &Out, const SingleValue &Val) {
       P->dumpName(Out);
     else
       Out << "dangling";
-    if (!Ptr->Offset.isZero())
+    if (Ptr->Offset != 0)
       Out << " + " << Ptr->Offset;
     Out << "] " << Ptr->Info.CI;
     if (Ptr->Info.Readable || Ptr->Info.Writable)
@@ -363,7 +362,7 @@ static void handleDereferenceable(UBAwareInterpreter &Interpreter,
       return;
     ImmUBReporter(Interpreter) << "dereferenceable on a null pointer";
   }
-  if (Ptr.Offset.getSExtValue() + Size > Ptr.Bound) {
+  if (Ptr.Offset + Size > Ptr.Bound) {
     ImmUBReporter(Interpreter)
         << "dereferenceable" << (OrNull ? "_or_null" : "") << "(" << Size
         << ") out of bound: " << V;
@@ -575,9 +574,7 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
     PointerInfo.pushReadWrite(nullptr, true,
                               isa<GlobalVariable>(GV) &&
                                   !cast<GlobalVariable>(GV)->isConstant());
-    return AnyValue{Pointer{Iter->second,
-                            APInt::getZero(DL.getTypeSizeInBits(GV->getType())),
-                            std::move(PointerInfo)}};
+    return AnyValue{Pointer{Iter->second, 0, std::move(PointerInfo)}};
   }
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     switch (CE->getOpcode()) {
@@ -628,8 +625,7 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
   }
   if (auto *BA = dyn_cast<BlockAddress>(V))
     return SingleValue{
-        Pointer{BlockTargets.at(BA->getBasicBlock()),
-                APInt::getZero(DL.getTypeSizeInBits(V->getType())),
+        Pointer{BlockTargets.at(BA->getBasicBlock()), 0,
                 ContextSensitivePointerInfo::getDefault(nullptr)}};
   errs() << "Unexpected constant " << *V << '\n';
   std::abort();
@@ -790,7 +786,7 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/true);
       MO->verifyMemAccess(PV->Offset, Size, Alignment, true);
-      return store(*MO, PV->Offset.getZExtValue(), V, Ty);
+      return store(*MO, PV->Offset, V, Ty);
     }
     ImmUBReporter(*this) << "store to invalid pointer";
   }
@@ -819,7 +815,7 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/false);
       MO->verifyMemAccess(PV->Offset, Size, Alignment, false);
-      return load(*MO, PV->Offset.getZExtValue(), Ty);
+      return load(*MO, PV->Offset, Ty);
     }
     ImmUBReporter(*this) << "load from invalid pointer " << *PV;
   }
@@ -833,19 +829,18 @@ SingleValue UBAwareInterpreter::offsetPointer(const Pointer &Ptr,
     return Ptr;
   bool HasNSW = Flags.hasNoUnsignedSignedWrap();
   bool HasNUW = Flags.hasNoUnsignedWrap();
-  auto NewOffset = addNoWrap(Ptr.Offset, Offset, HasNSW, HasNUW);
-  if (!NewOffset)
-    return poison();
   auto NewAddr = addNoWrap(Ptr.Address, Offset, HasNSW, HasNUW);
   if (!NewAddr)
     return poison();
-  if (NewOffset->isNegative() || NewOffset->sgt(Ptr.Bound)) {
+  int64_t NewOffset = Ptr.Offset + Offset.getSExtValue();
+  if (NewOffset < 0 || NewOffset >= static_cast<int64_t>(Ptr.Bound)) {
     if (Flags.isInBounds())
       return poison();
     return MemMgr.lookupPointer(*NewAddr);
   }
 
-  return Pointer{Ptr.Obj, *NewOffset, *NewAddr, Ptr.Bound, Ptr.Info};
+  return Pointer{Ptr.Obj, static_cast<size_t>(NewOffset), *NewAddr, Ptr.Bound,
+                 Ptr.Info};
 }
 
 UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
@@ -858,7 +853,7 @@ UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
   EMIInfo.Enabled = Option.EnableEMITracking;
   EMIInfo.EnablePGFTracking = EMIInfo.Enabled && Option.EnablePGFTracking;
   NullPtrStorage = MemMgr.create("null", false, 0U, 1U);
-  NullPtr = Pointer{NullPtrStorage, APInt::getZero(DL.getPointerSizeInBits()),
+  NullPtr = Pointer{NullPtrStorage, 0,
                     ContextSensitivePointerInfo::getDefault(nullptr)};
   assert(NullPtr->Address.isZero());
   if (Option.RustMode)
@@ -1039,7 +1034,7 @@ char *UBAwareInterpreter::getRawPtr(const SingleValue &SV) {
   if (auto MO = Ptr.Obj.lock()) {
     if (MO == NullPtrStorage)
       return nullptr;
-    return MO->rawPointer() + Ptr.Offset.getSExtValue();
+    return MO->rawPointer() + Ptr.Offset;
   }
   ImmUBReporter(*this) << "dangling pointer";
   llvm_unreachable("Unreachable code");
@@ -1075,9 +1070,9 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
     MO->verifyMemAccess(Ptr.Offset, Size, Alignment, IsStore);
     if (IsStore) {
       // FIXME: Approximation: assume all bytes to write are non-poison.
-      MO->markPoison(Ptr.Offset.getSExtValue(), Size, false);
+      MO->markPoison(Ptr.Offset, Size, false);
     }
-    return MO->rawPointer() + Ptr.Offset.getSExtValue();
+    return MO->rawPointer() + Ptr.Offset;
   }
   ImmUBReporter(*this) << "dangling pointer";
   llvm_unreachable("Unreachable code");
@@ -1122,8 +1117,7 @@ bool UBAwareInterpreter::visitAllocaInst(AllocaInst &AI) {
     AllocSize *= getIntNonPoison(AI.getArraySize()).getZExtValue();
   auto Obj = MemMgr.create(getValueName(&AI), true, AllocSize,
                            AI.getPointerAlignment(DL).value());
-  Pointer Ptr{Obj, APInt::getZero(DL.getPointerSizeInBits()),
-              ContextSensitivePointerInfo::getDefault(CurrentFrame)};
+  Pointer Ptr{Obj, 0, ContextSensitivePointerInfo::getDefault(CurrentFrame)};
   Obj->setLiveness(true);
   Obj->setStackObjectInfo(CurrentFrame);
   if (!Option.IgnoreExplicitLifetimeMarker) {
@@ -1841,23 +1835,23 @@ bool UBAwareInterpreter::visitGetElementPtrInst(GetElementPtrInst &GEP) {
     for (auto &[K, V] : VarOffsets) {
       auto KV = GetSplat(getValue(K));
       for (uint32_t I = 0; I != Len; ++I) {
+        auto &ResVal = Res.getSingleValueAt(I);
         if (auto Idx = getInt(KV.getSingleValueAt(I))) {
           auto &IdxVal = *Idx;
           if (CanonicalizeBitWidth(IdxVal)) {
             if (auto Off = mulNoWrap(IdxVal, V, Flags.hasNoUnsignedSignedWrap(),
                                      Flags.hasNoUnsignedWrap())) {
-              Res.getSingleValueAt(I) =
-                  computeGEP(Res.getSingleValueAt(I), *Off, Flags);
+              ResVal = computeGEP(ResVal, *Off, Flags);
               continue;
             }
           }
         }
-        Res.getSingleValueAt(I) = poison();
+        ResVal = poison();
       }
     }
     for (uint32_t I = 0; I != Len; ++I) {
-      Res.getSingleValueAt(I) =
-          computeGEP(Res.getSingleValueAt(I), Offset, Flags);
+      auto &ResVal = Res.getSingleValueAt(I);
+      ResVal = computeGEP(ResVal, Offset, Flags);
     }
     return addValue(GEP, std::move(Res));
   }
@@ -1931,7 +1925,7 @@ bool UBAwareInterpreter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
       else if (Idx < static_cast<int32_t>(Size))
         PickedValues.push_back(LHS.getSingleValueAt(Idx));
       else if (RHSIsPoison)
-        PickedValues.push_back(getPoison(SVI.getType()->getScalarType()));
+        PickedValues.push_back(poison());
       else
         PickedValues.push_back(RHS.getSingleValueAt(Idx - Size));
     }
@@ -2254,7 +2248,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
         if (!Option.ReduceMode && Size->isAllOnes())
           Size = APInt(Size->getBitWidth(), MO->size());
         // FIXME: What is the meaning of size?
-        if (MO->isStackObject(CurrentFrame->LastFrame) && P->Offset.isZero()) {
+        if (MO->isStackObject(CurrentFrame->LastFrame) && P->Offset == 0) {
           // Do not reduce the size.
           if (Option.ReduceMode && MO->size() != Size)
             ImmUBReporter(*this) << "call lifetime intrinsic with wrong size";
@@ -2806,7 +2800,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     Res.reserve(Len);
     for (uint32_t I = 0; I != Len; ++I) {
       bool Val = (*Base + I).ult(*N);
-      Res.push_back(SingleValue{APInt(1, Val, false, true)});
+      Res.push_back(boolean(Val));
     }
     return std::move(Res);
   }
@@ -2907,10 +2901,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     Res.reserve(Len);
     for (uint32_t I = 0; I != Len; ++I) {
       uint32_t Pos = I + Off;
-      if (Pos < Len)
-        Res.push_back(LHS[Pos]);
-      else
-        Res.push_back(RHS[Pos - Len]);
+      Res.push_back(Pos < Len ? LHS[Pos] : RHS[Pos - Len]);
     }
     return std::move(Res);
   }
@@ -2927,10 +2918,9 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     std::vector<AnyValue> Values;
     Values.reserve(Len);
     for (uint32_t I = 0; I != Len; ++I) {
-      if (getBooleanNonPoison(Mask[I].getSingleValue()))
-        Values.push_back(load(Ptr, Align, AccessTy, false));
-      else
-        Values.push_back(PassThru[I]);
+      Values.push_back(getBooleanNonPoison(Mask[I].getSingleValue())
+                           ? load(Ptr, Align, AccessTy, false)
+                           : PassThru[I]);
       Ptr = computeGEP(Ptr, Offset, GEPNoWrapFlags::none());
     }
     return std::move(Values);
@@ -3021,9 +3011,8 @@ SingleValue UBAwareInterpreter::alloc(const APInt &AllocSize,
   AllocatedMems.insert(MemObj);
   if (ZeroInitialize)
     std::memset(MemObj->rawPointer(), 0, MemObj->size());
-  return SingleValue{
-      Pointer{MemObj, APInt::getZero(DL.getPointerSizeInBits()),
-              ContextSensitivePointerInfo::getDefault(CurrentFrame)}};
+  return SingleValue{Pointer{
+      MemObj, 0, ContextSensitivePointerInfo::getDefault(CurrentFrame)}};
 }
 AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
                                          SmallVectorImpl<AnyValue> &Args) {
@@ -3085,7 +3074,7 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
     if (isPoison(Ptr))
       ImmUBReporter(*this) << "free with poison ptr";
     auto &PtrVal = std::get<Pointer>(Ptr);
-    if (!PtrVal.Offset.isZero())
+    if (PtrVal.Offset != 0)
       ImmUBReporter(*this) << "free with invalid ptr";
     if (auto MO = PtrVal.Obj.lock())
       AllocatedMems.erase(MO);
@@ -3138,9 +3127,8 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
           // FIXME: propagate poison
           memcpy(TmpMO->rawPointer(), getRawPtr(ArgVal.getSingleValue()),
                  DL.getTypeStoreSize(Ty));
-          ArgVal = SingleValue{
-              Pointer{TmpMO, APInt::getZero(DL.getPointerSizeInBits()),
-                      ContextSensitivePointerInfo::getDefault(CurrentFrame)}};
+          ArgVal = SingleValue{Pointer{
+              TmpMO, 0, ContextSensitivePointerInfo::getDefault(CurrentFrame)}};
           InitializeMO = TmpMO.get();
           ByValTempObjects.push_back(std::move(TmpMO));
         }
@@ -3175,7 +3163,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
                                           "pointer argument with "
                                           "initializes";
                 InitializeMO = MO.get();
-                InitializeOffset = Ptr.Offset.getSExtValue();
+                InitializeOffset = Ptr.Offset;
               }
 
               for (auto &R : Initializes) {
@@ -3247,12 +3235,12 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
       if (isPoison(Ptr))
         ImmUBReporter(*this) << "free with poison ptr";
       auto &PtrVal = std::get<Pointer>(Ptr);
-      if (!PtrVal.Offset.isZero())
-        ImmUBReporter(*this) << "free with invalid ptr";
+      if (PtrVal.Offset != 0)
+        ImmUBReporter(*this) << "free with invalid ptr " << Ptr;
       if (auto MO = PtrVal.Obj.lock())
         AllocatedMems.erase(MO);
       else
-        ImmUBReporter(*this) << "free with invalid ptr";
+        ImmUBReporter(*this) << "free with invalid ptr " << Ptr;
       return none();
     }
     errs() << "Do not know how to handle " << *Func << '\n';
