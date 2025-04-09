@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/Support/ModRef.h"
 #include <llvm/Analysis/AssumeBundleQueries.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InlineAsm.h>
@@ -122,7 +123,13 @@ void MemObject::dump(raw_ostream &Out) const {
 ContextSensitivePointerInfo
 ContextSensitivePointerInfo::getDefault(Frame *FrameCtx) {
   return ContextSensitivePointerInfo{
-      nullptr,           FrameCtx, true, true, true, true, IRMemLocation::Other,
+      nullptr,
+      FrameCtx,
+      true,
+      true,
+      true,
+      true,
+      static_cast<uint32_t>(IRMemLocation::Other),
       CaptureInfo::all()};
 }
 void ContextSensitivePointerInfo::push(Frame *Ctx) {
@@ -163,7 +170,8 @@ SingleValue MemoryManager::lookupPointer(const APInt &Addr) const {
     auto *MO = std::prev(Iter)->second;
     if (MO->address().ule(Addr) && Addr.ule(MO->address() + MO->size())) {
       return SingleValue{
-          Pointer{MO->shared_from_this(), (Addr - MO->address()).getZExtValue(),
+          Pointer{MO->shared_from_this(),
+                  static_cast<uint32_t>((Addr - MO->address()).getZExtValue()),
                   ContextSensitivePointerInfo::getDefault(nullptr)}};
     }
   }
@@ -231,7 +239,7 @@ raw_ostream &operator<<(raw_ostream &Out, const SingleValue &Val) {
     if (Ptr->Info.Readable || Ptr->Info.Writable)
       Out << ' ' << (Ptr->Info.Readable ? "R" : "")
           << (Ptr->Info.Writable ? "W" : "");
-    switch (Ptr->Info.Loc) {
+    switch (Ptr->Info.getLoc()) {
     case IRMemLocation::ArgMem:
       Out << " ArgMem";
       break;
@@ -776,7 +784,7 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
       ImmUBReporter(*this) << "store to a non-writable pointer " << *PV;
     if (auto MO = PV->Obj.lock()) {
       if (!MO->isStackObject(CurrentFrame) &&
-          (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
+          (CurrentFrame->MemEffects.getModRef(PV->Info.getLoc()) &
            ModRefInfo::Mod) != ModRefInfo::Mod) {
         // FIXME: If read is set, check  the case where the location is read
         // from and then the same value is written back.
@@ -805,10 +813,11 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
     }
     if (auto MO = PV->Obj.lock()) {
       if ((!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
-          (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
+          (CurrentFrame->MemEffects.getModRef(PV->Info.getLoc()) &
            ModRefInfo::Ref) != ModRefInfo::Ref) {
-        if (!IsVolatile || (CurrentFrame->MemEffects.getModRef(PV->Info.Loc) &
-                            ModRefInfo::Mod) != ModRefInfo::Mod)
+        if (!IsVolatile ||
+            (CurrentFrame->MemEffects.getModRef(PV->Info.getLoc()) &
+             ModRefInfo::Mod) != ModRefInfo::Mod)
           ImmUBReporter(*this) << "load in a readnone context " << *MO;
       }
       auto Size = getFixedSize(DL.getTypeStoreSize(Ty));
@@ -832,14 +841,14 @@ SingleValue UBAwareInterpreter::offsetPointer(const Pointer &Ptr,
   auto NewAddr = addNoWrap(Ptr.Address, Offset, HasNSW, HasNUW);
   if (!NewAddr)
     return poison();
-  int64_t NewOffset = Ptr.Offset + Offset.getSExtValue();
+  int64_t NewOffset = static_cast<uint64_t>(Ptr.Offset) + Offset.getSExtValue();
   if (NewOffset < 0 || NewOffset >= static_cast<int64_t>(Ptr.Bound)) {
     if (Flags.isInBounds())
       return poison();
     return MemMgr.lookupPointer(*NewAddr);
   }
 
-  return Pointer{Ptr.Obj, static_cast<size_t>(NewOffset), *NewAddr, Ptr.Bound,
+  return Pointer{Ptr.Obj, static_cast<uint32_t>(NewOffset), *NewAddr, Ptr.Bound,
                  Ptr.Info};
 }
 
@@ -1055,13 +1064,13 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
   }
   if (auto MO = Ptr.Obj.lock()) {
     if (IsStore && !MO->isStackObject(CurrentFrame) &&
-        (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) & ModRefInfo::Mod) !=
-            ModRefInfo::Mod)
+        (CurrentFrame->MemEffects.getModRef(Ptr.Info.getLoc()) &
+         ModRefInfo::Mod) != ModRefInfo::Mod)
       ImmUBReporter(*this) << "store in a writenone context";
     if (!IsStore && (!MO->isConstant() && !MO->isStackObject(CurrentFrame)) &&
-        (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) & ModRefInfo::Ref) !=
-            ModRefInfo::Ref) {
-      if (IsVolatile || (CurrentFrame->MemEffects.getModRef(Ptr.Info.Loc) &
+        (CurrentFrame->MemEffects.getModRef(Ptr.Info.getLoc()) &
+         ModRefInfo::Ref) != ModRefInfo::Ref) {
+      if (IsVolatile || (CurrentFrame->MemEffects.getModRef(Ptr.Info.getLoc()) &
                          ModRefInfo::Mod) != ModRefInfo::Mod)
         ImmUBReporter(*this) << "load in a readnone context";
     }

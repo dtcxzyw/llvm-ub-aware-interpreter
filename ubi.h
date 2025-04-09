@@ -145,7 +145,7 @@ struct ContextSensitivePointerInfo {
   bool Writable : 1;
   bool Comparable : 1;
   bool ComparableWithNull : 1;
-  IRMemLocation Loc;
+  uint32_t Loc : 2;
   CaptureInfo CI;
 
   static ContextSensitivePointerInfo getDefault(Frame *FrameCtx);
@@ -157,8 +157,9 @@ struct ContextSensitivePointerInfo {
   }
   void pushLoc(Frame *Ctx, IRMemLocation Loc) {
     push(Ctx);
-    this->Loc = Loc;
+    this->Loc = static_cast<uint32_t>(Loc);
   }
+  IRMemLocation getLoc() const { return static_cast<IRMemLocation>(Loc); }
   void pushCaptureInfo(Frame *Ctx, CaptureInfo CI) {
     push(Ctx);
     this->CI &= CI;
@@ -177,16 +178,16 @@ struct ContextSensitivePointerInfo {
 struct Pointer final {
   std::weak_ptr<MemObject> Obj;
   APInt Address;
-  size_t Offset;
-  size_t Bound;
+  uint32_t Offset;
+  uint32_t Bound;
   ContextSensitivePointerInfo Info;
 
-  explicit Pointer(const std::shared_ptr<MemObject> &Obj, size_t Offset,
+  explicit Pointer(const std::shared_ptr<MemObject> &Obj, uint32_t Offset,
                    ContextSensitivePointerInfo Info)
       : Obj(Obj), Address(Obj->address() + Offset), Offset(Offset),
         Bound(Obj->size()), Info(std::move(Info)) {}
-  explicit Pointer(const std::weak_ptr<MemObject> &Obj, size_t NewOffset,
-                   APInt NewAddress, size_t NewBound,
+  explicit Pointer(const std::weak_ptr<MemObject> &Obj, uint32_t NewOffset,
+                   APInt NewAddress, uint32_t NewBound,
                    ContextSensitivePointerInfo Info)
       : Obj(Obj), Address(std::move(NewAddress)), Offset(NewOffset),
         Bound(NewBound), Info(std::move(Info)) {}
