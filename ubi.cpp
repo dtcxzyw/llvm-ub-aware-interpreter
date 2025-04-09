@@ -2890,6 +2890,30 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     }
     return none();
   }
+  case Intrinsic::vector_splice: {
+    auto &LHS = Args[0].getValueArray();
+    auto &RHS = Args[1].getValueArray();
+    auto Imm = getInt(Args[2].getSingleValue());
+    if (!Imm)
+      ImmUBReporter(*this) << "llvm.vector.splice with poison index";
+    uint32_t Len = LHS.size();
+    if (Imm->isNegative())
+      *Imm += Len;
+    if (Imm->uge(Len))
+      ImmUBReporter(*this) << "llvm.vector.splice with invalid index "
+                           << Args[2];
+    uint32_t Off = Imm->getZExtValue();
+    std::vector<AnyValue> Res;
+    Res.reserve(Len);
+    for (uint32_t I = 0; I != Len; ++I) {
+      uint32_t Pos = I + Off;
+      if (Pos < Len)
+        Res.push_back(LHS[Pos]);
+      else
+        Res.push_back(RHS[Pos - Len]);
+    }
+    return std::move(Res);
+  }
   default:
     break;
   }
