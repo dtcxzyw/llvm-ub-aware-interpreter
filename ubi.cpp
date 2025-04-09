@@ -118,7 +118,15 @@ void MemObject::dump(raw_ostream &Out) const {
   Out << (IsLocal ? '%' : '@') << Name << " (Addr = " << Address << ", "
       << "Size = " << Data.size() << (IsAlive ? "" : ", dead") << ')';
 }
-
+void Pointer::verifyMemAccess(UBAwareInterpreter &Interpreter,
+                              size_t AccessSize) const {
+  size_t AccessStart = Offset.getZExtValue();
+  size_t AccessEnd = AccessStart + AccessSize;
+  if (AccessStart < Start || AccessEnd > End)
+    ImmUBReporter(Interpreter)
+        << "Memory access [" << AccessStart << ", " << AccessEnd
+        << ") violates inrange[" << Start << ", " << End << ")\n";
+}
 ContextSensitivePointerInfo
 ContextSensitivePointerInfo::getDefault(Frame *FrameCtx) {
   return ContextSensitivePointerInfo{
@@ -169,7 +177,7 @@ SingleValue MemoryManager::lookupPointer(const APInt &Addr) const {
   }
 
   return SingleValue{Pointer{std::weak_ptr<MemObject>{},
-                             APInt::getZero(Addr.getBitWidth()), Addr, 0,
+                             APInt::getZero(Addr.getBitWidth()), Addr, 0, 0, 0,
                              ContextSensitivePointerInfo::getDefault(nullptr)}};
 }
 
@@ -789,6 +797,7 @@ void UBAwareInterpreter::store(const AnyValue &P, uint32_t Alignment,
       auto Size = getFixedSize(DL.getTypeStoreSize(Ty));
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/true);
+      PV->verifyMemAccess(*this, Size);
       MO->verifyMemAccess(PV->Offset, Size, Alignment, true);
       return store(*MO, PV->Offset.getZExtValue(), V, Ty);
     }
@@ -818,6 +827,7 @@ AnyValue UBAwareInterpreter::load(const AnyValue &P, uint32_t Alignment,
       auto Size = getFixedSize(DL.getTypeStoreSize(Ty));
       if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
         volatileMemOpTy(Ty, /*IsStore=*/false);
+      PV->verifyMemAccess(*this, Size);
       MO->verifyMemAccess(PV->Offset, Size, Alignment, false);
       return load(*MO, PV->Offset.getZExtValue(), Ty);
     }
@@ -845,7 +855,17 @@ SingleValue UBAwareInterpreter::offsetPointer(const Pointer &Ptr,
     return MemMgr.lookupPointer(*NewAddr);
   }
 
-  return Pointer{Ptr.Obj, *NewOffset, *NewAddr, Ptr.Bound, Ptr.Info};
+  return Pointer{Ptr.Obj,
+                 *NewOffset,
+                 *NewAddr,
+                 Ptr.Bound,
+                 static_cast<size_t>(std::max(static_cast<intptr_t>(Ptr.Start) +
+                                                  Offset.getSExtValue(),
+                                              static_cast<intptr_t>(0))),
+                 static_cast<size_t>(std::min(
+                     static_cast<intptr_t>(Ptr.End) + Offset.getSExtValue(),
+                     static_cast<intptr_t>(Ptr.Bound))),
+                 Ptr.Info};
 }
 
 UBAwareInterpreter::UBAwareInterpreter(Module &M, InterpreterOption Option)
@@ -1072,6 +1092,7 @@ char *UBAwareInterpreter::getRawPtr(SingleValue SV, size_t Size,
     }
     if (Option.TrackVolatileMem && IsVolatile && MO->isGlobal())
       volatileMemOp(Size, IsStore);
+    Ptr.verifyMemAccess(*this, Size);
     MO->verifyMemAccess(Ptr.Offset, Size, Alignment, IsStore);
     if (IsStore) {
       // FIXME: Approximation: assume all bytes to write are non-poison.
@@ -1830,6 +1851,12 @@ bool UBAwareInterpreter::visitGetElementPtrInst(GetElementPtrInst &GEP) {
     Idx = Idx.sext(BitWidth);
     return true;
   };
+  auto HandleInRange = [](SingleValue &Res) {
+    if (isPoison(Res))
+      return;
+    auto &Ptr = std::get<Pointer>(Res);
+    // TODO: getInRange
+  };
   if (auto *VTy = dyn_cast<VectorType>(GEP.getType())) {
     uint32_t Len = getVectorLength(VTy);
     auto GetSplat = [Len](AnyValue V) -> AnyValue {
@@ -1859,6 +1886,8 @@ bool UBAwareInterpreter::visitGetElementPtrInst(GetElementPtrInst &GEP) {
       Res.getSingleValueAt(I) =
           computeGEP(Res.getSingleValueAt(I), Offset, Flags);
     }
+    for (auto &Val : Res.getValueArray())
+      HandleInRange(Val.getSingleValue());
     return addValue(GEP, std::move(Res));
   }
 
@@ -1878,7 +1907,9 @@ bool UBAwareInterpreter::visitGetElementPtrInst(GetElementPtrInst &GEP) {
     }
     return addValue(GEP, poison());
   }
-  return addValue(GEP, computeGEP(Res, Offset, Flags));
+  Res = computeGEP(Res, Offset, Flags);
+  HandleInRange(Res);
+  return addValue(GEP, std::move(Res));
 }
 bool UBAwareInterpreter::visitExtractValueInst(ExtractValueInst &EVI) {
   AnyValue Res = getValue(EVI.getAggregateOperand());

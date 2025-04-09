@@ -77,6 +77,7 @@
 using namespace llvm;
 
 class MemoryManager;
+class UBAwareInterpreter;
 struct Frame;
 
 struct MemByteMetadata {
@@ -179,17 +180,21 @@ struct Pointer final {
   APInt Offset;
   APInt Address;
   size_t Bound;
+  size_t Start;
+  size_t End;
   ContextSensitivePointerInfo Info;
 
   explicit Pointer(const std::shared_ptr<MemObject> &Obj, const APInt &Offset,
                    ContextSensitivePointerInfo Info)
       : Obj(Obj), Offset(Offset), Address(Obj->address() + Offset),
-        Bound(Obj->size()), Info(std::move(Info)) {}
+        Bound(Obj->size()), Start(0), End(Obj->size()), Info(std::move(Info)) {}
   explicit Pointer(const std::weak_ptr<MemObject> &Obj, APInt NewOffset,
-                   APInt NewAddress, size_t NewBound,
-                   ContextSensitivePointerInfo Info)
+                   APInt NewAddress, size_t NewBound, size_t NewStart,
+                   size_t NewEnd, ContextSensitivePointerInfo Info)
       : Obj(Obj), Offset(std::move(NewOffset)), Address(std::move(NewAddress)),
-        Bound(NewBound), Info(std::move(Info)) {}
+        Bound(NewBound), Start(NewStart), End(NewEnd), Info(std::move(Info)) {}
+  void verifyMemAccess(UBAwareInterpreter &Interpreter,
+                       size_t AccessSize) const;
 };
 
 using SingleValue = std::variant<APInt, APFloat, Pointer, std::monostate>;
@@ -206,8 +211,6 @@ inline bool isPoison(const APFloat &AFP, FastMathFlags FMF) {
 inline SingleValue boolean(bool Val) { return SingleValue{APInt(1, Val)}; }
 inline SingleValue poison() { return std::monostate{}; }
 bool refines(const SingleValue &LHS, const SingleValue &RHS);
-
-class UBAwareInterpreter;
 
 class MemoryManager final {
   UBAwareInterpreter &Interpreter;
