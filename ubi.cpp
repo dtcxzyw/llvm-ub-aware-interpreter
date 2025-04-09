@@ -45,8 +45,7 @@ void MemObject::verifyMemAccess(size_t Offset, size_t AccessSize,
                                 size_t Alignment, bool IsStore) {
   if (!IsAlive)
     ImmUBReporter(Manager.Interpreter) << "Accessing dead object " << *this;
-  auto NewAddr = Address + Offset;
-  if (NewAddr.countr_zero() < Log2_64(Alignment))
+  if (((Address.getZExtValue() + Offset) & (Alignment - 1)) != 0)
     ImmUBReporter(Manager.Interpreter) << "Unaligned mem op";
   if (Offset + AccessSize > Data.size())
     ImmUBReporter(Manager.Interpreter)
@@ -841,7 +840,7 @@ SingleValue UBAwareInterpreter::offsetPointer(const Pointer &Ptr,
   if (!NewAddr)
     return poison();
   int64_t NewOffset = static_cast<uint64_t>(Ptr.Offset) + Offset.getSExtValue();
-  if (NewOffset < 0 || NewOffset >= static_cast<int64_t>(Ptr.Bound)) {
+  if (NewOffset < 0 || NewOffset > static_cast<int64_t>(Ptr.Bound)) {
     if (Flags.isInBounds())
       return poison();
     return MemMgr.lookupPointer(*NewAddr);
@@ -1000,9 +999,18 @@ bool UBAwareInterpreter::jumpTo(BasicBlock *To) {
   }
   return false;
 }
-AnyValue UBAwareInterpreter::getValue(Value *V) {
-  if (auto *C = dyn_cast<Constant>(V))
-    return convertFromConstant(C);
+static AnyValue None{std::monostate{}};
+const AnyValue &none() { return None; }
+const AnyValue &UBAwareInterpreter::getValue(Value *V) {
+  if (auto *C = dyn_cast<Constant>(V)) {
+    auto Iter = ConstantCache.find(C);
+    if (Iter == ConstantCache.end())
+      Iter =
+          ConstantCache
+              .insert({C, std::make_unique<AnyValue>(convertFromConstant(C))})
+              .first;
+    return *Iter->second;
+  }
   if (isa<MetadataAsValue>(V))
     return none();
   return CurrentFrame->ValueMap.at(V);
@@ -1808,7 +1816,6 @@ SingleValue UBAwareInterpreter::computeGEP(const SingleValue &Base,
   return offsetPointer(Ptr, Offset, Flags);
 }
 bool UBAwareInterpreter::visitGetElementPtrInst(GetElementPtrInst &GEP) {
-  // TODO: handle inrange
   uint32_t BitWidth = DL.getIndexSizeInBits(0);
   APInt Offset = APInt::getZero(BitWidth);
   SmallMapVector<Value *, APInt, 4> VarOffsets;

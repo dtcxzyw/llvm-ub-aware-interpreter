@@ -261,7 +261,6 @@ struct AnyValue final {
   }
   bool refines(const AnyValue &RHS) const;
 };
-inline AnyValue none() { return AnyValue{std::monostate{}}; }
 raw_ostream &operator<<(raw_ostream &Out, const AnyValue &Val);
 
 struct FunctionAnalysisCache final {
@@ -386,6 +385,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   DenseMap<size_t, Function *> ValidCallees;
   DenseMap<size_t, BasicBlock *> ValidBlockTargets;
   DenseMap<BasicBlock *, std::shared_ptr<MemObject>> BlockTargets;
+  DenseMap<Constant *, std::unique_ptr<AnyValue>> ConstantCache;
   std::unordered_map<Function *, FunctionAnalysisCache> AnalysisCache;
   EMITrackingInfo EMIInfo;
   std::mt19937_64 Gen;
@@ -417,7 +417,7 @@ public:
   const InterpreterOption &getOption() const { return Option; }
   bool addValue(Instruction &I, AnyValue Val);
   bool jumpTo(BasicBlock *To);
-  AnyValue getValue(Value *V);
+  const AnyValue &getValue(Value *V);
   std::optional<APInt> getInt(const SingleValue &SV);
   std::optional<APInt> getInt(Value *V);
   APInt getIntNonPoison(Value *V);
