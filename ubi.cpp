@@ -2914,6 +2914,44 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     }
     return std::move(Res);
   }
+  case Intrinsic::masked_load: {
+    auto Ptr = Args[0].getSingleValue();
+    auto Align = getInt(Args[1].getSingleValue())->getZExtValue();
+    auto &Mask = Args[2].getValueArray();
+    auto &PassThru = Args[3].getValueArray();
+    auto *ValTy = cast<VectorType>(RetTy);
+    auto *AccessTy = ValTy->getScalarType();
+    uint32_t Len = getVectorLength(ValTy);
+    APInt Offset(DL.getIndexSizeInBits(0),
+                 DL.getTypeStoreSize(AccessTy).getFixedValue(), false, true);
+    std::vector<AnyValue> Values;
+    Values.reserve(Len);
+    for (uint32_t I = 0; I != Len; ++I) {
+      if (getBooleanNonPoison(Mask[I].getSingleValue()))
+        Values.push_back(load(Ptr, Align, AccessTy, false));
+      else
+        Values.push_back(PassThru[I]);
+      Ptr = computeGEP(Ptr, Offset, GEPNoWrapFlags::none());
+    }
+    return std::move(Values);
+  }
+  case Intrinsic::masked_store: {
+    auto &Values = Args[0].getValueArray();
+    auto Ptr = Args[1].getSingleValue();
+    auto Align = getInt(Args[2].getSingleValue())->getZExtValue();
+    auto &Mask = Args[3].getValueArray();
+    auto *ValTy = cast<VectorType>(II.getArgOperand(0)->getType());
+    auto *AccessTy = ValTy->getScalarType();
+    uint32_t Len = Values.size();
+    APInt Offset(DL.getIndexSizeInBits(0),
+                 DL.getTypeStoreSize(AccessTy).getFixedValue(), false, true);
+    for (uint32_t I = 0; I != Len; ++I) {
+      if (getBooleanNonPoison(Mask[I].getSingleValue()))
+        store(Ptr, Align, Values[I], AccessTy, false);
+      Ptr = computeGEP(Ptr, Offset, GEPNoWrapFlags::none());
+    }
+    return none();
+  }
   default:
     break;
   }

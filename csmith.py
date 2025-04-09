@@ -249,7 +249,7 @@ def csmith_test(i):
                     + file_o0_output
                     + " "
                     + file_c
-                    + " -O3 -Xclang -disable-llvm-passes -emit-llvm -S"
+                    + " -O3 --target=riscv64-linux-gnu -mcpu=spacemit-x60 -emit-llvm -S"
                 )
                 subprocess.check_call(
                     comp_command.split(" "),
@@ -264,21 +264,21 @@ def csmith_test(i):
             try:
                 ref_out = subprocess.check_output(
                     [llubi_bin, file_o0_output] + llubi_workarounds,
-                    timeout=exec_timeout * 2,
+                    timeout=exec_timeout * 5,
                 )
             except subprocess.TimeoutExpired:
                 # Ignore timeout
                 os.remove(file_c)
                 os.remove(file_out)
                 os.remove(file_o0_output)
-                return True
+                return None
             except Exception:
                 return False
 
         try:
             out = subprocess.check_output(
                 [llubi_bin, file_out] + llubi_workarounds + ["--verify-value-tracking"],
-                timeout=exec_timeout * 2,
+                timeout=exec_timeout * 5,
             )
         except subprocess.TimeoutExpired:
             # Ignore timeout
@@ -286,7 +286,7 @@ def csmith_test(i):
             os.remove(file_out)
             if not inconsistent:
                 os.remove(file_o0_output)
-            return True
+            return None
         except Exception:
             return False
 
