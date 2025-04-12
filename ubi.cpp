@@ -984,13 +984,13 @@ bool UBAwareInterpreter::jumpTo(BasicBlock *To) {
   BasicBlock *From = CurrentFrame->BB;
   if (Option.VerifySCEV) {
     auto &LI = CurrentFrame->Cache->LI;
-    auto *L0 = LI.getLoopFor(From);
     auto *L1 = LI.getLoopFor(To);
 
-    if (L1->getHeader() == To) {
+    if (L1 && L1->getHeader() == To) {
+      auto *L0 = LI.getLoopFor(From);
       if (L0 == L1)
         ++CurrentFrame->Cache->BECount[L1];
-      else if (L0->contains(L1))
+      else if (!L0 || L0->contains(L1))
         CurrentFrame->Cache->BECount[L1] = 0;
     }
   }
@@ -3717,7 +3717,7 @@ class SCEVEvaluator final : public SCEVVisitor<SCEVEvaluator, SCEVEvalRes> {
   uint32_t getSize(const SCEV *S) {
     auto *Ty = S->getType();
     if (Ty->isPointerTy())
-      return DL.getPointerTypeSize(Ty);
+      return DL.getPointerTypeSizeInBits(Ty);
     return Ty->getIntegerBitWidth();
   }
 
@@ -3784,7 +3784,7 @@ public:
   }
 
   SCEVEvalRes visitMulExpr(const SCEVMulExpr *S) {
-    APInt Res(getSize(S), 0);
+    APInt Res(getSize(S), 1);
     // TODO: the nowrap flags must apply regardless of the order
     // sort by the absolute value
     for (auto *Op : S->operands()) {
