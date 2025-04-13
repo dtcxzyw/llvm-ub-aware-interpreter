@@ -3674,7 +3674,6 @@ void UBAwareInterpreter::verifyValueTracking(Value *V, const AnyValue &RV,
   // TODO: known fpclass
 }
 
-// TODO: convert nowrap violation into immediate UB
 using SCEVEvalRes = std::optional<APInt>;
 
 static uint64_t GetBinomialCoefficient(uint64_t N, uint64_t M) {
@@ -3711,7 +3710,6 @@ static uint64_t GetBinomialCoefficient(uint64_t N, uint64_t M) {
 }
 
 class SCEVEvaluator final : public SCEVVisitor<SCEVEvaluator, SCEVEvalRes> {
-  UBAwareInterpreter &Interpreter;
   const DataLayout &DL;
   function_ref<SCEVEvalRes(Value *)> EvalUnknown;
   function_ref<uint32_t(const Loop *)> GetLoopBECount;
@@ -3725,12 +3723,12 @@ class SCEVEvaluator final : public SCEVVisitor<SCEVEvaluator, SCEVEvalRes> {
   }
 
 public:
-  explicit SCEVEvaluator(UBAwareInterpreter &Interpreter, const DataLayout &DL,
+  explicit SCEVEvaluator(const DataLayout &DL,
                          function_ref<SCEVEvalRes(Value *)> EvalUnknown,
                          function_ref<uint32_t(const Loop *)> GetLoopBECount,
                          uint32_t VScale)
-      : Interpreter(Interpreter), DL(DL), EvalUnknown(EvalUnknown),
-        GetLoopBECount(GetLoopBECount), VScale(VScale) {}
+      : DL(DL), EvalUnknown(EvalUnknown), GetLoopBECount(GetLoopBECount),
+        VScale(VScale) {}
 
   SCEVEvalRes visitConstant(const SCEVConstant *SC) {
     return SC->getValue()->getValue();
@@ -3810,8 +3808,10 @@ public:
     auto RHSRes = visit(S->getRHS());
     if (!RHSRes.has_value())
       return std::nullopt;
+    // For better diagnostics, convert division by zero from immediate UB to
+    // poison.
     if (RHSRes->isZero())
-      ImmUBReporter(Interpreter) << "SCEV division by zero\n";
+      return std::nullopt;
     return LHSRes->udiv(*RHSRes);
   }
 
@@ -3939,10 +3939,8 @@ void UBAwareInterpreter::verifySCEV(Value *V, const AnyValue &RV) {
   auto GetLoopBECount = [&](const Loop *L) -> uint32_t {
     return CurrentFrame->Cache->BECount.at(L);
   };
-  SCEVEvaluator Evaluator{*this, DL, EvalUnknown, GetLoopBECount,
-                          Option.VScale};
+  SCEVEvaluator Evaluator{DL, EvalUnknown, GetLoopBECount, Option.VScale};
   auto SCEVRes = Evaluator.visit(Expr);
-  // SCEV evaluation doesn't trigger immediate UB.
   auto &SingleRV = getValue(V).getSingleValue();
   if (isPoison(SingleRV))
     return;
