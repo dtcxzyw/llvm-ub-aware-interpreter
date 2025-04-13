@@ -3587,7 +3587,7 @@ void UBAwareInterpreter::dumpStackTrace() {
 }
 FunctionAnalysisCache::FunctionAnalysisCache(Function &F,
                                              TargetLibraryInfoImpl &TLIImpl)
-    : DT(F), AC(F), TLI(TLIImpl), LI(DT), SE(F, TLI, AC, DT, LI) {
+    : DT(F), AC(F), TLI(TLIImpl, &F), LI(DT), SE(F, TLI, AC, DT, LI) {
   for (auto &BB : F) {
     if (auto *Branch = dyn_cast<BranchInst>(BB.getTerminator())) {
       if (Branch->isUnconditional())
@@ -3927,16 +3927,42 @@ void UBAwareInterpreter::verifySCEV(Value *V, const AnyValue &RV) {
   auto &SingleRV = getValue(V).getSingleValue();
   if (isPoison(SingleRV))
     return;
-  if (!SCEVRes.has_value())
+  auto DumpSubExprs = [&] {
+    struct EvalAllSubExpr {
+      SCEVEvaluator &Evaluator;
+
+      bool follow(const SCEV *S) {
+        if (isa<SCEVConstant>(S))
+          return false;
+        auto Res = Evaluator.visit(S);
+        if (!Res.has_value())
+          errs() << "  " << *S << " = poison\n";
+        else
+          errs() << "  " << *S << " = " << *Res << '\n';
+        return true;
+      }
+
+      bool isDone() const { return false; }
+    };
+
+    EvalAllSubExpr E{Evaluator};
+    SCEVTraversal<EvalAllSubExpr> Traversal{E};
+    Traversal.visitAll(SE);
+  };
+  if (!SCEVRes.has_value()) {
+    DumpSubExprs();
     ImmUBReporter(*this) << "SCEV result is more poisonous than real value\n"
                          << *V << " = " << RV << '\n'
                          << *SE << " = poison" << '\n';
+  }
   auto &SCEVIntRes = SCEVRes.value();
   auto &RealRes = std::holds_alternative<Pointer>(SingleRV)
                       ? std::get<Pointer>(SingleRV).Address
                       : std::get<APInt>(SingleRV);
-  if (SCEVIntRes != RealRes)
+  if (SCEVIntRes != RealRes) {
+    DumpSubExprs();
     ImmUBReporter(*this) << "SCEV result is different from real value\n"
                          << *V << " = " << RV << '\n'
                          << *SE << " = " << SCEVIntRes << '\n';
+  }
 }
