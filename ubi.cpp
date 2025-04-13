@@ -3695,13 +3695,16 @@ static uint64_t GetBinomialCoefficient(uint64_t N, uint64_t M) {
     Coeff2D.resize(M + 1);
   for (uint64_t I = 0; I <= M; ++I) {
     auto &Coeffs = Coeff2D[I];
-    auto &LastCoeffs = Coeff2D[I - 1];
-    Coeffs.reserve(N + 1);
-    for (uint64_t J = Coeffs.size(); J <= N; ++J) {
-      if (I == 0)
-        Coeffs.push_back(1);
-      else
-        Coeffs.push_back(LastCoeffs[J] + (J ? 0 : LastCoeffs[J - 1]));
+    if (I == 0) {
+      if (Coeffs.size() < N + 1)
+        Coeffs.resize(N + 1, 1);
+    } else {
+      auto &LastCoeffs = Coeff2D[I - 1];
+      Coeffs.reserve(N + 1);
+      if (Coeffs.empty())
+        Coeffs.push_back(0);
+      for (uint64_t J = Coeffs.size(); J <= N; ++J)
+        Coeffs.push_back(Coeffs[J - 1] + LastCoeffs[J - 1]);
     }
   }
   return Coeff2D[M][N];
@@ -3879,10 +3882,10 @@ public:
     APInt Inc = APInt::getZero(getSize(S));
     uint32_t Idx = 1;
     for (auto *Op : drop_begin(S->operands())) {
-      auto OpRes = visit(Op);
       auto Coeff = GetBinomialCoefficient(BECount, Idx++);
       if (Coeff == 0)
         continue;
+      auto OpRes = visit(Op);
       if (!OpRes.has_value())
         return std::nullopt;
       auto Add = *OpRes * Coeff;
