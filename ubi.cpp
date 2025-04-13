@@ -3873,26 +3873,44 @@ public:
     return Res;
   }
 
-  // TODO: handle self wrap
   SCEVEvalRes visitAddRecExpr(const SCEVAddRecExpr *S) {
     auto Start = visit(S->getStart());
     if (!Start.has_value())
       return std::nullopt;
     auto BECount = GetLoopBECount(S->getLoop());
-    APInt Inc = APInt::getZero(getSize(S));
-    uint32_t Idx = 1;
-    for (auto *Op : drop_begin(S->operands())) {
-      auto Coeff = GetBinomialCoefficient(BECount, Idx++);
-      if (Coeff == 0)
-        continue;
-      auto OpRes = visit(Op);
-      if (!OpRes.has_value())
+    if (BECount == 0)
+      return Start;
+    // We only check nw for affine addrec.
+    if (S->isAffine()) {
+      auto Step = visit(S->getOperand(1));
+      if (!Step.has_value())
         return std::nullopt;
-      auto Add = *OpRes * Coeff;
-      Inc += Add;
+      APInt BECountC(Step->getBitWidth(), BECount, false, true);
+      if (S->hasNoSelfWrap()) {
+        auto AbsStep = Step->abs();
+        bool Overflow = false;
+        (void)AbsStep.umul_ov(BECountC, Overflow);
+        if (Overflow)
+          return std::nullopt;
+      }
+      return addNoWrap(*Start, *Step * BECountC, S->hasNoSignedWrap(),
+                       S->hasNoUnsignedWrap());
+    } else {
+      APInt Inc = APInt::getZero(getSize(S));
+      uint32_t Idx = 1;
+      for (auto *Op : drop_begin(S->operands())) {
+        auto Coeff = GetBinomialCoefficient(BECount, Idx++);
+        if (Coeff == 0)
+          continue;
+        auto OpRes = visit(Op);
+        if (!OpRes.has_value())
+          return std::nullopt;
+        auto Add = *OpRes * Coeff;
+        Inc += Add;
+      }
+      return addNoWrap(*Start, Inc, S->hasNoSignedWrap(),
+                       S->hasNoUnsignedWrap());
     }
-
-    return addNoWrap(*Start, Inc, S->hasNoSignedWrap(), S->hasNoUnsignedWrap());
   }
 
   SCEVEvalRes visitUnknown(const SCEVUnknown *S) {
