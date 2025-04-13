@@ -277,8 +277,14 @@ def csmith_test(i):
 
         try:
             out = subprocess.check_output(
-                [llubi_bin, file_out] + llubi_workarounds + ["--verify-value-tracking"],
+                [llubi_bin, file_out]
+                + llubi_workarounds
+                + ["--verify-value-tracking", "--verify-scev-res"],
                 timeout=exec_timeout * 5,
+                env={
+                    "LLVM_DISABLE_CRASH_REPORT": "1",
+                    "LLVM_DISABLE_SYMBOLIZATION": "1",
+                },
             )
         except subprocess.TimeoutExpired:
             # Ignore timeout

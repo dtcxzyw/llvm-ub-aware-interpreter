@@ -5,11 +5,13 @@
 
 #include "ubi.h"
 #include <llvm/Analysis/AssumeBundleQueries.h>
+#include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InlineAsm.h>
 #include <cassert>
 #include <cstdlib>
 #include <utility>
+#include <variant>
 #include <vector>
 
 class ImmUBReporter final {
@@ -980,6 +982,19 @@ bool UBAwareInterpreter::jumpTo(BasicBlock *To) {
     To->printAsOperand(errs(), false);
   }
   BasicBlock *From = CurrentFrame->BB;
+  if (Option.VerifySCEV) {
+    auto &LI = CurrentFrame->Cache->LI;
+    auto *L1 = LI.getLoopFor(To);
+
+    if (L1 && L1->getHeader() == To) {
+      auto *L0 = LI.getLoopFor(From);
+      if (L0 == L1)
+        ++CurrentFrame->Cache->BECount[L1];
+      else
+        CurrentFrame->Cache->BECount[L1] = 0;
+    }
+  }
+
   CurrentFrame->BB = To;
   CurrentFrame->PC = To->begin();
   SmallVector<std::pair<PHINode *, AnyValue>> IncomingValues;
@@ -3263,11 +3278,16 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   }
 
   FunctionAnalysisCache *FAC = nullptr;
-  if (Option.VerifyValueTracking) {
+  if (Option.VerifyValueTracking || Option.VerifySCEV) {
     auto CacheIter = AnalysisCache.find(Func);
-    if (CacheIter == AnalysisCache.end())
-      CacheIter = AnalysisCache.emplace(Func, *Func).first;
-    FAC = &CacheIter->second;
+    if (CacheIter == AnalysisCache.end()) {
+      CacheIter =
+          AnalysisCache
+              .emplace(Func,
+                       std::make_unique<FunctionAnalysisCache>(*Func, TLI))
+              .first;
+    }
+    FAC = CacheIter->second.get();
   }
 
   Frame CallFrame{Func, FAC, TLI, CurrentFrame, ME};
@@ -3308,10 +3328,17 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
     }
     // TODO: verify at-use analysis result
     if (visit(*CallFrame.PC)) {
-      if (Option.VerifyValueTracking) {
-        auto Iter = CallFrame.ValueMap.find(&*CallFrame.PC);
-        if (Iter != CallFrame.ValueMap.end())
-          verifyAnalysis(Iter->first, Iter->second, &*CallFrame.PC);
+      if ((Option.VerifyValueTracking || Option.VerifySCEV)) {
+        Type *Ty = (*CallFrame.PC).getType();
+        if (Ty->isSingleValueType()) {
+          auto Iter = CallFrame.ValueMap.find(&*CallFrame.PC);
+          if (Iter != CallFrame.ValueMap.end()) {
+            if (Option.VerifyValueTracking)
+              verifyValueTracking(Iter->first, Iter->second, &*CallFrame.PC);
+            if (Option.VerifySCEV && CallFrame.Cache->SE.isSCEVable(Ty))
+              verifySCEV(Iter->first, Iter->second);
+          }
+        }
       }
       auto *InnerCB = dyn_cast<CallBase>(CallFrame.PC);
       if (InnerCB && InnerCB->getType()->isPointerTy() &&
@@ -3558,7 +3585,9 @@ void UBAwareInterpreter::dumpStackTrace() {
     Frame = Frame->LastFrame;
   }
 }
-FunctionAnalysisCache::FunctionAnalysisCache(Function &F) : DT(F), AC(F) {
+FunctionAnalysisCache::FunctionAnalysisCache(Function &F,
+                                             TargetLibraryInfoImpl &TLIImpl)
+    : DT(F), AC(F), TLI(TLIImpl, &F), LI(DT), SE(F, TLI, AC, DT, LI) {
   for (auto &BB : F) {
     if (auto *Branch = dyn_cast<BranchInst>(BB.getTerminator())) {
       if (Branch->isUnconditional())
@@ -3594,8 +3623,8 @@ Frame::Frame(Function *Func, FunctionAnalysisCache *Cache,
              TargetLibraryInfoImpl &TLI, Frame *LastFrame, MemoryEffects ME)
     : Func(Func), BB(nullptr), PC(), Cache(Cache), TLI(TLI, Func),
       LastFrame(LastFrame), MemEffects(ME) {}
-void UBAwareInterpreter::verifyAnalysis(Value *V, const AnyValue &RV,
-                                        const Instruction *CxtI) {
+void UBAwareInterpreter::verifyValueTracking(Value *V, const AnyValue &RV,
+                                             const Instruction *CxtI) {
   auto *Ty = V->getType();
   SimplifyQuery SQ = getSQ(CxtI);
 
@@ -3643,4 +3672,335 @@ void UBAwareInterpreter::verifyAnalysis(Value *V, const AnyValue &RV,
       ImmUBReporter(*this) << *V << " may be null\n";
   }
   // TODO: known fpclass
+}
+
+using SCEVEvalRes = std::optional<APInt>;
+
+static uint64_t GetBinomialCoefficient(uint64_t N, uint64_t M) {
+  if (N < M)
+    return 0;
+  if (N == M || M == 0)
+    return 1;
+  if (N - M < M)
+    M = N - M;
+  if (M == 1)
+    return N;
+  if (M == 2 && N <= (1ULL << 32))
+    return N * (N - 1) / 2;
+  if (M == 3 && N <= (1ULL << 21))
+    return N * (N - 1) * (N - 2) / 6;
+  static std::vector<std::vector<uint32_t>> Coeff2D;
+  if (Coeff2D.size() < M + 1)
+    Coeff2D.resize(M + 1);
+  for (uint64_t I = 0; I <= M; ++I) {
+    auto &Coeffs = Coeff2D[I];
+    if (I == 0) {
+      if (Coeffs.size() < N + 1)
+        Coeffs.resize(N + 1, 1);
+    } else {
+      auto &LastCoeffs = Coeff2D[I - 1];
+      Coeffs.reserve(N + 1);
+      if (Coeffs.empty())
+        Coeffs.push_back(0);
+      for (uint64_t J = Coeffs.size(); J <= N; ++J)
+        Coeffs.push_back(Coeffs[J - 1] + LastCoeffs[J - 1]);
+    }
+  }
+  return Coeff2D[M][N];
+}
+
+class SCEVEvaluator final : public SCEVVisitor<SCEVEvaluator, SCEVEvalRes> {
+  const DataLayout &DL;
+  function_ref<SCEVEvalRes(Value *)> EvalUnknown;
+  function_ref<uint32_t(const Loop *)> GetLoopBECount;
+  uint32_t VScale;
+
+  uint32_t getSize(const SCEV *S) {
+    auto *Ty = S->getType();
+    if (Ty->isPointerTy())
+      return DL.getPointerTypeSizeInBits(Ty);
+    return Ty->getIntegerBitWidth();
+  }
+
+public:
+  explicit SCEVEvaluator(const DataLayout &DL,
+                         function_ref<SCEVEvalRes(Value *)> EvalUnknown,
+                         function_ref<uint32_t(const Loop *)> GetLoopBECount,
+                         uint32_t VScale)
+      : DL(DL), EvalUnknown(EvalUnknown), GetLoopBECount(GetLoopBECount),
+        VScale(VScale) {}
+
+  SCEVEvalRes visitConstant(const SCEVConstant *SC) {
+    return SC->getValue()->getValue();
+  }
+
+  SCEVEvalRes visitVScale(const SCEVVScale *S) {
+    return APInt{getSize(S), VScale};
+  }
+
+  SCEVEvalRes visitPtrToIntExpr(const SCEVPtrToIntExpr *S) {
+    auto *Ptr = S->getOperand();
+    return visit(Ptr);
+  }
+
+  SCEVEvalRes visitTruncateExpr(const SCEVTruncateExpr *S) {
+    auto *Op = S->getOperand();
+    auto OpRes = visit(Op);
+    if (!OpRes.has_value())
+      return std::nullopt;
+    return OpRes->trunc(getSize(S));
+  }
+
+  SCEVEvalRes visitZeroExtendExpr(const SCEVZeroExtendExpr *S) {
+    auto *Op = S->getOperand();
+    auto OpRes = visit(Op);
+    if (!OpRes.has_value())
+      return std::nullopt;
+    return OpRes->zext(getSize(S));
+  }
+
+  SCEVEvalRes visitSignExtendExpr(const SCEVSignExtendExpr *S) {
+    auto *Op = S->getOperand();
+    auto OpRes = visit(Op);
+    if (!OpRes.has_value())
+      return std::nullopt;
+    return OpRes->sext(getSize(S));
+  }
+
+  SCEVEvalRes visitAddExpr(const SCEVAddExpr *S) {
+    // TODO: the nowrap flags must apply regardless of the order
+    // (sum of positives) + (sum of negatives)
+    APInt Res(getSize(S), 0);
+    for (auto *Op : S->operands()) {
+      auto OpRes = visit(Op);
+      if (!OpRes.has_value())
+        return std::nullopt;
+      auto BinOpRes =
+          addNoWrap(Res, *OpRes, S->hasNoSignedWrap(), S->hasNoUnsignedWrap());
+      if (!BinOpRes.has_value())
+        return std::nullopt;
+      Res = *BinOpRes;
+    }
+    return Res;
+  }
+
+  SCEVEvalRes visitMulExpr(const SCEVMulExpr *S) {
+    APInt Res(getSize(S), 1);
+    // TODO: the nowrap flags must apply regardless of the order
+    // sort by the absolute value
+    for (auto *Op : S->operands()) {
+      auto OpRes = visit(Op);
+      if (!OpRes.has_value())
+        return std::nullopt;
+      auto BinOpRes =
+          mulNoWrap(Res, *OpRes, S->hasNoSignedWrap(), S->hasNoUnsignedWrap());
+      if (!BinOpRes.has_value())
+        return std::nullopt;
+      Res = *BinOpRes;
+    }
+    return Res;
+  }
+
+  SCEVEvalRes visitUDivExpr(const SCEVUDivExpr *S) {
+    auto LHSRes = visit(S->getLHS());
+    if (!LHSRes.has_value())
+      return std::nullopt;
+    auto RHSRes = visit(S->getRHS());
+    if (!RHSRes.has_value())
+      return std::nullopt;
+    // For better diagnostics, convert division by zero from immediate UB to
+    // poison.
+    if (RHSRes->isZero())
+      return std::nullopt;
+    return LHSRes->udiv(*RHSRes);
+  }
+
+  SCEVEvalRes visitSMaxExpr(const SCEVSMaxExpr *S) {
+    APInt Res = APInt::getSignedMinValue(getSize(S));
+    for (auto *Op : S->operands()) {
+      auto OpRes = visit(Op);
+      if (!OpRes.has_value())
+        return std::nullopt;
+      Res = APIntOps::smax(Res, *OpRes);
+    }
+    return Res;
+  }
+
+  SCEVEvalRes visitSMinExpr(const SCEVSMinExpr *S) {
+    APInt Res = APInt::getSignedMaxValue(getSize(S));
+    for (auto *Op : S->operands()) {
+      auto OpRes = visit(Op);
+      if (!OpRes.has_value())
+        return std::nullopt;
+      Res = APIntOps::smin(Res, *OpRes);
+    }
+    return Res;
+  }
+
+  SCEVEvalRes visitUMaxExpr(const SCEVUMaxExpr *S) {
+    APInt Res = APInt::getMinValue(getSize(S));
+    for (auto *Op : S->operands()) {
+      auto OpRes = visit(Op);
+      if (!OpRes.has_value())
+        return std::nullopt;
+      Res = APIntOps::umax(Res, *OpRes);
+    }
+    return Res;
+  }
+
+  SCEVEvalRes visitUMinExpr(const SCEVUMinExpr *S) {
+    APInt Res = APInt::getMaxValue(getSize(S));
+    for (auto *Op : S->operands()) {
+      auto OpRes = visit(Op);
+      if (!OpRes.has_value())
+        return std::nullopt;
+      Res = APIntOps::umin(Res, *OpRes);
+    }
+    return Res;
+  }
+
+  SCEVEvalRes visitSequentialUMinExpr(const SCEVSequentialUMinExpr *S) {
+    APInt Res = APInt::getMaxValue(getSize(S));
+    for (auto *Op : S->operands()) {
+      auto OpRes = visit(Op);
+      if (!OpRes.has_value())
+        return std::nullopt;
+      // We reached the saturation point.
+      if (OpRes->isMinValue())
+        return *OpRes;
+      Res = APIntOps::umin(Res, *OpRes);
+    }
+    return Res;
+  }
+
+  SCEVEvalRes visitAddRecExpr(const SCEVAddRecExpr *S) {
+    auto Start = visit(S->getStart());
+    if (!Start.has_value())
+      return std::nullopt;
+    auto BECount = GetLoopBECount(S->getLoop());
+    if (BECount == 0)
+      return Start;
+    // We only check nw for affine addrec.
+    if (S->isAffine()) {
+      auto Step = visit(S->getOperand(1));
+      if (!Step.has_value())
+        return std::nullopt;
+      APInt BECountC(Step->getBitWidth(), BECount, false, true);
+      if (S->hasNoSelfWrap()) {
+        auto AbsStep = Step->abs();
+        bool Overflow = false;
+        (void)AbsStep.umul_ov(BECountC, Overflow);
+        if (Overflow)
+          return std::nullopt;
+      }
+      return addNoWrap(*Start, *Step * BECountC, S->hasNoSignedWrap(),
+                       S->hasNoUnsignedWrap());
+    } else {
+      APInt Inc = APInt::getZero(getSize(S));
+      uint32_t Idx = 1;
+      for (auto *Op : drop_begin(S->operands())) {
+        auto Coeff = GetBinomialCoefficient(BECount, Idx++);
+        if (Coeff == 0)
+          continue;
+        auto OpRes = visit(Op);
+        if (!OpRes.has_value())
+          return std::nullopt;
+        auto Add = *OpRes * Coeff;
+        Inc += Add;
+      }
+      return addNoWrap(*Start, Inc, S->hasNoSignedWrap(),
+                       S->hasNoUnsignedWrap());
+    }
+  }
+
+  SCEVEvalRes visitUnknown(const SCEVUnknown *S) {
+    return EvalUnknown(S->getValue());
+  }
+};
+
+void UBAwareInterpreter::verifySCEV(Value *V, const AnyValue &RV) {
+  auto &SE = CurrentFrame->Cache->SE;
+  auto *Expr = SE.getSCEV(V);
+
+  if (isa<SCEVUnknown>(Expr))
+    return;
+
+  auto EvalUnknown = [&](Value *V) -> SCEVEvalRes {
+    auto &Res = getValue(V).getSingleValue();
+    if (isPoison(Res))
+      return std::nullopt;
+    if (auto *C = std::get_if<APInt>(&Res))
+      return *C;
+    if (auto *P = std::get_if<Pointer>(&Res))
+      return P->Address;
+    errs() << "Unknown value type: " << *V << '\n';
+    llvm_unreachable("Unreachable");
+  };
+  auto GetLoopBECount = [&](const Loop *L) -> uint32_t {
+    return CurrentFrame->Cache->BECount.at(L);
+  };
+  SCEVEvaluator Evaluator{DL, EvalUnknown, GetLoopBECount, Option.VScale};
+  auto SCEVRes = Evaluator.visit(Expr);
+  auto &SingleRV = getValue(V).getSingleValue();
+  if (isPoison(SingleRV))
+    return;
+  auto DumpSubExprs = [&] {
+    struct EvalAllSubExpr {
+      SCEVEvaluator &Evaluator;
+
+      bool follow(const SCEV *S) {
+        if (isa<SCEVConstant>(S))
+          return false;
+        auto Res = Evaluator.visit(S);
+        if (!Res.has_value())
+          errs() << "  " << *S << " = poison\n";
+        else
+          errs() << "  " << *S << " = " << *Res << '\n';
+        return true;
+      }
+
+      bool isDone() const { return false; }
+    };
+
+    EvalAllSubExpr E{Evaluator};
+    SCEVTraversal<EvalAllSubExpr> Traversal{E};
+    Traversal.visitAll(Expr);
+  };
+  if (!SCEVRes.has_value()) {
+    DumpSubExprs();
+    ImmUBReporter(*this) << "SCEV result is more poisonous than real value\n"
+                         << *V << " = " << RV << '\n'
+                         << *Expr << " = poison" << '\n';
+  }
+  auto &SCEVIntRes = SCEVRes.value();
+  auto &RealRes = std::holds_alternative<Pointer>(SingleRV)
+                      ? std::get<Pointer>(SingleRV).Address
+                      : std::get<APInt>(SingleRV);
+  if (SCEVIntRes != RealRes) {
+    DumpSubExprs();
+    ImmUBReporter(*this) << "SCEV result is different from real value\n"
+                         << *V << " = " << RV << '\n'
+                         << *Expr << " = " << SCEVIntRes << '\n';
+  }
+
+  // Verify analysis result
+  auto UCR = SE.getUnsignedRange(Expr);
+  if (!UCR.contains(SCEVIntRes))
+    ImmUBReporter(*this) << "Real value is out of the SCEV unsigned range\n"
+                         << *V << " = " << RV << '\n'
+                         << *Expr << " = " << UCR << '\n';
+
+  auto SCR = SE.getSignedRange(Expr);
+  if (!SCR.contains(SCEVIntRes))
+    ImmUBReporter(*this) << "Real value is out of the SCEV signed range\n"
+                         << *V << " = " << RV << '\n'
+                         << *Expr << " = " << SCR << '\n';
+
+  auto Fac = SE.getConstantMultiple(Expr);
+  if (Fac.ugt(1) && !RealRes.urem(Fac).isZero()) {
+    ImmUBReporter(*this)
+        << "Real value is not a multiple of the SCEV constant\n"
+        << *V << " = " << RV << '\n'
+        << "MaxKnownFac(" << *Expr << ") = " << Fac << '\n';
+  }
 }

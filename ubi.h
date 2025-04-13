@@ -21,6 +21,8 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Analysis/AssumptionCache.h>
 #include <llvm/Analysis/DomConditionCache.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/ScalarEvolution.h>
 #include <llvm/Analysis/SimplifyQuery.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/Attributes.h>
@@ -267,10 +269,14 @@ struct FunctionAnalysisCache final {
   DominatorTree DT;
   AssumptionCache AC;
   DomConditionCache DC;
+  TargetLibraryInfo TLI;
+  LoopInfo LI;
+  ScalarEvolution SE;
   DenseMap<Value *, bool> NonZeroCache;
   DenseMap<Value *, KnownBits> KnownBitsCache;
+  DenseMap<Loop *, uint32_t> BECount;
 
-  FunctionAnalysisCache(Function &F);
+  FunctionAnalysisCache(Function &F, TargetLibraryInfoImpl &TLIImpl);
   FunctionAnalysisCache(const FunctionAnalysisCache &) = delete;
   KnownBits queryKnownBits(Value *V, const SimplifyQuery &SQ);
   bool queryNonZero(Value *V, const SimplifyQuery &SQ);
@@ -367,6 +373,7 @@ struct InterpreterOption {
   bool FuseFMulAdd = false;
 
   bool VerifyValueTracking = false;
+  bool VerifySCEV = false;
   bool ReduceMode = false;
   bool RustMode = false;
 };
@@ -386,7 +393,8 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   DenseMap<size_t, BasicBlock *> ValidBlockTargets;
   DenseMap<BasicBlock *, std::shared_ptr<MemObject>> BlockTargets;
   DenseMap<Constant *, std::unique_ptr<AnyValue>> ConstantCache;
-  std::unordered_map<Function *, FunctionAnalysisCache> AnalysisCache;
+  std::unordered_map<Function *, std::unique_ptr<FunctionAnalysisCache>>
+      AnalysisCache;
   EMITrackingInfo EMIInfo;
   std::mt19937_64 Gen;
   Frame *CurrentFrame = nullptr;
@@ -394,7 +402,9 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   uint64_t VolatileMemHash = 0;
 
   SimplifyQuery getSQ(const Instruction *CxtI) const;
-  void verifyAnalysis(Value *V, const AnyValue &RV, const Instruction *CxtI);
+  void verifyValueTracking(Value *V, const AnyValue &RV,
+                           const Instruction *CxtI);
+  void verifySCEV(Value *V, const AnyValue &RV);
   uint32_t getVectorLength(VectorType *Ty) const;
   uint32_t getFixedSize(TypeSize Size) const;
   AnyValue getPoison(Type *Ty) const;
