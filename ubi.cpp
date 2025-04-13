@@ -3901,9 +3901,10 @@ public:
 };
 
 void UBAwareInterpreter::verifySCEV(Value *V, const AnyValue &RV) {
-  auto *SE = CurrentFrame->Cache->SE.getSCEV(V);
+  auto &SE = CurrentFrame->Cache->SE;
+  auto *Expr = SE.getSCEV(V);
 
-  if (isa<SCEVUnknown>(SE))
+  if (isa<SCEVUnknown>(Expr))
     return;
 
   auto EvalUnknown = [&](Value *V) -> SCEVEvalRes {
@@ -3922,7 +3923,7 @@ void UBAwareInterpreter::verifySCEV(Value *V, const AnyValue &RV) {
   };
   SCEVEvaluator Evaluator{*this, DL, EvalUnknown, GetLoopBECount,
                           Option.VScale};
-  auto SCEVRes = Evaluator.visit(SE);
+  auto SCEVRes = Evaluator.visit(Expr);
   // SCEV evaluation doesn't trigger immediate UB.
   auto &SingleRV = getValue(V).getSingleValue();
   if (isPoison(SingleRV))
@@ -3947,13 +3948,13 @@ void UBAwareInterpreter::verifySCEV(Value *V, const AnyValue &RV) {
 
     EvalAllSubExpr E{Evaluator};
     SCEVTraversal<EvalAllSubExpr> Traversal{E};
-    Traversal.visitAll(SE);
+    Traversal.visitAll(Expr);
   };
   if (!SCEVRes.has_value()) {
     DumpSubExprs();
     ImmUBReporter(*this) << "SCEV result is more poisonous than real value\n"
                          << *V << " = " << RV << '\n'
-                         << *SE << " = poison" << '\n';
+                         << *Expr << " = poison" << '\n';
   }
   auto &SCEVIntRes = SCEVRes.value();
   auto &RealRes = std::holds_alternative<Pointer>(SingleRV)
@@ -3963,6 +3964,27 @@ void UBAwareInterpreter::verifySCEV(Value *V, const AnyValue &RV) {
     DumpSubExprs();
     ImmUBReporter(*this) << "SCEV result is different from real value\n"
                          << *V << " = " << RV << '\n'
-                         << *SE << " = " << SCEVIntRes << '\n';
+                         << *Expr << " = " << SCEVIntRes << '\n';
+  }
+
+  // Verify analysis result
+  auto UCR = SE.getUnsignedRange(Expr);
+  if (!UCR.contains(SCEVIntRes))
+    ImmUBReporter(*this) << "Real value is out of the SCEV unsigned range\n"
+                         << *V << " = " << RV << '\n'
+                         << *Expr << " = " << UCR << '\n';
+
+  auto SCR = SE.getSignedRange(Expr);
+  if (!SCR.contains(SCEVIntRes))
+    ImmUBReporter(*this) << "Real value is out of the SCEV signed range\n"
+                         << *V << " = " << RV << '\n'
+                         << *Expr << " = " << SCR << '\n';
+
+  auto Fac = SE.getConstantMultiple(Expr);
+  if (Fac.ugt(1) && !RealRes.urem(Fac).isZero()) {
+    ImmUBReporter(*this)
+        << "Real value is not a multiple of the SCEV constant\n"
+        << *V << " = " << RV << '\n'
+        << "MaxKnownFac(" << *Expr << ") = " << Fac << '\n';
   }
 }
