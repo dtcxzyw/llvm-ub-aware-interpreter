@@ -43,6 +43,11 @@ if not inconsistent:
 cwd = "csmith" + datetime.datetime.now().strftime("%Y-%m-%d@%H:%M")
 os.makedirs(cwd)
 
+no_report_env = {
+    "LLVM_DISABLE_CRASH_REPORT": "1",
+    "LLVM_DISABLE_SYMBOLIZATION": "1",
+}
+
 
 def check_step_by_step(file_c, basename):
     file_o0_output = basename + ".O0.ll"
@@ -67,7 +72,8 @@ def check_step_by_step(file_c, basename):
     try:
         ref_out = subprocess.check_output(
             [llubi_bin, file_o0_output] + llubi_workarounds,
-            timeout=exec_timeout * 2,
+            timeout=exec_timeout * 5,
+            env=no_report_env,
         )
     except subprocess.TimeoutExpired:
         # Ignore timeout
@@ -110,7 +116,8 @@ def check_step_by_step(file_c, basename):
         try:
             out = subprocess.check_output(
                 [llubi_bin, file_i_output] + llubi_workarounds,
-                timeout=exec_timeout * 2,
+                timeout=exec_timeout * 5,
+                env=no_report_env,
             )
         except subprocess.TimeoutExpired:
             # Ignore timeout
@@ -172,6 +179,7 @@ def csmith_test(i):
             ref_out = subprocess.check_output(
                 [llubi_bin, file_out, "--emi", file_emi_out] + llubi_workarounds,
                 timeout=exec_timeout,
+                env=no_report_env,
             )
         except subprocess.TimeoutExpired:
             # Ignore timeout
@@ -209,7 +217,8 @@ def csmith_test(i):
         try:
             out = subprocess.check_output(
                 [llubi_bin, file_emi_opt_out] + llubi_workarounds,
-                timeout=exec_timeout * 2,
+                timeout=exec_timeout * 5,
+                env=no_report_env,
             )
         except subprocess.TimeoutExpired:
             # Ignore timeout
@@ -265,6 +274,7 @@ def csmith_test(i):
                 ref_out = subprocess.check_output(
                     [llubi_bin, file_o0_output] + llubi_workarounds,
                     timeout=exec_timeout * 5,
+                    env=no_report_env,
                 )
             except subprocess.TimeoutExpired:
                 # Ignore timeout
@@ -281,10 +291,7 @@ def csmith_test(i):
                 + llubi_workarounds
                 + ["--verify-value-tracking", "--verify-scev-res"],
                 timeout=exec_timeout * 5,
-                env={
-                    "LLVM_DISABLE_CRASH_REPORT": "1",
-                    "LLVM_DISABLE_SYMBOLIZATION": "1",
-                },
+                env=no_report_env,
             )
         except subprocess.TimeoutExpired:
             # Ignore timeout
