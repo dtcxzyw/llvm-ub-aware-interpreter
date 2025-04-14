@@ -988,7 +988,7 @@ bool UBAwareInterpreter::jumpTo(BasicBlock *To) {
 
     if (L1 && L1->getHeader() == To) {
       auto *L0 = LI.getLoopFor(From);
-      if (L0 == L1)
+      if (L0 == L1 || (L0 && L1->contains(L0)))
         ++CurrentFrame->Cache->BECount[L1];
       else
         CurrentFrame->Cache->BECount[L1] = 0;
