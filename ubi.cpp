@@ -3947,22 +3947,28 @@ void UBAwareInterpreter::verifySCEV(Value *V, const AnyValue &RV) {
   auto DumpSubExprs = [&] {
     struct EvalAllSubExpr {
       SCEVEvaluator &Evaluator;
+      function_ref<uint32_t(const Loop *)> GetLoopBECount;
 
       bool follow(const SCEV *S) {
         if (isa<SCEVConstant>(S))
           return false;
         auto Res = Evaluator.visit(S);
         if (!Res.has_value())
-          errs() << "  " << *S << " = poison\n";
+          errs() << "  " << *S << " = poison";
         else
-          errs() << "  " << *S << " = " << *Res << '\n';
+          errs() << "  " << *S << " = " << *Res;
+        if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(S)) {
+          auto BECount = GetLoopBECount(AddRec->getLoop());
+          errs() << " (loop count = " << BECount << ")";
+        }
+        errs() << '\n';
         return true;
       }
 
       bool isDone() const { return false; }
     };
 
-    EvalAllSubExpr E{Evaluator};
+    EvalAllSubExpr E{Evaluator, GetLoopBECount};
     SCEVTraversal<EvalAllSubExpr> Traversal{E};
     Traversal.visitAll(Expr);
   };
