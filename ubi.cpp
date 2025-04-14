@@ -3959,7 +3959,7 @@ void UBAwareInterpreter::verifySCEV(Value *V, const AnyValue &RV) {
           errs() << "  " << *S << " = " << *Res;
         if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(S)) {
           auto BECount = GetLoopBECount(AddRec->getLoop());
-          errs() << " (loop count = " << BECount << ")";
+          errs() << " (BE count = " << BECount << ")";
         }
         errs() << '\n';
         return true;
