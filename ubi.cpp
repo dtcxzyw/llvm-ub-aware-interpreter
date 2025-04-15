@@ -3893,22 +3893,26 @@ public:
         if (Overflow)
           return std::nullopt;
       }
-      return addNoWrap(*Start, *Step * BECountC, S->hasNoSignedWrap(),
-                       S->hasNoUnsignedWrap());
+      return addNoWrap(*Start + *Step * (BECountC - 1), *Step,
+                       S->hasNoSignedWrap(), S->hasNoUnsignedWrap());
     } else {
-      APInt Inc = APInt::getZero(getSize(S));
+      APInt LastInc = APInt::getZero(getSize(S));
+      APInt CurInc = APInt::getZero(getSize(S));
       uint32_t Idx = 1;
       for (auto *Op : drop_begin(S->operands())) {
-        auto Coeff = GetBinomialCoefficient(BECount, Idx++);
-        if (Coeff == 0)
+        auto LastCoeff = GetBinomialCoefficient(BECount - 1, Idx);
+        auto CurCoeff = GetBinomialCoefficient(BECount, Idx);
+        ++Idx;
+        if (CurCoeff == 0)
           continue;
         auto OpRes = visit(Op);
         if (!OpRes.has_value())
           return std::nullopt;
-        auto Add = *OpRes * Coeff;
-        Inc += Add;
+        LastInc += *OpRes * LastCoeff;
+        CurInc += *OpRes * CurCoeff;
       }
-      return addNoWrap(*Start, Inc, S->hasNoSignedWrap(),
+      auto Diff = CurInc - LastInc;
+      return addNoWrap(*Start + LastInc, Diff, S->hasNoSignedWrap(),
                        S->hasNoUnsignedWrap());
     }
   }
