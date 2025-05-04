@@ -56,6 +56,10 @@ static cl::opt<bool> VeriySCEV("verify-scev-res",
                                cl::desc("Verify analysis results of SCEV"),
                                cl::init(false), cl::cat(Category));
 static cl::opt<bool>
+    VerifyLVI("verify-lvi",
+              cl::desc("Verify analysis results of LazyValueInfo"),
+              cl::init(false), cl::cat(Category));
+static cl::opt<bool>
     StorePoisonIsNoop("store-poison-is-noop",
                       cl::desc("Treat store poison as a no-op"),
                       cl::init(false), cl::cat(Category));
@@ -98,6 +102,7 @@ int main(int argc, char **argv) {
   Option.TrackVolatileMem = TrackVolatileMem;
   Option.VerifyValueTracking = VerifyValueTracking;
   Option.VerifySCEV = VeriySCEV;
+  Option.VerifyLazyValueInfo = VerifyLVI;
   Option.IgnoreParamAttrsOnIntrinsic = IgnoreParamAttrsOnIntrinsic;
   Option.DumpStackTrace = DumpStackTrace;
   Option.StorePoisonIsNoop = StorePoisonIsNoop;

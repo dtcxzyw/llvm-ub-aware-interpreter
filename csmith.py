@@ -290,7 +290,7 @@ def csmith_test(i):
             out = subprocess.check_output(
                 [llubi_bin, file_out]
                 + llubi_workarounds
-                + ["--verify-value-tracking", "--verify-scev-res"],
+                + ["--verify-value-tracking", "--verify-scev-res", "--verify-lvi"],
                 timeout=exec_timeout * 5,
                 env=no_report_env,
             )

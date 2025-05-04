@@ -3337,6 +3337,14 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
               verifyValueTracking(Iter->first, Iter->second, &*CallFrame.PC);
             if (Option.VerifySCEV && CallFrame.Cache->SE.isSCEVable(Ty))
               verifySCEV(Iter->first, Iter->second);
+            if (Option.VerifyLazyValueInfo && Ty->isIntegerTy() &&
+                !Ty->isIntegerTy(1)) {
+              auto CR = CallFrame.Cache->LVI.getConstantRange(
+                  Iter->first, cast<Instruction>(Iter->first), false);
+              auto &Val = Iter->second.getSingleValue();
+              if (!isPoison(Val) && !CR.contains(std::get<APInt>(Val)))
+                Val = poison();
+            }
           }
         }
       }
@@ -3587,7 +3595,8 @@ void UBAwareInterpreter::dumpStackTrace() {
 }
 FunctionAnalysisCache::FunctionAnalysisCache(Function &F,
                                              TargetLibraryInfoImpl &TLIImpl)
-    : DT(F), AC(F), TLI(TLIImpl, &F), LI(DT), SE(F, TLI, AC, DT, LI) {
+    : DT(F), AC(F), TLI(TLIImpl, &F), LI(DT), SE(F, TLI, AC, DT, LI),
+      LVI(&AC, &F.getDataLayout()) {
   for (auto &BB : F) {
     if (auto *Branch = dyn_cast<BranchInst>(BB.getTerminator())) {
       if (Branch->isUnconditional())

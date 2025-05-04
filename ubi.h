@@ -21,6 +21,7 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Analysis/AssumptionCache.h>
 #include <llvm/Analysis/DomConditionCache.h>
+#include <llvm/Analysis/LazyValueInfo.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/ScalarEvolution.h>
 #include <llvm/Analysis/SimplifyQuery.h>
@@ -272,6 +273,7 @@ struct FunctionAnalysisCache final {
   TargetLibraryInfo TLI;
   LoopInfo LI;
   ScalarEvolution SE;
+  LazyValueInfo LVI;
   DenseMap<Value *, bool> NonZeroCache;
   DenseMap<Value *, KnownBits> KnownBitsCache;
   DenseMap<Loop *, uint32_t> BECount;
@@ -374,6 +376,7 @@ struct InterpreterOption {
 
   bool VerifyValueTracking = false;
   bool VerifySCEV = false;
+  bool VerifyLazyValueInfo = false;
   bool ReduceMode = false;
   bool RustMode = false;
 };
