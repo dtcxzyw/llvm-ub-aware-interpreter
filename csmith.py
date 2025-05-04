@@ -35,6 +35,7 @@ exec_timeout = 1.0
 llubi_workarounds = [
     # https://github.com/llvm/llvm-project/issues/115890
     "--ignore-param-attrs-intrinsic",
+    "--non-global-value-max-name-size=4096",
 ]
 if not inconsistent:
     # llubi_workarounds.append('--track-volatile-mem')
