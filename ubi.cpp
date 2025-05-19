@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include <llvm/Analysis/AssumeBundleQueries.h>
 #include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/ValueTracking.h>
@@ -3118,6 +3119,12 @@ AnyValue UBAwareInterpreter::callLibFunc(LibFunc Func, Function *FuncDecl,
       ImmUBReporter(*this) << "exit with poison code";
     std::exit(Code->getSExtValue());
   }
+  case LibFunc_terminate:
+    ImmUBReporter(*this) << "Terminated";
+    break;
+  case LibFunc_abort:
+    ImmUBReporter(*this) << "Aborted";
+    break;
   default:
     break;
   }
