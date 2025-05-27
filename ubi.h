@@ -122,7 +122,7 @@ public:
   void verifyMemAccess(size_t Offset, size_t AccessSize, size_t Alignment,
                        bool IsStore);
   void store(size_t Offset, const APInt &C);
-  std::optional<APInt> load(size_t Offset, size_t Bits) const;
+  std::optional<APInt> load(size_t Offset, size_t Bits, bool FreezeBytes) const;
   APInt address() const { return Address; }
   size_t size() const { return Data.size(); }
   char *rawPointer() { return reinterpret_cast<char *>(Data.data()); }
@@ -372,6 +372,8 @@ struct InterpreterOption {
   bool IgnoreExplicitLifetimeMarker = false;
   bool FillUninitializedMemWithPoison = false;
   bool StorePoisonIsNoop = false;
+  bool StorePoisonIsImmUB = false;
+  bool FreezeBytes = false;
   bool FuseFMulAdd = false;
 
   bool VerifyValueTracking = false;

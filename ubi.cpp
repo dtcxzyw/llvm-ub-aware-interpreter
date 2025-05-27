@@ -80,18 +80,23 @@ void MemObject::store(size_t Offset, const APInt &C) {
     }
   }
 }
-std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
+std::optional<APInt> MemObject::load(size_t Offset, size_t Bits,
+                                     bool FreezeBytes) const {
   APInt Res = APInt::getZero(alignTo(Bits, 8));
   constexpr uint32_t Scale = sizeof(APInt::WordType);
   const size_t Size = Res.getBitWidth() / 8;
   uint32_t ReadCnt = 0;
   const std::byte *const ReadPos = Data.data() + Offset;
+  bool AllPoison = true;
   for (uint32_t I = 0; I != Res.getNumWords(); ++I) {
     auto &Word = const_cast<APInt::WordType &>(Res.getRawData()[I]);
     if (ReadCnt + Scale <= Size) {
       for (uint32_t J = 0; J != Scale; ++J) {
-        if (Metadata[Offset + ReadCnt + J].IsPoison)
-          return std::nullopt;
+        if (Metadata[Offset + ReadCnt + J].IsPoison) {
+          if (!FreezeBytes)
+            return std::nullopt;
+        } else
+          AllPoison = false;
       }
       memcpy(&Word, &ReadPos[ReadCnt], sizeof(Word));
       ReadCnt += Scale;
@@ -99,8 +104,11 @@ std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
         break;
     } else {
       for (auto J = 0; J != Scale; ++J) {
-        if (Metadata[Offset + ReadCnt].IsPoison)
-          return std::nullopt;
+        if (Metadata[Offset + ReadCnt].IsPoison) {
+          if (!FreezeBytes)
+            return std::nullopt;
+        } else
+          AllPoison = false;
         Word |= static_cast<APInt::WordType>(ReadPos[ReadCnt]) << (J * 8);
         if (++ReadCnt == Size)
           break;
@@ -109,6 +117,8 @@ std::optional<APInt> MemObject::load(size_t Offset, size_t Bits) const {
         break;
     }
   }
+  if (AllPoison)
+    return std::nullopt;
   return Res.trunc(Bits);
 }
 void MemObject::dumpName(raw_ostream &Out) const {
@@ -644,6 +654,8 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
   if (Ty->isIntegerTy()) {
     auto &SV = V.getSingleValue();
     if (isPoison(SV)) {
+      if (Option.StorePoisonIsImmUB)
+        ImmUBReporter(*this) << "store poison value is UB";
       if (!Option.StorePoisonIsNoop)
         MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
       return;
@@ -652,6 +664,8 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
   } else if (Ty->isFloatingPointTy()) {
     auto &SV = V.getSingleValue();
     if (isPoison(SV)) {
+      if (Option.StorePoisonIsImmUB)
+        ImmUBReporter(*this) << "store poison value is UB";
       if (!Option.StorePoisonIsNoop)
         MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
       return;
@@ -661,6 +675,8 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
   } else if (Ty->isPointerTy()) {
     auto &SV = V.getSingleValue();
     if (isPoison(SV)) {
+      if (Option.StorePoisonIsImmUB)
+        ImmUBReporter(*this) << "store poison value is UB";
       if (!Option.StorePoisonIsNoop)
         MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
       return;
@@ -715,17 +731,20 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
 AnyValue UBAwareInterpreter::load(const MemObject &MO, uint32_t Offset,
                                   Type *Ty) {
   if (Ty->isIntegerTy()) {
-    auto Val = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
+    auto Val = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue(),
+                       Option.FreezeBytes);
     if (!Val.has_value())
       return poison();
     return SingleValue{Val->trunc(Ty->getScalarSizeInBits())};
   } else if (Ty->isFloatingPointTy()) {
-    auto Val = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
+    auto Val = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue(),
+                       Option.FreezeBytes);
     if (!Val.has_value())
       return poison();
     return SingleValue{APFloat(Ty->getFltSemantics(), *Val)};
   } else if (Ty->isPointerTy()) {
-    auto Addr = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue());
+    auto Addr = MO.load(Offset, DL.getTypeStoreSizeInBits(Ty).getFixedValue(),
+                        Option.FreezeBytes);
     if (!Addr.has_value())
       return poison();
     auto Ptr = MemMgr.lookupPointer(*Addr);

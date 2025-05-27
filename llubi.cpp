@@ -63,6 +63,13 @@ static cl::opt<bool>
     StorePoisonIsNoop("store-poison-is-noop",
                       cl::desc("Treat store poison as a no-op"),
                       cl::init(false), cl::cat(Category));
+static cl::opt<bool>
+    StorePoisonIsImmUB("store-poison-is-ub",
+                       cl::desc("Treat store poison as an immediate UB"),
+                       cl::init(true), cl::cat(Category));
+static cl::opt<bool> FreezeBytes("freeze-bytes",
+                                 cl::desc("Freeze bytes in memory"),
+                                 cl::init(false), cl::cat(Category));
 static cl::opt<bool> RustMode("rust", cl::desc("Run rust programs"),
                               cl::init(false), cl::cat(Category));
 static cl::opt<bool>
@@ -110,6 +117,8 @@ int main(int argc, char **argv) {
   Option.IgnoreExplicitLifetimeMarker = IgnoreExplicitLifetimeMarker;
   Option.FillUninitializedMemWithPoison = FillUninitializedMemWithPoison;
   Option.FuseFMulAdd = FuseFMulAdd;
+  Option.FreezeBytes = FreezeBytes;
+  Option.StorePoisonIsImmUB = StorePoisonIsImmUB;
 
   UBAwareInterpreter Executor(*M, Option);
   int32_t Ret = Executor.runMain();
