@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/IR/DerivedTypes.h"
 #include <llvm/Analysis/AssumeBundleQueries.h>
 #include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
@@ -702,6 +703,20 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
          CaptureComponents::Provenance);
   } else if (Ty->isVectorTy()) {
     Type *EltTy = Ty->getScalarType();
+    if (EltTy->isIntegerTy() && EltTy->getIntegerBitWidth() % 8 != 0) {
+      // Approximate the behavior with <n x i8> vector.
+      uint32_t Len = getVectorLength(cast<VectorType>(Ty));
+      uint32_t NumBits = Len * EltTy->getIntegerBitWidth();
+      if (NumBits % 8 != 0)
+        ImmUBReporter(*this) << "vector element type is not byte-sized";
+      uint32_t NumBytes = NumBits / 8;
+      auto *NewVTy = VectorType::get(IntegerType::getInt8Ty(Ty->getContext()),
+                                     NumBytes, /*Scalable=*/false);
+      // FIXME: poison elements may infect the whole byte.
+      auto Converted =
+          bitcast(V, VectorType::get(EltTy, Len, /*Scalable=*/false), NewVTy);
+      store(MO, Offset, Converted, NewVTy);
+    }
     auto Step = DL.getTypeStoreSize(EltTy);
     auto &MV = V.getValueArray();
     for (auto &Val : MV) {
@@ -783,6 +798,18 @@ AnyValue UBAwareInterpreter::load(const MemObject &MO, uint32_t Offset,
   } else if (auto *VTy = dyn_cast<VectorType>(Ty)) {
     uint32_t Len = getVectorLength(VTy);
     Type *EltTy = VTy->getElementType();
+    if (EltTy->isIntegerTy() && EltTy->getIntegerBitWidth() % 8 != 0) {
+      // Approximate the behavior with <n x i8> vector.
+      uint32_t NumBits = Len * EltTy->getIntegerBitWidth();
+      if (NumBits % 8 != 0)
+        ImmUBReporter(*this) << "vector element type is not byte-sized";
+      uint32_t NumBytes = NumBits / 8;
+      auto *NewVTy = VectorType::get(IntegerType::getInt8Ty(VTy->getContext()),
+                                     NumBytes, /*Scalable=*/false);
+      auto LoadedValue = load(MO, Offset, NewVTy);
+      return bitcast(LoadedValue, NewVTy,
+                     VectorType::get(EltTy, Len, /*Scalable=*/false));
+    }
     size_t Step = DL.getTypeStoreSize(EltTy);
     std::vector<AnyValue> Res;
     Res.reserve(Len);
@@ -2032,13 +2059,13 @@ bool UBAwareInterpreter::visitLoadInst(LoadInst &LI) {
   return addValue(LI, std::move(RetVal));
 }
 void UBAwareInterpreter::writeBits(APInt &Dst, uint32_t &Offset,
-                                   const APInt &Src) {
+                                   const APInt &Src) const {
   Dst.insertBits(Src, Offset);
   Offset += Src.getBitWidth();
 }
 void UBAwareInterpreter::toBits(APInt &Bits, APInt &PoisonBits,
                                 uint32_t &Offset, const AnyValue &Val,
-                                Type *Ty) {
+                                Type *Ty) const {
   if (Val.isSingleValue() && isPoison(Val.getSingleValue())) {
     unsigned BW = DL.getTypeSizeInBits(Ty).getFixedValue();
     PoisonBits.setBits(Offset, Offset + BW);
@@ -2077,14 +2104,14 @@ bool UBAwareInterpreter::visitPtrToInt(PtrToIntInst &I) {
   });
 }
 APInt UBAwareInterpreter::readBits(const APInt &Src, uint32_t &Offset,
-                                   uint32_t Width) {
+                                   uint32_t Width) const {
   auto Res = Src.extractBits(Width, Offset);
   Offset += Width;
   return Res;
 }
 AnyValue UBAwareInterpreter::fromBits(const APInt &Bits,
                                       const APInt &PoisonBits, uint32_t &Offset,
-                                      Type *Ty) {
+                                      Type *Ty) const {
   if (Ty->isIntOrPtrTy() || Ty->isFloatingPointTy()) {
     if (APInt::getBitsSet(Bits.getBitWidth(), Offset,
                           Offset + Ty->getScalarSizeInBits())
@@ -2116,15 +2143,18 @@ AnyValue UBAwareInterpreter::fromBits(const APInt &Bits,
     std::abort();
   }
 }
-bool UBAwareInterpreter::visitBitCastInst(BitCastInst &BCI) {
-  APInt Bits =
-      APInt::getZero(DL.getTypeSizeInBits(BCI.getType()).getFixedValue());
+AnyValue UBAwareInterpreter::bitcast(const AnyValue &V, Type *SrcTy,
+                                     Type *DstTy) const {
+  APInt Bits = APInt::getZero(DL.getTypeSizeInBits(DstTy).getFixedValue());
   APInt PoisonBits = Bits;
   uint32_t Offset = 0;
-  toBits(Bits, PoisonBits, Offset, getValue(BCI.getOperand(0)),
-         BCI.getOperand(0)->getType());
+  toBits(Bits, PoisonBits, Offset, V, SrcTy);
   Offset = 0;
-  return addValue(BCI, fromBits(Bits, PoisonBits, Offset, BCI.getType()));
+  return fromBits(Bits, PoisonBits, Offset, DstTy);
+}
+bool UBAwareInterpreter::visitBitCastInst(BitCastInst &BCI) {
+  return addValue(BCI, bitcast(getValue(BCI.getOperand(0)),
+                               BCI.getOperand(0)->getType(), BCI.getType()));
 }
 std::string UBAwareInterpreter::getValueName(Value *V) {
   std::string Str;

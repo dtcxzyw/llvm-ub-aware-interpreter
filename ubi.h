@@ -415,6 +415,7 @@ class UBAwareInterpreter : public InstVisitor<UBAwareInterpreter, bool> {
   AnyValue getPoison(Type *Ty) const;
   AnyValue getZero(Type *Ty) const;
   AnyValue convertFromConstant(Constant *V) const;
+  AnyValue bitcast(const AnyValue &V, Type *SrcTy, Type *DstTy) const;
   void store(MemObject &MO, uint32_t Offset, const AnyValue &V, Type *Ty);
   AnyValue load(const MemObject &MO, uint32_t Offset, Type *Ty);
   void store(const AnyValue &P, uint32_t Alignment, const AnyValue &V, Type *Ty,
@@ -549,14 +550,14 @@ public:
   bool visitStoreInst(StoreInst &SI);
   void handleRangeMetadata(AnyValue &V, Instruction &I);
   bool visitLoadInst(LoadInst &LI);
-  void writeBits(APInt &Dst, uint32_t &Offset, const APInt &Src);
+  void writeBits(APInt &Dst, uint32_t &Offset, const APInt &Src) const;
   void toBits(APInt &Bits, APInt &PoisonBits, uint32_t &Offset,
-              const AnyValue &Val, Type *Ty);
+              const AnyValue &Val, Type *Ty) const;
   bool visitIntToPtr(IntToPtrInst &I);
   bool visitPtrToInt(PtrToIntInst &I);
-  APInt readBits(const APInt &Src, uint32_t &Offset, uint32_t Width);
+  APInt readBits(const APInt &Src, uint32_t &Offset, uint32_t Width) const;
   AnyValue fromBits(const APInt &Bits, const APInt &PoisonBits,
-                    uint32_t &Offset, Type *Ty);
+                    uint32_t &Offset, Type *Ty) const;
   bool visitBitCastInst(BitCastInst &BCI);
   std::string getValueName(Value *V);
   AnyValue handleCall(CallBase &CB);
