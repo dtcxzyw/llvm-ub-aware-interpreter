@@ -654,7 +654,7 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
   if (Ty->isIntegerTy()) {
     auto &SV = V.getSingleValue();
     if (isPoison(SV)) {
-      if (Option.StorePoisonIsImmUB)
+      if (Option.StorePoisonIsImmUB && CurrentFrame)
         ImmUBReporter(*this) << "store poison value is UB";
       if (!Option.StorePoisonIsNoop)
         MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
@@ -664,7 +664,7 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
   } else if (Ty->isFloatingPointTy()) {
     auto &SV = V.getSingleValue();
     if (isPoison(SV)) {
-      if (Option.StorePoisonIsImmUB)
+      if (Option.StorePoisonIsImmUB && CurrentFrame)
         ImmUBReporter(*this) << "store poison value is UB";
       if (!Option.StorePoisonIsNoop)
         MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
@@ -675,7 +675,7 @@ void UBAwareInterpreter::store(MemObject &MO, uint32_t Offset,
   } else if (Ty->isPointerTy()) {
     auto &SV = V.getSingleValue();
     if (isPoison(SV)) {
-      if (Option.StorePoisonIsImmUB)
+      if (Option.StorePoisonIsImmUB && CurrentFrame)
         ImmUBReporter(*this) << "store poison value is UB";
       if (!Option.StorePoisonIsNoop)
         MO.markPoison(Offset, DL.getTypeStoreSize(Ty).getFixedValue(), true);
