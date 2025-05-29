@@ -4,7 +4,6 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
-#include "llvm/IR/DerivedTypes.h"
 #include <llvm/Analysis/AssumeBundleQueries.h>
 #include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
