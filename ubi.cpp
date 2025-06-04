@@ -3665,7 +3665,7 @@ KnownBits FunctionAnalysisCache::queryKnownBits(Value *V,
   auto Iter = KnownBitsCache.find(V);
   if (Iter != KnownBitsCache.end())
     return Iter->second;
-  return KnownBitsCache[V] = computeKnownBits(V, /*Depth=*/0, SQ);
+  return KnownBitsCache[V] = computeKnownBits(V, SQ);
 }
 bool FunctionAnalysisCache::queryNonZero(Value *V, const SimplifyQuery &SQ) {
   auto Iter = NonZeroCache.find(V);
@@ -3719,8 +3719,7 @@ void UBAwareInterpreter::verifyValueTracking(Value *V, const AnyValue &RV,
         ImmUBReporter(*this) << *V << " may be zero\n";
     }
     if (MinSignBits != 1) {
-      unsigned SignBits =
-          ComputeNumSignBits(V, SQ.DL, /*Depth=*/0, SQ.AC, SQ.CxtI, SQ.DT);
+      unsigned SignBits = ComputeNumSignBits(V, SQ.DL, SQ.AC, SQ.CxtI, SQ.DT);
       if (SignBits > MinSignBits)
         ImmUBReporter(*this)
             << "signbits of " << *V
