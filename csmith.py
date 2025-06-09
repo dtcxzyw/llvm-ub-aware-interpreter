@@ -149,6 +149,15 @@ def csmith_test(i):
     try:
         comp_command = compile_command + " -o " + file_out + " " + file_c
         subprocess.check_call(comp_command.split(" "), timeout=comp_timeout)
+    except subprocess.TimeoutExpired:
+        os.remove(file_c)
+        if os.path.exists(file_out):
+            os.remove(file_out)
+        return None
+    except subprocess.CalledProcessError:
+        return False
+
+    try:
         subprocess.check_call(
             [file_out],
             timeout=exec_timeout,

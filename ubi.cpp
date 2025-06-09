@@ -9,6 +9,7 @@
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InlineAsm.h>
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <utility>
@@ -2843,6 +2844,11 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
       return getPoison(RetTy);
     return std::vector<AnyValue>{Vec.begin() + Offset,
                                  Vec.begin() + Offset + DstSize};
+  }
+  case Intrinsic::vector_reverse: {
+    auto Vec = Args[0].getValueArray();
+    std::reverse(Vec.begin(), Vec.end());
+    return std::move(Vec);
   }
   case Intrinsic::fptosi_sat:
   case Intrinsic::fptoui_sat: {
