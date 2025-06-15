@@ -2321,6 +2321,20 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
       ImmUBReporter(*this) << "call lifetime intrinsic with poison size";
     auto &Ptr = Args[1].getSingleValue();
     if (auto *P = std::get_if<Pointer>(&Ptr)) {
+      uint64_t PtrTag = P->Address.getZExtValue();
+      if (Option.EnforceStackOrderLifetimeMarker) {
+        auto &LifetimeStack = CurrentFrame->LastFrame->LifetimeStack;
+        if (IID == Intrinsic::lifetime_start)
+          LifetimeStack.push(PtrTag);
+        else {
+          if (LifetimeStack.empty() || LifetimeStack.top() != PtrTag)
+            ImmUBReporter(*this)
+                << "call lifetime end with unmatched lifetime start";
+          else
+            LifetimeStack.pop();
+        }
+      }
+
       if (auto MO = P->Obj.lock()) {
         // Do not reduce the pointer.
         if (Option.ReduceMode && P->Address.isZero())

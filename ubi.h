@@ -74,6 +74,7 @@
 #include <limits>
 #include <map>
 #include <random>
+#include <stack>
 #include <unordered_set>
 #include <variant>
 
@@ -295,6 +296,7 @@ struct Frame final {
   TargetLibraryInfo TLI;
   Frame *LastFrame;
   MemoryEffects MemEffects;
+  std::stack<uint64_t> LifetimeStack;
 
   explicit Frame(Function *Func, FunctionAnalysisCache *Cache,
                  TargetLibraryInfoImpl &TLI, Frame *LastFrame,
@@ -375,6 +377,7 @@ struct InterpreterOption {
   bool StorePoisonIsImmUB = false;
   bool FreezeBytes = false;
   bool FuseFMulAdd = false;
+  bool EnforceStackOrderLifetimeMarker = false;
 
   bool VerifyValueTracking = false;
   bool VerifySCEV = false;

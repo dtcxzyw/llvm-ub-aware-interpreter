@@ -76,6 +76,10 @@ static cl::opt<bool>
     IgnoreExplicitLifetimeMarker("ignore-explicit-lifetime-marker",
                                  cl::desc("Ignore explicit lifetime markers"),
                                  cl::init(false), cl::cat(Category));
+static cl::opt<bool> EnforceStackOrderLifetimeMarker(
+    "enforce-stack-order-lifetime-marker",
+    cl::desc("Ensure lifetime.start/end execute in a stack order"),
+    cl::init(false), cl::cat(Category));
 static cl::opt<bool> FillUninitializedMemWithPoison(
     "fill-uninitialized-mem-with-poison",
     cl::desc("Fill uninitialized memory with poison to sync with alive2"),
@@ -115,6 +119,7 @@ int main(int argc, char **argv) {
   Option.StorePoisonIsNoop = StorePoisonIsNoop;
   Option.RustMode = RustMode;
   Option.IgnoreExplicitLifetimeMarker = IgnoreExplicitLifetimeMarker;
+  Option.EnforceStackOrderLifetimeMarker = EnforceStackOrderLifetimeMarker;
   Option.FillUninitializedMemWithPoison = FillUninitializedMemWithPoison;
   Option.FuseFMulAdd = FuseFMulAdd;
   Option.FreezeBytes = FreezeBytes;
