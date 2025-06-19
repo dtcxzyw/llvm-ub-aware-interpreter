@@ -3314,7 +3314,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
     }
   }
 
-  if (!Func->hasExactDefinition()) {
+  if (Func->empty()) {
     // Handle Rust allocator API
     Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
     auto Scope =
