@@ -3041,6 +3041,26 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     }
     return none();
   }
+  case Intrinsic::experimental_cttz_elts: {
+    auto &Vec = Args[0].getValueArray();
+    bool IsZeroPoison = getBooleanNonPoison(Args[1].getSingleValue());
+    uint32_t LastNonZero = 0;
+    uint32_t Index = 0;
+    for (auto &V : Vec) {
+      ++Index;
+      if (isPoison(V.getSingleValue()))
+        return poison();
+      auto &Val = std::get<APInt>(V.getSingleValue());
+      if (Val.isOne())
+        LastNonZero = Index;
+    }
+
+    if (IsZeroPoison && LastNonZero == 0)
+      return poison();
+
+    return SingleValue{
+        APInt{RetTy->getScalarSizeInBits(), Vec.size() - LastNonZero}};
+  }
   default:
     break;
   }
