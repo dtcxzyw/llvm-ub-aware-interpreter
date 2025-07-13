@@ -3044,22 +3044,23 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
   case Intrinsic::experimental_cttz_elts: {
     auto &Vec = Args[0].getValueArray();
     bool IsZeroPoison = getBooleanNonPoison(Args[1].getSingleValue());
-    uint32_t LastNonZero = 0;
+    uint32_t FirstNonZero = Vec.size();
     uint32_t Index = 0;
     for (auto &V : Vec) {
-      ++Index;
       if (isPoison(V.getSingleValue()))
         return poison();
       auto &Val = std::get<APInt>(V.getSingleValue());
-      if (Val.isOne())
-        LastNonZero = Index;
+      if (Val.isOne()) {
+        FirstNonZero = Index;
+        break;
+      }
+      ++Index;
     }
 
-    if (IsZeroPoison && LastNonZero == 0)
+    if (IsZeroPoison && FirstNonZero == Vec.size())
       return poison();
 
-    return SingleValue{
-        APInt{RetTy->getScalarSizeInBits(), Vec.size() - LastNonZero}};
+    return SingleValue{APInt{RetTy->getScalarSizeInBits(), FirstNonZero}};
   }
   default:
     break;
