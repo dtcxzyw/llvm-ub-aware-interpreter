@@ -3103,7 +3103,11 @@ void UBAwareInterpreter::patchRustLibFunc() {
       IRBuilder<> Builder{Entry};
       auto *OnceState = Builder.CreateAlloca(Builder.getInt64Ty());
       auto *Status = Builder.CreateLoad(Builder.getInt32Ty(), F.getArg(0));
-      auto *Test = Builder.CreateIsNull(Status);
+      // const INCOMPLETE: Primitive = 3;
+      // See also
+      // https://github.com/rust-lang/rust/commit/a2d41393365df0c0c9f728de7f79b8f0d4e14ef2
+      auto *Test =
+          Builder.CreateICmpEQ(Status, ConstantInt::get(Status->getType(), 3));
       auto *ThenBB = BasicBlock::Create(M.getContext(), "then", &F);
       auto *EndBB = BasicBlock::Create(M.getContext(), "end", &F);
       Builder.CreateCondBr(Test, ThenBB, EndBB);
