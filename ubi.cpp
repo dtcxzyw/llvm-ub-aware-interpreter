@@ -4,6 +4,7 @@
 // See the LICENSE file for more information.
 
 #include "ubi.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <llvm/Analysis/AssumeBundleQueries.h>
 #include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
@@ -2320,6 +2321,8 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     if (!Size)
       ImmUBReporter(*this) << "call lifetime intrinsic with poison size";
     auto &Ptr = Args[1].getSingleValue();
+    if (isPoison(Ptr))
+      return none();
     if (auto *P = std::get_if<Pointer>(&Ptr)) {
       uint64_t PtrTag = P->Address.getZExtValue();
       if (Option.EnforceStackOrderLifetimeMarker) {
@@ -2341,7 +2344,6 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
           ImmUBReporter(*this) << "call lifetime intrinsic with null";
         if (!Option.ReduceMode && Size->isAllOnes())
           Size = APInt(Size->getBitWidth(), MO->size());
-        // FIXME: What is the meaning of size?
         if (MO->isStackObject(CurrentFrame->LastFrame) && P->Offset == 0) {
           // Do not reduce the size.
           if (Option.ReduceMode && MO->size() != Size)
@@ -2351,15 +2353,15 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
                            Option.FillUninitializedMemWithPoison ||
                                IID != Intrinsic::lifetime_start);
           MO->setLiveness(IID == Intrinsic::lifetime_start);
+          return none();
         } else {
-          MO->markPoison(0, MO->size(), true);
+          ImmUBReporter(*this)
+              << "call lifetime intrinsic with non-stack object";
         }
-      } else
-        ImmUBReporter(*this) << "call lifetime intrinsic with dangling pointer";
-    } else {
-      ImmUBReporter(*this) << "call lifetime intrinsic with poison pointer";
+      }
     }
-    return none();
+    ImmUBReporter(*this) << "call lifetime intrinsic with invalid pointer";
+    llvm_unreachable("Unreachable code");
   }
   case Intrinsic::experimental_noalias_scope_decl:
     return none();
