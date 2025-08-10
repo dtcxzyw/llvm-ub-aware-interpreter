@@ -2317,10 +2317,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     if (Option.IgnoreExplicitLifetimeMarker)
       return none();
 
-    auto Size = getInt(Args[0].getSingleValue());
-    if (!Size)
-      ImmUBReporter(*this) << "call lifetime intrinsic with poison size";
-    auto &Ptr = Args[1].getSingleValue();
+    auto &Ptr = Args[0].getSingleValue();
     if (isPoison(Ptr))
       return none();
     if (auto *P = std::get_if<Pointer>(&Ptr)) {
@@ -2342,12 +2339,7 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
         // Do not reduce the pointer.
         if (Option.ReduceMode && P->Address.isZero())
           ImmUBReporter(*this) << "call lifetime intrinsic with null";
-        if (!Option.ReduceMode && Size->isAllOnes())
-          Size = APInt(Size->getBitWidth(), MO->size());
         if (MO->isStackObject(CurrentFrame->LastFrame) && P->Offset == 0) {
-          // Do not reduce the size.
-          if (Option.ReduceMode && MO->size() != Size)
-            ImmUBReporter(*this) << "call lifetime intrinsic with wrong size";
           if (MO->isAlive() || IID == Intrinsic::lifetime_start)
             MO->markPoison(0, MO->size(),
                            Option.FillUninitializedMemWithPoison ||
