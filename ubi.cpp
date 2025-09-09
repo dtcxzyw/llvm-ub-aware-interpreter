@@ -2206,6 +2206,18 @@ bool UBAwareInterpreter::visitCallInst(CallInst &CI) {
   }
   return addValue(CI, std::move(RetVal));
 }
+bool UBAwareInterpreter::visitCallBrInst(CallBrInst &CI) {
+  if (auto *Asm = dyn_cast<InlineAsm>(CI.getCalledOperand())) {
+    if (!Asm->getAsmString().empty() || !CI.getType()->isVoidTy()) {
+      errs() << "Unsupported inline asm\n";
+      std::abort();
+    }
+    return jumpTo(CI.getDefaultDest());
+  }
+
+  errs() << "Unsupported callee of callbr\n";
+  std::abort();
+}
 bool UBAwareInterpreter::visitInvokeInst(InvokeInst &II) {
   auto RetVal = handleCall(II);
   if (EMIInfo.EnablePGFTracking && RetVal.isSingleValue()) {

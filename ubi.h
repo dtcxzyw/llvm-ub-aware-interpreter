@@ -565,6 +565,7 @@ public:
   std::string getValueName(Value *V);
   AnyValue handleCall(CallBase &CB);
   bool visitCallInst(CallInst &CI);
+  bool visitCallBrInst(CallBrInst &CI);
   bool visitInvokeInst(InvokeInst &II);
   bool visitReturnInst(ReturnInst &RI);
   bool visitUnreachableInst(UnreachableInst &);
