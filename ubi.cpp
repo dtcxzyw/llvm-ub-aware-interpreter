@@ -3387,6 +3387,13 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
       else
         ImmUBReporter(*this) << "free with invalid ptr " << Ptr;
       return none();
+    } else if (Func->getName() == "llubi_inspect" &&
+               Func->getReturnType()->isVoidTy()) {
+      for (auto &Arg : Args) {
+        outs() << Arg << ' ';
+      }
+      outs() << '\n';
+      return none();
     }
     errs() << "Do not know how to handle " << *Func << '\n';
     std::exit(EXIT_FAILURE);
