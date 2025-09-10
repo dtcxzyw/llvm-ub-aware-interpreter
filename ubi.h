@@ -558,6 +558,7 @@ public:
               const AnyValue &Val, Type *Ty) const;
   bool visitIntToPtr(IntToPtrInst &I);
   bool visitPtrToInt(PtrToIntInst &I);
+  bool visitPtrToAddr(PtrToAddrInst &I);
   APInt readBits(const APInt &Src, uint32_t &Offset, uint32_t Width) const;
   AnyValue fromBits(const APInt &Bits, const APInt &PoisonBits,
                     uint32_t &Offset, Type *Ty) const;

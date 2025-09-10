@@ -614,7 +614,8 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
       }
       break;
     }
-    case Instruction::PtrToInt: {
+    case Instruction::PtrToInt:
+    case Instruction::PtrToAddr: {
       auto Ptr = std::get<Pointer>(
           convertFromConstant(cast<Constant>(CE->getOperand(0)))
               .getSingleValue());
@@ -2097,6 +2098,14 @@ bool UBAwareInterpreter::visitIntToPtr(IntToPtrInst &I) {
   });
 }
 bool UBAwareInterpreter::visitPtrToInt(PtrToIntInst &I) {
+  return visitUnOp(I, [&](const SingleValue &V) -> SingleValue {
+    if (isPoison(V))
+      return poison();
+    auto &Ptr = std::get<Pointer>(V);
+    return Ptr.Address;
+  });
+}
+bool UBAwareInterpreter::visitPtrToAddr(PtrToAddrInst &I) {
   return visitUnOp(I, [&](const SingleValue &V) -> SingleValue {
     if (isPoison(V))
       return poison();
