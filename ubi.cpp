@@ -48,7 +48,7 @@ void MemObject::markPoison(size_t Offset, size_t Size, bool IsPoison) {
 }
 void MemObject::verifyMemAccess(size_t Offset, size_t AccessSize,
                                 size_t Alignment, bool IsStore) {
-  if (!IsAlive)
+  if (!IsAlive && IsStore)
     ImmUBReporter(Manager.Interpreter) << "Accessing dead object " << *this;
   if (((Address.getZExtValue() + Offset) & (Alignment - 1)) != 0)
     ImmUBReporter(Manager.Interpreter) << "Unaligned mem op";
