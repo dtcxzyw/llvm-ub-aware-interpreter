@@ -29,7 +29,9 @@ csmith_command = (
     csmith_dir
     + "/bin/csmith --max-funcs 3 --max-block-depth 5 --quiet --builtins --no-packed-struct --no-unions --no-bitfields --output "
 )
-compile_command = llvm_dir + "/bin/clang -DNDEBUG -g0 -w -I" + csmith_dir + "/include "
+compile_command = (
+    llvm_dir + "/bin/clang -lm -DNDEBUG -g0 -w -I" + csmith_dir + "/include "
+)
 comp_timeout = 10.0
 exec_timeout = 1.0
 llubi_workarounds = [
