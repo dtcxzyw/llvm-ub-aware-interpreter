@@ -3,7 +3,7 @@ UB-aware interpreter for LLVM debugging
 
 ## Introduction
 
-This tool is developed to save my life when debugging LLVM. Unlike lli, this interpreter is UB-aware, which means it will check immediate undefined behaviors during the execution and handle poison values properly. It is designed to be a debugging tool, so it is not optimized for performance. [alive-exec](https://github.com/AliveToolkit/alive2) should be a drop-in replacement of this tool. But it is slow and easy to get stuck in my experience. So this tool is designed to be more friendly to csmith and creduce.
+This tool is developed to save my life when debugging LLVM. Unlike lli, this interpreter is UB-aware, which means it will check immediate undefined behaviors during execution and handle poison values properly. It is designed to be a debugging tool, so it is not optimized for performance. [alive-exec](https://github.com/AliveToolkit/alive2) should be a drop-in replacement for this tool. But it is slow and easy to get stuck in my experience. So this tool is designed to be more friendly to csmith and creduce.
 
 ## Motivation
 
@@ -98,14 +98,16 @@ python3 rustlantis.py ./rustlantis <test count>
 ## Limitations
 We did some refinements on the LLVM LangRef to make the implementation practical and efficient:
 
++ It only checks **guardable** UBs. That is, they are checked at the point of instruction execution. Some non-guardable UBs, like mustprogress violation (i.e., infinite loop), are not checked.
++ `nsz` attribute is not supported.
 + Undef values are not supported as we will eventually remove undef from LLVM in the future. In llubi, they are treated as zero values.
-+ FFI is not supported. Currently it only supports ```printf("%d", x)``` for csmith. Some rust standard library functions are patched to support rustlantis.
++ FFI is not supported. Currently it only supports ```printf("%d", x)``` for csmith. Some Rust standard library functions are patched to support rustlantis.
 + Addresses of allocations are unique. That is, we cannot model the behavior of stack coloring in llubi.
 + Pointer aliasing has not been supported yet.
 + Pointer provenance and capture tracking support is limited. We do not track the capabilities of pointers if it is stored into memory or converted to an integer.
 + We do not maintain the precise poison semantics in memory.
 + We do not check ```externally observable sideeffects``` strictly as required by ```memory(read)/readonly```. The current implementation just works for these two fuzzers.
-+ Volatile memory accesses are partially supported. We only record total number of bytes that are loaded/stored via volatile memory ops.
++ Volatile memory accesses are partially supported. We only record the total number of bytes that are loaded/stored via volatile memory ops.
 
 ## License
 
