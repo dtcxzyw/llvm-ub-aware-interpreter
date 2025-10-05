@@ -2012,9 +2012,20 @@ bool UBAwareInterpreter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   return addValue(SVI, std::move(PickedValues));
 }
 bool UBAwareInterpreter::visitStoreInst(StoreInst &SI) {
-  store(getValue(SI.getPointerOperand()), SI.getAlign().value(),
-        getValue(SI.getValueOperand()), SI.getValueOperand()->getType(),
-        SI.isVolatile());
+  auto Ptr = getValue(SI.getPointerOperand());
+  auto Val = getValue(SI.getValueOperand());
+  if (MDNode *Captures = SI.getMetadata(LLVMContext::MD_captures)) {
+    assert(SI.getValueOperand()->getType()->isPointerTy() &&
+           "Unexpected metadata");
+    auto CI = MDNode::toCaptureComponents(Captures);
+    auto PtrVal = Val.getSingleValue();
+    if (!isPoison(PtrVal)) {
+      auto &Ptr = std::get<Pointer>(PtrVal);
+      Ptr.Info.pushCaptureInfo(CurrentFrame, CI);
+    }
+  }
+  store(std::move(Ptr), SI.getAlign().value(), std::move(Val),
+        SI.getValueOperand()->getType(), SI.isVolatile());
   return true;
 }
 void UBAwareInterpreter::handleRangeMetadata(AnyValue &V, Instruction &I) {
