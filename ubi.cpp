@@ -601,7 +601,7 @@ AnyValue UBAwareInterpreter::convertFromConstant(Constant *V) const {
     switch (CE->getOpcode()) {
     case Instruction::GetElementPtr: {
       auto *Inst = cast<GetElementPtrInst>(CE->getAsInstruction());
-      auto Guard = make_scope_exit([Inst] { Inst->deleteValue(); });
+      llvm::scope_exit Scope([Inst] { Inst->deleteValue(); });
       APInt Offset = APInt::getZero(DL.getIndexSizeInBits(0));
       SmallMapVector<Value *, APInt, 4> VarOffset;
       if (Inst->collectOffset(DL, Offset.getBitWidth(), VarOffset, Offset)) {
@@ -3009,19 +3009,36 @@ AnyValue UBAwareInterpreter::callIntrinsic(IntrinsicInst &II,
     }
     return none();
   }
-  case Intrinsic::vector_splice: {
+  case Intrinsic::vector_splice_left: {
     auto &LHS = Args[0].getValueArray();
     auto &RHS = Args[1].getValueArray();
     auto Imm = getInt(Args[2].getSingleValue());
     if (!Imm)
-      ImmUBReporter(*this) << "llvm.vector.splice with poison index";
+      ImmUBReporter(*this) << "llvm.vector.splice.left with poison index";
     uint32_t Len = LHS.size();
-    if (Imm->isNegative())
-      *Imm += Len;
     if (Imm->uge(Len))
-      ImmUBReporter(*this) << "llvm.vector.splice with invalid index "
+      ImmUBReporter(*this) << "llvm.vector.splice.left with invalid index "
                            << Args[2];
     uint32_t Off = Imm->getZExtValue();
+    std::vector<AnyValue> Res;
+    Res.reserve(Len);
+    for (uint32_t I = 0; I != Len; ++I) {
+      uint32_t Pos = I + Off;
+      Res.push_back(Pos < Len ? LHS[Pos] : RHS[Pos - Len]);
+    }
+    return std::move(Res);
+  }
+  case Intrinsic::vector_splice_right: {
+    auto &LHS = Args[0].getValueArray();
+    auto &RHS = Args[1].getValueArray();
+    auto Imm = getInt(Args[2].getSingleValue());
+    if (!Imm)
+      ImmUBReporter(*this) << "llvm.vector.splice.right with poison index";
+    uint32_t Len = LHS.size();
+    if (Imm->ugt(Len))
+      ImmUBReporter(*this) << "llvm.vector.splice.right with invalid index "
+                           << Args[2];
+    uint32_t Off = Len - Imm->getZExtValue();
     std::vector<AnyValue> Res;
     Res.reserve(Len);
     for (uint32_t I = 0; I != Len; ++I) {
@@ -3348,8 +3365,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   auto ME = CB ? CB->getMemoryEffects() : MemoryEffects::unknown();
   if (Func->isIntrinsic()) {
     Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
-    auto Scope =
-        llvm::make_scope_exit([&, Frame = CurrentFrame] { ExitFunc(Frame); });
+    llvm::scope_exit Scope([&, Frame = CurrentFrame] { ExitFunc(Frame); });
     CurrentFrame = &CallFrame;
     PostProcessArgs();
     return callIntrinsic(*cast<IntrinsicInst>(CB), Args);
@@ -3357,8 +3373,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
     LibFunc F;
     if (TLI.getLibFunc(*Func, F)) {
       Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
-      auto Scope =
-          llvm::make_scope_exit([&, Frame = CurrentFrame] { ExitFunc(Frame); });
+      llvm::scope_exit Scope([&, Frame = CurrentFrame] { ExitFunc(Frame); });
       CurrentFrame = &CallFrame;
       PostProcessArgs();
       return callLibFunc(F, Func, Args);
@@ -3368,8 +3383,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   if (Func->empty()) {
     // Handle Rust allocator API
     Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
-    auto Scope =
-        llvm::make_scope_exit([&, Frame = CurrentFrame] { ExitFunc(Frame); });
+    llvm::scope_exit Scope([&, Frame = CurrentFrame] { ExitFunc(Frame); });
     CurrentFrame = &CallFrame;
     PostProcessArgs();
     auto Kind = Func->getAttributes().getAllocKind();
@@ -3424,8 +3438,7 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
   }
 
   Frame CallFrame{Func, FAC, TLI, CurrentFrame, ME};
-  auto Scope =
-      llvm::make_scope_exit([&, Frame = CurrentFrame] { ExitFunc(Frame); });
+  llvm::scope_exit Scope([&, Frame = CurrentFrame] { ExitFunc(Frame); });
   CurrentFrame = &CallFrame;
   PostProcessArgs();
   if (Option.Verbose) {
