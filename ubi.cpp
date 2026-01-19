@@ -3536,6 +3536,14 @@ int32_t UBAwareInterpreter::runMain() {
     for (auto &Arg : Entry->args())
       Args.push_back(getZero(Arg.getType()));
   } else if (!Option.RustMode) {
+    if (Entry->arg_size() != 2 ||
+        !Entry->getArg(0)->getType()->isIntegerTy(32) ||
+        !Entry->getArg(1)->getType()->isPointerTy()) {
+      errs() << "Unsupported main function signature\n"
+             << "If you are reducing a test case, please enable -reduce-mode.\n"
+             << "It will fill the arguments with zero values.\n";
+      return EXIT_FAILURE;
+    }
     Args.push_back(SingleValue{APInt::getZero(32)});
     Args.push_back(SingleValue{*NullPtr});
   }
