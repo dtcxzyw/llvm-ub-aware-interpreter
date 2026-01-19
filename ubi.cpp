@@ -3897,6 +3897,10 @@ public:
     return visit(Ptr);
   }
 
+  SCEVEvalRes visitPtrToAddrExpr(const SCEVPtrToAddrExpr *E) {
+    return visit(E->getOperand());
+  }
+
   SCEVEvalRes visitTruncateExpr(const SCEVTruncateExpr *S) {
     auto *Op = S->getOperand();
     auto OpRes = visit(Op);
