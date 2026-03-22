@@ -1841,19 +1841,22 @@ bool UBAwareInterpreter::visitSelect(SelectInst &SI) {
   }
   return addValue(SI, postProcessFPVal(std::move(Res), SI));
 }
-bool UBAwareInterpreter::visitBranchInst(BranchInst &BI) {
-  if (BI.isConditional()) {
-    switch (getBoolean(BI.getCondition())) {
-    case BooleanVal::True:
-      return jumpTo(BI.getSuccessor(0));
-    case BooleanVal::False:
-      return jumpTo(BI.getSuccessor(1));
-    case BooleanVal::Poison:
-      ImmUBReporter(*this) << "Branch on poison";
-    }
+bool UBAwareInterpreter::visitCondBrInst(CondBrInst &BI) {
+  switch (getBoolean(BI.getCondition())) {
+  case BooleanVal::True:
+    return jumpTo(BI.getSuccessor(0));
+  case BooleanVal::False:
+    return jumpTo(BI.getSuccessor(1));
+  case BooleanVal::Poison:
+    ImmUBReporter(*this) << "Branch on poison";
   }
-  return jumpTo(BI.getSuccessor(0));
+  llvm_unreachable("Unreachable code");
 }
+
+bool UBAwareInterpreter::visitUncondBrInst(UncondBrInst &BI) {
+  return jumpTo(BI.getSuccessor());
+}
+
 bool UBAwareInterpreter::visitIndirectBrInst(IndirectBrInst &IBI) {
   auto Ptr = getValue(IBI.getAddress()).getSingleValue();
   if (isPoison(Ptr))
@@ -3752,11 +3755,8 @@ FunctionAnalysisCache::FunctionAnalysisCache(Function &F,
     : DT(F), AC(F), TLI(TLIImpl, &F), LI(DT), SE(F, TLI, AC, DT, LI),
       LVI(&AC, &F.getDataLayout()) {
   for (auto &BB : F) {
-    if (auto *Branch = dyn_cast<BranchInst>(BB.getTerminator())) {
-      if (Branch->isUnconditional())
-        continue;
+    if (auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator()))
       DC.registerBranch(Branch);
-    }
   }
 }
 KnownBits FunctionAnalysisCache::queryKnownBits(Value *V,
@@ -3901,7 +3901,7 @@ public:
   }
 
   SCEVEvalRes visitPtrToIntExpr(const SCEVPtrToIntExpr *S) {
-    auto *Ptr = S->getOperand();
+    const SCEV *Ptr = S->getOperand();
     return visit(Ptr);
   }
 
@@ -3910,7 +3910,7 @@ public:
   }
 
   SCEVEvalRes visitTruncateExpr(const SCEVTruncateExpr *S) {
-    auto *Op = S->getOperand();
+    const SCEV *Op = S->getOperand();
     auto OpRes = visit(Op);
     if (!OpRes.has_value())
       return std::nullopt;
@@ -3918,7 +3918,7 @@ public:
   }
 
   SCEVEvalRes visitZeroExtendExpr(const SCEVZeroExtendExpr *S) {
-    auto *Op = S->getOperand();
+    const SCEV *Op = S->getOperand();
     auto OpRes = visit(Op);
     if (!OpRes.has_value())
       return std::nullopt;
@@ -3926,7 +3926,7 @@ public:
   }
 
   SCEVEvalRes visitSignExtendExpr(const SCEVSignExtendExpr *S) {
-    auto *Op = S->getOperand();
+    const SCEV *Op = S->getOperand();
     auto OpRes = visit(Op);
     if (!OpRes.has_value())
       return std::nullopt;
@@ -3937,7 +3937,7 @@ public:
     // TODO: the nowrap flags must apply regardless of the order
     // (sum of positives) + (sum of negatives)
     APInt Res(getSize(S), 0);
-    for (auto *Op : S->operands()) {
+    for (const SCEV *Op : S->operands()) {
       auto OpRes = visit(Op);
       if (!OpRes.has_value())
         return std::nullopt;
@@ -3954,7 +3954,7 @@ public:
     APInt Res(getSize(S), 1);
     // TODO: the nowrap flags must apply regardless of the order
     // sort by the absolute value
-    for (auto *Op : S->operands()) {
+    for (const SCEV *Op : S->operands()) {
       auto OpRes = visit(Op);
       if (!OpRes.has_value())
         return std::nullopt;
@@ -3983,7 +3983,7 @@ public:
 
   SCEVEvalRes visitSMaxExpr(const SCEVSMaxExpr *S) {
     APInt Res = APInt::getSignedMinValue(getSize(S));
-    for (auto *Op : S->operands()) {
+    for (const SCEV *Op : S->operands()) {
       auto OpRes = visit(Op);
       if (!OpRes.has_value())
         return std::nullopt;
@@ -3994,7 +3994,7 @@ public:
 
   SCEVEvalRes visitSMinExpr(const SCEVSMinExpr *S) {
     APInt Res = APInt::getSignedMaxValue(getSize(S));
-    for (auto *Op : S->operands()) {
+    for (const SCEV *Op : S->operands()) {
       auto OpRes = visit(Op);
       if (!OpRes.has_value())
         return std::nullopt;
@@ -4005,7 +4005,7 @@ public:
 
   SCEVEvalRes visitUMaxExpr(const SCEVUMaxExpr *S) {
     APInt Res = APInt::getMinValue(getSize(S));
-    for (auto *Op : S->operands()) {
+    for (const SCEV *Op : S->operands()) {
       auto OpRes = visit(Op);
       if (!OpRes.has_value())
         return std::nullopt;
@@ -4016,7 +4016,7 @@ public:
 
   SCEVEvalRes visitUMinExpr(const SCEVUMinExpr *S) {
     APInt Res = APInt::getMaxValue(getSize(S));
-    for (auto *Op : S->operands()) {
+    for (const SCEV *Op : S->operands()) {
       auto OpRes = visit(Op);
       if (!OpRes.has_value())
         return std::nullopt;
@@ -4027,7 +4027,7 @@ public:
 
   SCEVEvalRes visitSequentialUMinExpr(const SCEVSequentialUMinExpr *S) {
     APInt Res = APInt::getMaxValue(getSize(S));
-    for (auto *Op : S->operands()) {
+    for (const SCEV *Op : S->operands()) {
       auto OpRes = visit(Op);
       if (!OpRes.has_value())
         return std::nullopt;
@@ -4065,7 +4065,7 @@ public:
       APInt LastInc = APInt::getZero(getSize(S));
       APInt CurInc = APInt::getZero(getSize(S));
       uint32_t Idx = 1;
-      for (auto *Op : drop_begin(S->operands())) {
+      for (const SCEV *Op : drop_begin(S->operands())) {
         auto LastCoeff = GetBinomialCoefficient(BECount - 1, Idx);
         auto CurCoeff = GetBinomialCoefficient(BECount, Idx);
         ++Idx;

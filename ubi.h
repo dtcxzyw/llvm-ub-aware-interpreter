@@ -540,7 +540,8 @@ public:
   AnyValue freezeValue(const AnyValue &Val, Type *Ty);
   bool visitFreezeInst(FreezeInst &Freeze);
   bool visitSelect(SelectInst &SI);
-  bool visitBranchInst(BranchInst &BI);
+  bool visitCondBrInst(CondBrInst &BI);
+  bool visitUncondBrInst(UncondBrInst &BI);
   bool visitIndirectBrInst(IndirectBrInst &IBI);
   SingleValue computeGEP(const SingleValue &Base, const APInt &Offset,
                          GEPNoWrapFlags Flags);
