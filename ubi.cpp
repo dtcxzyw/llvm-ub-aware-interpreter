@@ -3753,7 +3753,7 @@ void UBAwareInterpreter::dumpStackTrace() {
 FunctionAnalysisCache::FunctionAnalysisCache(Function &F,
                                              TargetLibraryInfoImpl &TLIImpl)
     : DT(F), AC(F), TLI(TLIImpl, &F), LI(DT), SE(F, TLI, AC, DT, LI),
-      LVI(&AC, &F.getDataLayout()) {
+      LVI(&F, &AC) {
   for (auto &BB : F) {
     if (auto *Branch = dyn_cast<CondBrInst>(BB.getTerminator()))
       DC.registerBranch(Branch);
