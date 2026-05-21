@@ -83,7 +83,7 @@ static cl::opt<bool> EnforceStackOrderLifetimeMarker(
 static cl::opt<bool> FillUninitializedMemWithPoison(
     "fill-uninitialized-mem-with-poison",
     cl::desc("Fill uninitialized memory with poison to sync with alive2"),
-    cl::init(false), cl::cat(Category));
+    cl::init(true), cl::cat(Category));
 static cl::opt<bool> FuseFMulAdd("fuse-fmuladd",
                                  cl::desc("Treat fmuladd as fma"),
                                  cl::init(false), cl::cat(Category));
