@@ -3900,11 +3900,6 @@ public:
     return APInt{getSize(S), VScale};
   }
 
-  SCEVEvalRes visitPtrToIntExpr(const SCEVPtrToIntExpr *S) {
-    const SCEV *Ptr = S->getOperand();
-    return visit(Ptr);
-  }
-
   SCEVEvalRes visitPtrToAddrExpr(const SCEVPtrToAddrExpr *E) {
     return visit(E->getOperand());
   }
