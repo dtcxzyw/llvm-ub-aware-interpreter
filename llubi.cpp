@@ -66,7 +66,7 @@ static cl::opt<bool>
 static cl::opt<bool>
     StorePoisonIsImmUB("store-poison-is-ub",
                        cl::desc("Treat store poison as an immediate UB"),
-                       cl::init(true), cl::cat(Category));
+                       cl::init(false), cl::cat(Category));
 static cl::opt<bool> FreezeBytes("freeze-bytes",
                                  cl::desc("Freeze bytes in memory"),
                                  cl::init(false), cl::cat(Category));

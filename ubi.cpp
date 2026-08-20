@@ -3373,8 +3373,8 @@ AnyValue UBAwareInterpreter::call(Function *Func, CallBase *CB,
     PostProcessArgs();
     return callIntrinsic(*cast<IntrinsicInst>(CB), Args);
   } else {
-    LibFunc F;
-    if (TLI.getLibFunc(*Func, F)) {
+    LibFunc F = TLI.getLibFunc(*Func);
+    if (F != NotLibFunc) {
       Frame CallFrame{Func, nullptr, TLI, CurrentFrame, ME};
       llvm::scope_exit Scope([&, Frame = CurrentFrame] { ExitFunc(Frame); });
       CurrentFrame = &CallFrame;
