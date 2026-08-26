@@ -1,6 +1,8 @@
 # llvm-ub-aware-interpreter (llubi)
 UB-aware interpreter for LLVM debugging
 
+**NOTICE: llubi is now shipped with LLVM since LLVM 23. See also https://discourse.llvm.org/t/rfc-upstreaming-llvm-ub-aware-interpreter/89645.**
+
 ## Introduction
 
 This tool is developed to save my life when debugging LLVM. Unlike lli, this interpreter is UB-aware, which means it will check immediate undefined behaviors during execution and handle poison values properly. It is designed to be a debugging tool, so it is not optimized for performance. [alive-exec](https://github.com/AliveToolkit/alive2) should be a drop-in replacement for this tool. But it is slow and easy to get stuck in my experience. So this tool is designed to be more friendly to csmith and creduce.
